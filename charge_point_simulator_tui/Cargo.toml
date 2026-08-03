@@ -1,0 +1,17 @@
+[package]
+name = "charge_point_simulator_tui"
+description = "OCPP Charge Point Simulator. Use this library to simulate the use of a charger point"
+repository = "https://github.com/flowionab/charge-point-simulator"
+license = "MIT OR Apache-2.0"
+authors = ["Joatin Granlund <joatin@granlund.io>"]
+keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+
+[dependencies]
+tokio.workspace = true
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+color-eyre = "0.6.5"
