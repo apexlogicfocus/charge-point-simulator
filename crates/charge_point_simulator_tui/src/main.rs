@@ -1,6 +1,9 @@
 mod screen;
 mod app;
 mod dashboard;
+mod logs;
+mod picker;
+mod theme;
 
 use std::path::PathBuf;
 

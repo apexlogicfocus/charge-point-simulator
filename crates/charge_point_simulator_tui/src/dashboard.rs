@@ -15,6 +15,16 @@ const EVSE_STRIP_HEIGHT: u16 = 3;
 const LOG_HEIGHT: u16 = 8;
 const COMMAND_BAR_HEIGHT: u16 = 1;
 
+/// Below this size the dashboard's panels would be squeezed to the point of
+/// being unreadable, so the app shows a "resize your terminal" message
+/// instead of the normal layout.
+pub const MIN_WIDTH: u16 = 60;
+pub const MIN_HEIGHT: u16 = 16;
+
+pub fn is_terminal_too_small(area: Rect) -> bool {
+    area.width < MIN_WIDTH || area.height < MIN_HEIGHT
+}
+
 /// Splits `area` into overview / EVSE strip / EVSE detail / log / command bar
 /// regions, stacked top to bottom. The EVSE detail panel takes whatever
 /// vertical space is left over, shrinking to nothing rather than panicking
@@ -98,5 +108,25 @@ mod tests {
         assert_eq!(layout.evse_detail.height, 0);
         // Layout still fits within the given area instead of panicking or overflowing.
         assert!(layout.command_bar.bottom() <= 2);
+    }
+
+    #[test]
+    fn a_comfortably_sized_terminal_is_not_too_small() {
+        assert!(!is_terminal_too_small(area(80, 30)));
+    }
+
+    #[test]
+    fn a_terminal_narrower_than_the_minimum_is_too_small() {
+        assert!(is_terminal_too_small(area(MIN_WIDTH - 1, 30)));
+    }
+
+    #[test]
+    fn a_terminal_shorter_than_the_minimum_is_too_small() {
+        assert!(is_terminal_too_small(area(80, MIN_HEIGHT - 1)));
+    }
+
+    #[test]
+    fn the_minimum_size_itself_is_not_too_small() {
+        assert!(!is_terminal_too_small(area(MIN_WIDTH, MIN_HEIGHT)));
     }
 }
