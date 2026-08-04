@@ -1,8 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "charge_point_simulator_core",
-    "charge_point_simulator_tui"
+    "crates/*"
 ]
 
 [workspace.package]
