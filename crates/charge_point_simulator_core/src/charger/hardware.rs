@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ocpp_charge_point::hardware::{
@@ -84,7 +85,7 @@ impl Evse<FakeConnector> for FakeEvse {
 pub struct FakeChargePoint {
     vendor_name: String,
     model_name: String,
-    evses: Vec<FakeEvse>,
+    evses: Arc<Vec<FakeEvse>>,
 }
 
 impl FakeChargePoint {
@@ -92,17 +93,19 @@ impl FakeChargePoint {
         Self {
             vendor_name: "Flowion".to_string(),
             model_name: config.id.clone(),
-            evses: config
-                .evses
-                .iter()
-                .map(|evse_config| FakeEvse {
-                    connectors: (1..=evse_config.connectors)
-                        .map(|connector_id| {
-                            FakeConnector::new(evse_config.id as usize, connector_id as usize)
-                        })
-                        .collect(),
-                })
-                .collect(),
+            evses: Arc::new(
+                config
+                    .evses
+                    .iter()
+                    .map(|evse_config| FakeEvse {
+                        connectors: (1..=evse_config.connectors)
+                            .map(|connector_id| {
+                                FakeConnector::new(evse_config.id as usize, connector_id as usize)
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -123,14 +126,21 @@ impl ChargePoint<FakeEvse, FakeConnector> for FakeChargePoint {
         &self.evses
     }
 
+    /// `setup()` (in `ocpp-charge-point`) awaits `start()` directly before registering with the
+    /// CSMS, so this must return promptly rather than pumping the command loop inline - the
+    /// loop is spawned onto its own task instead, fed by an `Arc` clone of `evses` so it keeps
+    /// running independent of this call's lifetime.
     async fn start(
         &self,
         events: HardwareEventSender,
         mut commands: HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
-        while let Ok(command) = commands.recv().await {
-            execute_hardware_command(&self.evses, command, &events).await;
-        }
+        let evses = Arc::clone(&self.evses);
+        tokio::spawn(async move {
+            while let Ok(command) = commands.recv().await {
+                execute_hardware_command(&evses, command, &events).await;
+            }
+        });
         Ok(())
     }
 }
@@ -139,6 +149,37 @@ impl ChargePoint<FakeEvse, FakeConnector> for FakeChargePoint {
 mod tests {
     use super::*;
     use crate::charger::config::{EvseConfig, OcppVersion};
+    use ocpp_charge_point::ChargePointRuntime;
+    use ocpp_charge_point::executor::TokioExecutor;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn start_returns_promptly_instead_of_blocking_on_the_command_loop() {
+        // `ocpp-charge-point`'s `setup()` awaits `ChargePoint::start` directly before
+        // registering with the CSMS - if `start` pumped the command loop inline instead of
+        // spawning it, this would hang forever instead of completing within the timeout.
+        let config = ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses: vec![EvseConfig { id: 1, connectors: 1 }],
+        };
+
+        // A throwaway runtime, just to mint real event/command channel handles - `start` is
+        // called directly below, not through this runtime.
+        let channel_source = ChargePointRuntime::new(
+            FakeChargePoint::from_config(&config),
+            [1],
+            &TokioExecutor,
+        );
+        let events = channel_source.hardware_events();
+        let commands = channel_source.hardware_commands();
+
+        let charge_point = FakeChargePoint::from_config(&config);
+        let result = tokio::time::timeout(Duration::from_millis(200), charge_point.start(events, commands)).await;
+
+        assert!(result.is_ok(), "start() did not return within the timeout");
+        assert!(result.unwrap().is_ok());
+    }
 
     #[tokio::test]
     async fn lock_and_unlock_flip_the_locked_flag() {

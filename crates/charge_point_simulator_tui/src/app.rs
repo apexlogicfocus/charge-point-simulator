@@ -6,8 +6,9 @@ use crate::screen::Screen;
 use crate::text_field::TextField;
 use crate::theme::{BRAND_TEAL, bordered_block, connection_status_color, connector_status_color};
 use charge_point_simulator_core::charger::{
-    ChargerEntry, ChargerState, Command, ConnectionProfile, ConnectionStore, OcppVersion,
-    SecurityProfile, connect_charger,
+    ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, ConnectionProfile,
+    ConnectionStore, OcppVersion, SecurityProfile, apply_ocpp_state, build_ocpp_event,
+    connect_charger,
 };
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -18,7 +19,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use ratatui::{DefaultTerminal, Frame};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tui_big_text::{BigText, PixelSize};
 
@@ -55,6 +56,15 @@ pub struct App {
     pub connection_password: TextField,
     pub connection_focused_field: usize,
     pub connect_result_receiver: Option<oneshot::Receiver<Result<(), String>>>,
+    /// Live protocol state snapshots forwarded from a connected OCPP 2.1 charger's
+    /// background connection thread, drained each frame by [`Self::drain_ocpp_state_receiver`].
+    pub ocpp_state_receiver: Option<UnboundedReceiver<ChargePointState>>,
+    /// Where dispatched commands go instead of the local simulation, once connected to a
+    /// real CSMS (see [`Self::apply_command`]).
+    pub ocpp_event_sender: Option<UnboundedSender<ChargePointEvent>>,
+    /// The most recent snapshot from `ocpp_state_receiver`, used to decide what event a
+    /// dispatched command maps to (see [`charge_point_simulator_core::charger::build_ocpp_event`]).
+    pub live_ocpp_state: Option<ChargePointState>,
     pub exit: bool,
 }
 
@@ -69,6 +79,7 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             self.drain_log_receiver();
+            self.drain_ocpp_state_receiver();
             self.poll_connect_result();
             terminal.draw(|frame| self.draw(frame))?;
             if self.exit {
@@ -691,7 +702,25 @@ impl App {
         self.apply_command(command, &input);
     }
 
+    /// Dispatches `command` against the focused EVSE. Once connected to a real CSMS (OCPP
+    /// 2.1), this sends the matching `ChargePointEvent` to the live connection instead of
+    /// mutating local state directly - the dashboard picks up the effect once the runtime
+    /// reports it back via [`Self::drain_ocpp_state_receiver`].
     fn apply_command(&mut self, command: Command, input: &str) {
+        if let (Some(ocpp_state), Some(sender)) = (&self.live_ocpp_state, &self.ocpp_event_sender) {
+            match build_ocpp_event(ocpp_state, self.focused_evse, command, input) {
+                Some(event) => {
+                    let _ = sender.send(event);
+                    self.logs.push(format!("{} sent to CSMS", command.label()));
+                    self.status_message = Some(format!("→ {}", command.label()));
+                }
+                None => {
+                    self.status_message = Some(format!("✗ {} not ready yet", command.label()));
+                }
+            }
+            return;
+        }
+
         let Some(state) = &mut self.charger_state else {
             return;
         };
@@ -786,23 +815,55 @@ impl App {
         self.screen = Screen::Dashboard;
 
         if !profile.csms_url.trim().is_empty() {
-            let (sender, receiver) = oneshot::channel();
-            self.connect_result_receiver = Some(receiver);
+            let (result_sender, result_receiver) = oneshot::channel();
+            self.connect_result_receiver = Some(result_receiver);
+
+            let (state_sender, state_receiver) = mpsc::unbounded_channel();
+            self.ocpp_state_receiver = Some(state_receiver);
+
+            let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+            self.ocpp_event_sender = Some(event_sender);
+
             // `connect_and_setup`'s future isn't `Send` (upstream uses non-Send sync
             // primitives internally), so it can't go through `tokio::spawn`. A dedicated
             // thread with its own single-threaded runtime sidesteps that: `block_on`
-            // doesn't require `Send`.
+            // doesn't require `Send`. Unlike a one-shot connect attempt, this thread
+            // outlives the initial handshake: once connected, it forwards every live state
+            // snapshot and every dispatched command for as long as the App's receiver/sender
+            // ends of these channels stay alive (dropped in `return_to_picker`, which ends
+            // both loops and lets the thread exit).
             std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let tokio_runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("failed to build a runtime for the CSMS connection attempt");
-                let outcome = runtime.block_on(connect_charger(&config, &profile));
-                let result = match &outcome {
-                    Ok(_) => Ok(()),
-                    Err(error) => Err(error.to_string()),
-                };
-                let _ = sender.send(result);
+                tokio_runtime.block_on(async move {
+                    match connect_charger(&config, &profile).await {
+                        Ok(charge_point_runtime) => {
+                            let _ = result_sender.send(Ok(()));
+
+                            let mut ocpp_states = charge_point_runtime.subscribe();
+                            let forward_states = async {
+                                loop {
+                                    ocpp_states.changed().await;
+                                    let state = ocpp_states.borrow();
+                                    if state_sender.send(state).is_err() {
+                                        break;
+                                    }
+                                }
+                            };
+                            let forward_commands = async {
+                                while let Some(event) = event_receiver.recv().await {
+                                    let _ = charge_point_runtime.send(event).await;
+                                }
+                            };
+                            tokio::join!(forward_states, forward_commands);
+                        }
+                        Err(error) => {
+                            let _ = result_sender.send(Err(error.to_string()));
+                        }
+                    }
+                });
             });
         }
     }
@@ -829,9 +890,15 @@ impl App {
         }
     }
 
+    /// Drops the live-connection channels (if any), which ends the background connection
+    /// thread's forwarding loops and lets it exit, rather than leaving it running against a
+    /// charger that's no longer shown.
     fn return_to_picker(&mut self) {
         self.charger_state = None;
         self.status_message = None;
+        self.ocpp_state_receiver = None;
+        self.ocpp_event_sender = None;
+        self.live_ocpp_state = None;
         self.screen = Screen::PickCharger;
     }
 
@@ -843,6 +910,21 @@ impl App {
         };
         while let Ok(line) = receiver.try_recv() {
             self.logs.push(line);
+        }
+    }
+
+    /// Pulls every live protocol state snapshot forwarded from a connected OCPP 2.1 charger's
+    /// background connection thread, applying each to the dashboard's display state and
+    /// remembering the latest one for [`Self::apply_command`] to dispatch against.
+    fn drain_ocpp_state_receiver(&mut self) {
+        let Some(receiver) = &mut self.ocpp_state_receiver else {
+            return;
+        };
+        while let Ok(state) = receiver.try_recv() {
+            if let Some(charger_state) = &mut self.charger_state {
+                apply_ocpp_state(charger_state, &state);
+            }
+            self.live_ocpp_state = Some(state);
         }
     }
 }
@@ -860,6 +942,9 @@ mod tests {
     use super::*;
     use charge_point_simulator_core::charger::{
         ChargerConfig, ChargerSource, ConnectionStatus, EvseConfig, OcppVersion,
+    };
+    use ocpp_charge_point::state::{
+        ConnectorEvent, ConnectorState as OcppConnectorState, EvseEvent, RegistrationStatus,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1425,6 +1510,8 @@ mod tests {
 
         assert_eq!(app.screen, Screen::Dashboard);
         assert!(app.connect_result_receiver.is_some());
+        assert!(app.ocpp_state_receiver.is_some());
+        assert!(app.ocpp_event_sender.is_some());
         let remembered = app.connection_store.get("CP-2.1").unwrap();
         assert_eq!(remembered.csms_url, "ws://localhost:9999/dev");
         assert_eq!(remembered.ocpp_identity, "CP-2.1");
@@ -1479,5 +1566,86 @@ mod tests {
 
         assert_eq!(app.status_message, None);
         assert!(app.connect_result_receiver.is_some());
+    }
+
+    fn ocpp_state_with(connector: OcppConnectorState) -> ChargePointState {
+        let mut state = ChargePointState::new([1]);
+        state.registration = Some(RegistrationStatus::Accepted);
+        state.evses[0].connectors[0] = connector;
+        state
+    }
+
+    #[test]
+    fn drain_ocpp_state_receiver_applies_incoming_snapshots_and_remembers_the_latest() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        app.ocpp_state_receiver = Some(receiver);
+
+        sender.send(ocpp_state_with(OcppConnectorState::Locked)).unwrap();
+        app.drain_ocpp_state_receiver();
+
+        assert_eq!(
+            app.charger_state.as_ref().unwrap().connection_status,
+            ConnectionStatus::Connected
+        );
+        assert_eq!(app.live_ocpp_state.as_ref().unwrap().evses[0].connectors[0], OcppConnectorState::Locked);
+    }
+
+    #[test]
+    fn apply_command_sends_the_matching_event_when_connected_to_a_real_csms() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.ocpp_event_sender = Some(sender);
+        app.live_ocpp_state = Some(ocpp_state_with(OcppConnectorState::Available));
+
+        app.apply_command(Command::PlugInVehicle, "");
+
+        let sent = receiver.try_recv().unwrap();
+        assert_eq!(
+            sent,
+            ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::CableConnected,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn apply_command_reports_not_ready_when_no_connector_is_eligible_yet() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.ocpp_event_sender = Some(sender);
+        app.live_ocpp_state = Some(ocpp_state_with(OcppConnectorState::Charging));
+
+        app.apply_command(Command::PlugInVehicle, "");
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            app.status_message,
+            Some("✗ Plug in vehicle not ready yet".to_string())
+        );
+    }
+
+    #[test]
+    fn returning_to_the_picker_tears_down_the_live_connection_channels() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        let (_sender, receiver) = mpsc::unbounded_channel::<ChargePointState>();
+        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        app.ocpp_state_receiver = Some(receiver);
+        app.ocpp_event_sender = Some(event_sender);
+        app.live_ocpp_state = Some(ocpp_state_with(OcppConnectorState::Available));
+
+        app.handle_key_event(key(KeyCode::Esc));
+
+        assert!(app.ocpp_state_receiver.is_none());
+        assert!(app.ocpp_event_sender.is_none());
+        assert!(app.live_ocpp_state.is_none());
     }
 }

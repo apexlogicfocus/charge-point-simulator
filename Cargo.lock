@@ -248,6 +248,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "dirs",
+ "ocpp-charge-point",
  "ratatui",
  "tokio",
  "tracing",
