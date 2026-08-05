@@ -241,7 +241,23 @@ impl App {
     }
 
     fn render_dashboard(&self, frame: &mut Frame) {
-        let layout = dashboard_layout(frame.area());
+        let has_display = self
+            .charger_state
+            .as_ref()
+            .is_some_and(|state| state.config.has_display);
+        let layout = dashboard_layout(frame.area(), has_display);
+
+        if has_display {
+            let message = self
+                .charger_state
+                .as_ref()
+                .and_then(|state| state.display_message.as_deref())
+                .unwrap_or("(blank)");
+            frame.render_widget(
+                Paragraph::new(message).block(bordered_block("Display")),
+                layout.display,
+            );
+        }
 
         let overview_line = match &self.charger_state {
             Some(state) => Line::from(vec![
@@ -456,12 +472,16 @@ impl App {
         let Some(state) = &self.charger_state else {
             return Vec::new();
         };
-        let Some(evse) = state.evses.get(self.focused_evse) else {
-            return Vec::new();
-        };
+        let evse = state.evses.get(self.focused_evse);
         Command::ALL
             .into_iter()
-            .filter(|command| command.is_available(evse))
+            .filter(|command| {
+                if command.is_display_command() {
+                    command.is_available_for_charger(state)
+                } else {
+                    evse.is_some_and(|evse| command.is_available(evse))
+                }
+            })
             .collect()
     }
 
@@ -706,7 +726,21 @@ impl App {
     /// 2.1), this sends the matching `ChargePointEvent` to the live connection instead of
     /// mutating local state directly - the dashboard picks up the effect once the runtime
     /// reports it back via [`Self::drain_ocpp_state_receiver`].
+    ///
+    /// Display commands are the exception: `ocpp-charge-point` doesn't implement the
+    /// DisplayMessage functional block yet, so `SetDisplayMessage`/`ClearDisplayMessage`
+    /// always apply locally, live CSMS connection or not.
     fn apply_command(&mut self, command: Command, input: &str) {
+        if command.is_display_command() {
+            if let Some(state) = &mut self.charger_state
+                && let Some(log_line) = command.apply_to_charger(state, input)
+            {
+                self.logs.push(log_line);
+                self.status_message = Some(format!("✓ {}", command.label()));
+            }
+            return;
+        }
+
         if let (Some(ocpp_state), Some(sender)) = (&self.live_ocpp_state, &self.ocpp_event_sender) {
             match build_ocpp_event(ocpp_state, self.focused_evse, command, input) {
                 Some(event) => {
@@ -961,6 +995,7 @@ mod tests {
                 id: id.into(),
                 ocpp_version: OcppVersion::V16J,
                 evses,
+                has_display: false,
             },
             source: ChargerSource::BuiltIn,
         }
@@ -972,6 +1007,19 @@ mod tests {
                 id: id.into(),
                 ocpp_version: OcppVersion::V21,
                 evses: vec![EvseConfig { id: 1, connectors: 1 }],
+                has_display: false,
+            },
+            source: ChargerSource::BuiltIn,
+        }
+    }
+
+    fn charger_with_display(id: &str) -> ChargerEntry {
+        ChargerEntry {
+            config: ChargerConfig {
+                id: id.into(),
+                ocpp_version: OcppVersion::V16J,
+                evses: vec![EvseConfig { id: 1, connectors: 1 }],
+                has_display: true,
             },
             source: ChargerSource::BuiltIn,
         }
@@ -1188,6 +1236,72 @@ mod tests {
         let mut app = App::new(vec![]);
         app.handle_key_event(key(KeyCode::Char('c')));
         assert!(!app.command_palette_open);
+    }
+
+    #[test]
+    fn a_charger_without_a_display_never_offers_display_commands() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+
+        let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
+        assert!(!labels.contains(&"Set display message"));
+        assert!(!labels.contains(&"Clear display message"));
+    }
+
+    #[test]
+    fn a_charger_with_a_display_offers_set_but_not_clear_until_a_message_is_showing() {
+        let mut app = App::new(vec![charger_with_display("CP-display")]);
+        app.confirm_charger_selection();
+
+        let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
+        assert!(labels.contains(&"Set display message"));
+        assert!(!labels.contains(&"Clear display message"));
+    }
+
+    #[test]
+    fn setting_a_display_message_shows_it_and_then_offers_clear() {
+        let mut app = App::new(vec![charger_with_display("CP-display")]);
+        app.confirm_charger_selection();
+
+        app.apply_command(Command::SetDisplayMessage, "Welcome to Flowion");
+
+        assert_eq!(
+            app.charger_state.as_ref().unwrap().display_message,
+            Some("Welcome to Flowion".to_string())
+        );
+        assert_eq!(
+            app.status_message,
+            Some("✓ Set display message".to_string())
+        );
+        let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
+        assert!(labels.contains(&"Clear display message"));
+    }
+
+    #[test]
+    fn clearing_a_display_message_blanks_it() {
+        let mut app = App::new(vec![charger_with_display("CP-display")]);
+        app.confirm_charger_selection();
+        app.apply_command(Command::SetDisplayMessage, "hello");
+
+        app.apply_command(Command::ClearDisplayMessage, "");
+
+        assert_eq!(app.charger_state.as_ref().unwrap().display_message, None);
+    }
+
+    #[test]
+    fn display_commands_apply_locally_even_when_a_live_csms_sender_is_present() {
+        let mut app = App::new(vec![charger_with_display("CP-display")]);
+        app.confirm_charger_selection();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.ocpp_event_sender = Some(sender);
+
+        app.apply_command(Command::SetDisplayMessage, "hello");
+
+        assert_eq!(
+            app.charger_state.as_ref().unwrap().display_message,
+            Some("hello".to_string())
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

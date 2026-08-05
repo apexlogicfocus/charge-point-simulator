@@ -35,6 +35,11 @@ pub struct ChargerConfig {
     pub ocpp_version: OcppVersion,
     #[serde(default)]
     pub evses: Vec<EvseConfig>,
+    /// Whether this charger has a physical display (OCPP 2.x's DisplayMessage functional
+    /// block: `SetDisplayMessage`/`ClearDisplayMessage`). Defaults to `false` - most chargers
+    /// in the wild are display-less.
+    #[serde(default)]
+    pub has_display: bool,
 }
 
 impl ChargerConfig {
@@ -69,8 +74,36 @@ mod tests {
                     id: 1,
                     connectors: 1
                 }],
+                has_display: false,
             }
         );
+    }
+
+    #[test]
+    fn defaults_to_no_display_when_omitted() {
+        let config = ChargerConfig::from_yaml(
+            r#"
+            id: CP005
+            ocpp_version: "2.1"
+            "#,
+        )
+        .unwrap();
+
+        assert!(!config.has_display);
+    }
+
+    #[test]
+    fn parses_a_charger_with_a_display() {
+        let config = ChargerConfig::from_yaml(
+            r#"
+            id: CP006
+            ocpp_version: "2.1"
+            has_display: true
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.has_display);
     }
 
     #[test]

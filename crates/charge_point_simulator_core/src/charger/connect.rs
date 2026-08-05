@@ -71,9 +71,11 @@ mod tests {
             id: "sim-test".into(),
             ocpp_version: OcppVersion::V21,
             evses: vec![],
+            has_display: false,
         };
         let profile = ConnectionProfile {
-            csms_url: "http://localhost:8082/flowion/dev".into(),
+            csms_url: std::env::var("OCPP_TEST_URL")
+                .unwrap_or_else(|_| "http://localhost:8082/flowion/dev".into()),
             ocpp_identity: std::env::var("OCPP_TEST_IDENTITY").unwrap_or_else(|_| "sim-test".into()),
             security: SecurityProfile::basic(
                 std::env::var("OCPP_TEST_PASSWORD").unwrap_or_default(),

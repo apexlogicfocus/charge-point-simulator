@@ -162,6 +162,7 @@ mod tests {
             id: "CP001".into(),
             ocpp_version: OcppVersion::V21,
             evses: vec![EvseConfig { id: 1, connectors: 1 }],
+            has_display: false,
         };
 
         // A throwaway runtime, just to mint real event/command channel handles - `start` is
@@ -214,6 +215,7 @@ mod tests {
                 EvseConfig { id: 1, connectors: 2 },
                 EvseConfig { id: 2, connectors: 1 },
             ],
+            has_display: false,
         };
 
         let charge_point = FakeChargePoint::from_config(&config);
@@ -231,6 +233,7 @@ mod tests {
             id: "CP002".into(),
             ocpp_version: OcppVersion::V21,
             evses: vec![],
+            has_display: false,
         };
 
         let charge_point = FakeChargePoint::from_config(&config);

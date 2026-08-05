@@ -144,6 +144,7 @@ mod tests {
             id: "CP001".into(),
             ocpp_version: OcppVersion::V21,
             evses: vec![EvseConfig { id: 1, connectors: 2 }],
+            has_display: false,
         })
     }
 

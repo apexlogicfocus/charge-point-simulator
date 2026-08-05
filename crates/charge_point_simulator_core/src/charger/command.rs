@@ -1,8 +1,13 @@
-use super::state::{ConnectorStatus, EvseState, Vehicle};
+use super::state::{ChargerState, ConnectorStatus, EvseState, Vehicle};
 
 /// A simulated real-world event that can be dispatched against an EVSE, e.g.
 /// a vehicle plugging in or a connector faulting. Each command targets the
 /// first connector within the EVSE that's in an eligible state for it.
+///
+/// `SetDisplayMessage`/`ClearDisplayMessage` are the exception: a charger's display isn't
+/// per-EVSE, so those two target the charger as a whole (see
+/// [`Command::is_display_command`]/[`Command::is_available_for_charger`]/[`Command::apply_to_charger`]
+/// instead of the EVSE-scoped methods).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     PlugInVehicle,
@@ -10,6 +15,8 @@ pub enum Command {
     UnplugVehicle,
     ReportFault,
     ClearFault,
+    SetDisplayMessage,
+    ClearDisplayMessage,
 }
 
 /// A single free-text value a [`Command`] needs before it can be applied,
@@ -19,6 +26,7 @@ pub enum CommandParameter {
     VehicleId,
     RfidTag,
     FaultCode,
+    DisplayMessage,
 }
 
 impl CommandParameter {
@@ -28,17 +36,20 @@ impl CommandParameter {
             CommandParameter::VehicleId => "Vehicle ID",
             CommandParameter::RfidTag => "RFID tag",
             CommandParameter::FaultCode => "Fault code",
+            CommandParameter::DisplayMessage => "Display message",
         }
     }
 }
 
 impl Command {
-    pub const ALL: [Command; 5] = [
+    pub const ALL: [Command; 7] = [
         Command::PlugInVehicle,
         Command::PresentRfid,
         Command::UnplugVehicle,
         Command::ReportFault,
         Command::ClearFault,
+        Command::SetDisplayMessage,
+        Command::ClearDisplayMessage,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -48,6 +59,8 @@ impl Command {
             Command::UnplugVehicle => "Unplug vehicle",
             Command::ReportFault => "Report fault",
             Command::ClearFault => "Clear fault",
+            Command::SetDisplayMessage => "Set display message",
+            Command::ClearDisplayMessage => "Clear display message",
         }
     }
 
@@ -57,7 +70,50 @@ impl Command {
             Command::PlugInVehicle => Some(CommandParameter::VehicleId),
             Command::PresentRfid => Some(CommandParameter::RfidTag),
             Command::ReportFault => Some(CommandParameter::FaultCode),
-            Command::UnplugVehicle | Command::ClearFault => None,
+            Command::SetDisplayMessage => Some(CommandParameter::DisplayMessage),
+            Command::UnplugVehicle | Command::ClearFault | Command::ClearDisplayMessage => None,
+        }
+    }
+
+    /// Whether this command targets the charger's display as a whole rather than a specific
+    /// EVSE - `SetDisplayMessage`/`ClearDisplayMessage` use
+    /// [`Self::is_available_for_charger`]/[`Self::apply_to_charger`] instead of the EVSE-scoped
+    /// [`Self::is_available`]/[`Self::apply`].
+    pub fn is_display_command(&self) -> bool {
+        matches!(self, Command::SetDisplayMessage | Command::ClearDisplayMessage)
+    }
+
+    /// Whether `charger` is eligible for this display command: it needs a display, and
+    /// (for `ClearDisplayMessage`) an actual message showing.
+    pub fn is_available_for_charger(&self, charger: &ChargerState) -> bool {
+        if !charger.config.has_display {
+            return false;
+        }
+        match self {
+            Command::SetDisplayMessage => true,
+            Command::ClearDisplayMessage => charger.display_message.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Applies a display command to `charger`, returning a human-readable log line. Returns
+    /// `None` if this isn't a display command, or the charger has no display.
+    pub fn apply_to_charger(&self, charger: &mut ChargerState, input: &str) -> Option<String> {
+        if !charger.config.has_display {
+            return None;
+        }
+        match self {
+            Command::SetDisplayMessage => {
+                let input = input.trim();
+                let message = if input.is_empty() { "Welcome" } else { input };
+                charger.display_message = Some(message.to_string());
+                Some(format!("display message set: \"{message}\""))
+            }
+            Command::ClearDisplayMessage => {
+                charger.display_message = None;
+                Some("display message cleared".to_string())
+            }
+            _ => None,
         }
     }
 
@@ -77,6 +133,9 @@ impl Command {
             }
             Command::ReportFault => status != ConnectorStatus::Faulted,
             Command::ClearFault => status == ConnectorStatus::Faulted,
+            // Display commands target the charger as a whole, not a connector - see
+            // `is_available_for_charger` instead.
+            Command::SetDisplayMessage | Command::ClearDisplayMessage => false,
         }
     }
 
@@ -144,6 +203,11 @@ impl Command {
                 connector.status = ConnectorStatus::Available;
                 format!("EVSE {} connector {}: fault cleared", evse.id, connector.id)
             }
+            // `applies_to` always returns `false` for these, so the `?` above already
+            // returned before a connector could ever be found for one.
+            Command::SetDisplayMessage | Command::ClearDisplayMessage => unreachable!(
+                "display commands never match a connector via applies_to"
+            ),
         };
 
         Some(message)
@@ -153,7 +217,17 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::charger::config::{ChargerConfig, OcppVersion};
     use crate::charger::state::ConnectorState;
+
+    fn charger_with_display(has_display: bool) -> ChargerState {
+        ChargerState::from_config(ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses: vec![],
+            has_display,
+        })
+    }
 
     fn evse_with_statuses(statuses: &[ConnectorStatus]) -> EvseState {
         EvseState {
@@ -300,5 +374,69 @@ mod tests {
         assert_eq!(Command::ReportFault.parameter(), Some(CommandParameter::FaultCode));
         assert_eq!(Command::UnplugVehicle.parameter(), None);
         assert_eq!(Command::ClearFault.parameter(), None);
+        assert_eq!(
+            Command::SetDisplayMessage.parameter(),
+            Some(CommandParameter::DisplayMessage)
+        );
+        assert_eq!(Command::ClearDisplayMessage.parameter(), None);
+    }
+
+    #[test]
+    fn only_the_display_commands_are_flagged_as_display_commands() {
+        assert!(Command::SetDisplayMessage.is_display_command());
+        assert!(Command::ClearDisplayMessage.is_display_command());
+        assert!(!Command::PlugInVehicle.is_display_command());
+        assert!(!Command::ReportFault.is_display_command());
+    }
+
+    #[test]
+    fn set_display_message_needs_a_display() {
+        assert!(!Command::SetDisplayMessage.is_available_for_charger(&charger_with_display(false)));
+        assert!(Command::SetDisplayMessage.is_available_for_charger(&charger_with_display(true)));
+    }
+
+    #[test]
+    fn clear_display_message_also_needs_a_message_actually_showing() {
+        let mut charger = charger_with_display(true);
+        assert!(!Command::ClearDisplayMessage.is_available_for_charger(&charger));
+
+        charger.display_message = Some("hello".to_string());
+        assert!(Command::ClearDisplayMessage.is_available_for_charger(&charger));
+    }
+
+    #[test]
+    fn set_display_message_stores_the_given_text() {
+        let mut charger = charger_with_display(true);
+        let message = Command::SetDisplayMessage.apply_to_charger(&mut charger, "Welcome to Flowion").unwrap();
+
+        assert_eq!(charger.display_message, Some("Welcome to Flowion".to_string()));
+        assert!(message.contains("Welcome to Flowion"));
+    }
+
+    #[test]
+    fn set_display_message_falls_back_to_a_default_when_left_blank() {
+        let mut charger = charger_with_display(true);
+        Command::SetDisplayMessage.apply_to_charger(&mut charger, "  ").unwrap();
+
+        assert_eq!(charger.display_message, Some("Welcome".to_string()));
+    }
+
+    #[test]
+    fn clear_display_message_blanks_the_message() {
+        let mut charger = charger_with_display(true);
+        charger.display_message = Some("hello".to_string());
+
+        Command::ClearDisplayMessage.apply_to_charger(&mut charger, "").unwrap();
+
+        assert_eq!(charger.display_message, None);
+    }
+
+    #[test]
+    fn display_commands_do_nothing_on_a_charger_without_a_display() {
+        let mut charger = charger_with_display(false);
+        let result = Command::SetDisplayMessage.apply_to_charger(&mut charger, "hi");
+
+        assert_eq!(result, None);
+        assert_eq!(charger.display_message, None);
     }
 }

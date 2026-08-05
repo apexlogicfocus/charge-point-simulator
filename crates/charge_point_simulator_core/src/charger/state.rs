@@ -86,6 +86,10 @@ pub struct ChargerState {
     pub config: ChargerConfig,
     pub connection_status: ConnectionStatus,
     pub evses: Vec<EvseState>,
+    /// The message currently shown on the charger's display (`None` if it's blank), only
+    /// meaningful when `config.has_display` is `true`. Set/cleared via
+    /// [`crate::charger::Command::SetDisplayMessage`]/[`crate::charger::Command::ClearDisplayMessage`].
+    pub display_message: Option<String>,
 }
 
 impl ChargerState {
@@ -118,6 +122,7 @@ impl ChargerState {
             connection_status: ConnectionStatus::Booting,
             evses,
             config,
+            display_message: None,
         }
     }
 }
@@ -132,6 +137,7 @@ mod tests {
             id: "CP001".into(),
             ocpp_version: OcppVersion::V16J,
             evses,
+            has_display: false,
         }
     }
 
@@ -184,6 +190,12 @@ mod tests {
         let connector = &state.evses[0].connectors[0];
         assert_eq!(connector.status, ConnectorStatus::Available);
         assert_eq!(connector.vehicle, None);
+    }
+
+    #[test]
+    fn a_fresh_charger_has_no_display_message() {
+        let state = ChargerState::from_config(config(vec![]));
+        assert_eq!(state.display_message, None);
     }
 
     #[test]

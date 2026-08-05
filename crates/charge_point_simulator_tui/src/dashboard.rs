@@ -4,6 +4,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DashboardLayout {
     pub overview: Rect,
+    /// Zero height when the charger has no display - see [`dashboard_layout`]'s `has_display`.
+    pub display: Rect,
     pub evse_strip: Rect,
     pub evse_detail: Rect,
     pub log: Rect,
@@ -11,6 +13,7 @@ pub struct DashboardLayout {
 }
 
 const OVERVIEW_HEIGHT: u16 = 3;
+const DISPLAY_HEIGHT: u16 = 3;
 const EVSE_STRIP_HEIGHT: u16 = 3;
 const LOG_HEIGHT: u16 = 8;
 const COMMAND_BAR_HEIGHT: u16 = 1;
@@ -25,13 +28,16 @@ pub fn is_terminal_too_small(area: Rect) -> bool {
     area.width < MIN_WIDTH || area.height < MIN_HEIGHT
 }
 
-/// Splits `area` into overview / EVSE strip / EVSE detail / log / command bar
-/// regions, stacked top to bottom. The EVSE detail panel takes whatever
-/// vertical space is left over, shrinking to nothing rather than panicking
-/// when the terminal is too small to fit everything.
-pub fn dashboard_layout(area: Rect) -> DashboardLayout {
-    let [overview, evse_strip, evse_detail, log, command_bar] = Layout::vertical([
+/// Splits `area` into overview / display / EVSE strip / EVSE detail / log / command bar
+/// regions, stacked top to bottom. The display region only reserves space when
+/// `has_display` is true (chargers without one skip it entirely, rather than showing an
+/// empty panel). The EVSE detail panel takes whatever vertical space is left over, shrinking
+/// to nothing rather than panicking when the terminal is too small to fit everything.
+pub fn dashboard_layout(area: Rect, has_display: bool) -> DashboardLayout {
+    let display_height = if has_display { DISPLAY_HEIGHT } else { 0 };
+    let [overview, display, evse_strip, evse_detail, log, command_bar] = Layout::vertical([
         Constraint::Length(OVERVIEW_HEIGHT),
+        Constraint::Length(display_height),
         Constraint::Length(EVSE_STRIP_HEIGHT),
         Constraint::Min(0),
         Constraint::Length(LOG_HEIGHT),
@@ -41,6 +47,7 @@ pub fn dashboard_layout(area: Rect) -> DashboardLayout {
 
     DashboardLayout {
         overview,
+        display,
         evse_strip,
         evse_detail,
         log,
@@ -58,10 +65,11 @@ mod tests {
 
     #[test]
     fn stacks_regions_top_to_bottom_in_order() {
-        let layout = dashboard_layout(area(80, 40));
+        let layout = dashboard_layout(area(80, 40), true);
 
         assert_eq!(layout.overview.y, 0);
-        assert_eq!(layout.evse_strip.y, layout.overview.bottom());
+        assert_eq!(layout.display.y, layout.overview.bottom());
+        assert_eq!(layout.evse_strip.y, layout.display.bottom());
         assert_eq!(layout.evse_detail.y, layout.evse_strip.bottom());
         assert_eq!(layout.log.y, layout.evse_detail.bottom());
         assert_eq!(layout.command_bar.y, layout.log.bottom());
@@ -70,28 +78,39 @@ mod tests {
 
     #[test]
     fn fixed_regions_use_their_configured_height_when_space_allows() {
-        let layout = dashboard_layout(area(80, 40));
+        let layout = dashboard_layout(area(80, 40), true);
 
         assert_eq!(layout.overview.height, OVERVIEW_HEIGHT);
+        assert_eq!(layout.display.height, DISPLAY_HEIGHT);
         assert_eq!(layout.evse_strip.height, EVSE_STRIP_HEIGHT);
         assert_eq!(layout.log.height, LOG_HEIGHT);
         assert_eq!(layout.command_bar.height, COMMAND_BAR_HEIGHT);
     }
 
     #[test]
+    fn the_display_region_takes_no_space_when_the_charger_has_no_display() {
+        let layout = dashboard_layout(area(80, 40), false);
+
+        assert_eq!(layout.display.height, 0);
+        assert_eq!(layout.evse_strip.y, layout.overview.bottom());
+    }
+
+    #[test]
     fn evse_detail_absorbs_the_remaining_space() {
-        let layout = dashboard_layout(area(80, 40));
-        let fixed_height = OVERVIEW_HEIGHT + EVSE_STRIP_HEIGHT + LOG_HEIGHT + COMMAND_BAR_HEIGHT;
+        let layout = dashboard_layout(area(80, 40), true);
+        let fixed_height =
+            OVERVIEW_HEIGHT + DISPLAY_HEIGHT + EVSE_STRIP_HEIGHT + LOG_HEIGHT + COMMAND_BAR_HEIGHT;
 
         assert_eq!(layout.evse_detail.height, 40 - fixed_height);
     }
 
     #[test]
     fn regions_span_the_full_width() {
-        let layout = dashboard_layout(area(80, 40));
+        let layout = dashboard_layout(area(80, 40), true);
 
         for region in [
             layout.overview,
+            layout.display,
             layout.evse_strip,
             layout.evse_detail,
             layout.log,
@@ -103,7 +122,7 @@ mod tests {
 
     #[test]
     fn shrinks_gracefully_when_the_terminal_is_too_small() {
-        let layout = dashboard_layout(area(80, 2));
+        let layout = dashboard_layout(area(80, 2), true);
 
         assert_eq!(layout.evse_detail.height, 0);
         // Layout still fits within the given area instead of panicking or overflowing.
