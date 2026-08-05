@@ -3,8 +3,8 @@ use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, ConnectionProfile,
-    ConnectionStore, OcppVersion, SecurityProfile, apply_ocpp_state, build_ocpp_event,
-    connect_charger, meter_sample_events,
+    ConnectionStore, OcppVersion, SecurityProfile, SimulationMode, apply_ocpp_state,
+    build_ocpp_event, connect_charger, meter_sample_events,
 };
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -78,6 +78,21 @@ pub struct App {
     /// against [`METER_VALUE_INTERVAL`].
     pub last_meter_value_sent: Option<Instant>,
     pub exit: bool,
+}
+
+/// Decides what `ChargerState::mode` should become from the (possibly blank, possibly
+/// whitespace-padded) CSMS URL field on the connection setup screen. A blank URL means "no
+/// CSMS, run locally"; anything else means a real connection attempt is about to be made.
+///
+/// Kept as a free function, separate from `App::confirm_connection_setup`, specifically so it
+/// can be unit tested as a plain, synchronous decision - without going anywhere near the
+/// background thread `confirm_connection_setup` spawns to actually perform the connection.
+fn resolve_simulation_mode(csms_url: &str) -> SimulationMode {
+    if csms_url.trim().is_empty() {
+        SimulationMode::Local
+    } else {
+        SimulationMode::LiveCsms { url: csms_url.to_string() }
+    }
 }
 
 impl App {
@@ -527,6 +542,13 @@ impl App {
             tracing::warn!(%error, "failed to save connection store");
         }
 
+        // Decide the simulation mode right here, before anything below spawns the connection
+        // thread that would start feeding it live state snapshots - see
+        // `resolve_simulation_mode`'s doc comment for why the ordering matters.
+        if let Some(state) = &mut self.charger_state {
+            state.mode = resolve_simulation_mode(&profile.csms_url);
+        }
+
         self.screen = Screen::Dashboard;
 
         if !profile.csms_url.trim().is_empty() {
@@ -611,6 +633,12 @@ impl App {
     /// Drops the live-connection channels (if any), which ends the background connection
     /// thread's forwarding loops and lets it exit, rather than leaving it running against a
     /// charger that's no longer shown.
+    ///
+    /// This also drops `charger_state` itself, which incidentally takes any `SimulationMode`
+    /// with it: the next charger picked always starts from a fresh
+    /// `ChargerState::from_config`, which defaults to `SimulationMode::Local`. There's nothing
+    /// further to reset here, but it's worth spelling out - a future refactor that made
+    /// `charger_state` persist across selections would need to explicitly reset `mode` too.
     fn return_to_picker(&mut self) {
         self.charger_state = None;
         self.status_message = None;
@@ -1414,6 +1442,22 @@ mod tests {
     }
 
     #[test]
+    fn confirming_with_a_url_puts_the_charger_in_live_csms_mode_with_that_url() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+
+        for c in "ws://localhost:9999/dev".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.charger_state.unwrap().mode,
+            SimulationMode::LiveCsms { url: "ws://localhost:9999/dev".to_string() }
+        );
+    }
+
+    #[test]
     fn confirming_with_a_blank_url_does_not_start_a_connect_attempt() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
         app.confirm_charger_selection();
@@ -1421,6 +1465,61 @@ mod tests {
 
         assert_eq!(app.screen, Screen::Dashboard);
         assert!(app.connect_result_receiver.is_none());
+    }
+
+    #[test]
+    fn confirming_with_a_blank_url_leaves_the_charger_in_local_mode() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(app.charger_state.unwrap().mode, SimulationMode::Local);
+    }
+
+    #[test]
+    fn resolve_simulation_mode_is_local_for_a_blank_or_whitespace_only_url() {
+        assert_eq!(resolve_simulation_mode(""), SimulationMode::Local);
+        assert_eq!(resolve_simulation_mode("   "), SimulationMode::Local);
+    }
+
+    #[test]
+    fn resolve_simulation_mode_is_live_csms_with_the_url_for_a_non_blank_url() {
+        assert_eq!(
+            resolve_simulation_mode("wss://csms.example.com"),
+            SimulationMode::LiveCsms { url: "wss://csms.example.com".to_string() }
+        );
+    }
+
+    #[test]
+    fn a_live_csms_charger_does_not_self_promote_to_connected_on_ticks() {
+        // With a real CSMS connection in the picture, `connection_status` must come from the
+        // OCPP bridge alone (see `SimulationMode`'s doc comment) - `tick`'s simulated boot
+        // timer must never race it and flip the dashboard to "connected" on its own.
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().mode =
+            SimulationMode::LiveCsms { url: "wss://csms.example.com".to_string() };
+
+        app.tick_metrics_with(Duration::from_secs(60), Instant::now());
+
+        assert_eq!(
+            app.charger_state.unwrap().connection_status,
+            ConnectionStatus::Booting
+        );
+    }
+
+    #[test]
+    fn returning_to_the_picker_leaves_no_stale_live_csms_mode_for_the_next_charger() {
+        let mut app = App::new(vec![charger_v21("CP-2.1"), charger("CP001")]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().mode =
+            SimulationMode::LiveCsms { url: "wss://csms.example.com".to_string() };
+
+        app.handle_key_event(key(KeyCode::Esc)); // back to the picker
+        app.handle_key_event(key(KeyCode::Down)); // select CP001 (1.6J, straight to dashboard)
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(app.charger_state.unwrap().mode, SimulationMode::Local);
     }
 
     #[test]

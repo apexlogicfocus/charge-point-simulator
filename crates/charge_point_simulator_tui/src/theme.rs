@@ -213,6 +213,16 @@ pub fn section<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
     Block::new().borders(Borders::TOP).title(title).border_style(style)
 }
 
+/// A block with only a bottom border and no title, the mirror image of [`section`]: the rule
+/// sits *below* its content rather than carrying a title above it. Used for the dashboard's
+/// header line, which introduces the screen (which charger, its connection state, and now its
+/// simulation mode) before the rule separates it from the panels underneath - unlike every
+/// other panel, which titles its rule first and shows content below.
+pub fn header<'a>(focused: bool) -> Block<'a> {
+    let style = if focused { chrome_focused() } else { chrome() };
+    Block::new().borders(Borders::BOTTOM).border_style(style)
+}
+
 pub fn connection_status_color(status: ConnectionStatus) -> Color {
     match status {
         ConnectionStatus::Booting => Color::Yellow,
@@ -435,6 +445,25 @@ mod tests {
         let focused = section("Title", true);
         assert_eq!(unfocused.to_owned(), Block::new().borders(Borders::TOP).title("Title").border_style(chrome()));
         assert_eq!(focused.to_owned(), Block::new().borders(Borders::TOP).title("Title").border_style(chrome_focused()));
+    }
+
+    // --- header() primitive ---------------------------------------------------------
+
+    #[test]
+    fn header_renders_only_a_bottom_border() {
+        let block = header(false);
+        // A block with only Borders::BOTTOM takes exactly one row off the bottom, and none
+        // off the top/left/right - the mirror image of `section`'s top-only border.
+        let inner = block.inner(ratatui::layout::Rect::new(0, 0, 10, 10));
+        assert_eq!(inner, ratatui::layout::Rect::new(0, 0, 10, 9));
+    }
+
+    #[test]
+    fn header_border_style_responds_to_focus() {
+        let unfocused = header(false);
+        let focused = header(true);
+        assert_eq!(unfocused.to_owned(), Block::new().borders(Borders::BOTTOM).border_style(chrome()));
+        assert_eq!(focused.to_owned(), Block::new().borders(Borders::BOTTOM).border_style(chrome_focused()));
     }
 
     #[test]

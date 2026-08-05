@@ -25,7 +25,7 @@ use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargerConfig, ChargerEntry, ChargerSource, ChargerState, Command, ConnectionStatus,
-    EvseConfig, OcppVersion,
+    EvseConfig, OcppVersion, SimulationMode,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -313,6 +313,55 @@ fn dashboard_narrow() {
     let app = charging_dashboard_app();
 
     assert_snapshot("dashboard_narrow", &render(&app, 80, 24));
+}
+
+/// The header's `Local` case: "local simulation" in place of a CSMS URL. Every other
+/// dashboard scenario in this file happens to be `Local` too (it's `ChargerState::from_config`'s
+/// default), but none of them exists specifically to pin down the header's content - this one
+/// does.
+#[test]
+fn dashboard_header_local() {
+    let config = charger_config("CP-LOCAL", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let app = dashboard_app(config);
+
+    assert_snapshot("dashboard_header_local", &render(&app, 120, 34));
+}
+
+/// The header's `LiveCsms` case: the CSMS URL takes the mode segment's place. This is the
+/// piece of information Phase 2b exists to surface - previously nothing on the dashboard told
+/// a user whether their commands reached a real CSMS or just mutated local state.
+#[test]
+fn dashboard_header_live_csms() {
+    let config = charger_config("CP-LIVE", OcppVersion::V21, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let mut app = dashboard_app(config);
+    app.charger_state.as_mut().unwrap().mode = SimulationMode::LiveCsms {
+        url: "wss://csms.example.com/CP-LIVE".to_string(),
+    };
+
+    assert_snapshot("dashboard_header_live_csms", &render(&app, 120, 34));
+}
+
+/// A connection attempt still in flight (`connect_result_receiver` is `Some`): the header
+/// shows an animated spinner and "connecting..." instead of the (still-`Booting`, since the
+/// OCPP bridge hasn't reported anything yet) connection status. The spinner frame is derived
+/// from `uptime` - fixed here at exactly 500ms of simulated time, deterministically picking
+/// the third frame - never from wall-clock time, so this golden can't flake.
+#[test]
+fn dashboard_header_connecting() {
+    let config =
+        charger_config("CP-CONNECTING", OcppVersion::V21, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let mut app = App::new(vec![]);
+    app.screen = Screen::Dashboard;
+    let mut state = ChargerState::from_config(config);
+    state.mode = SimulationMode::LiveCsms {
+        url: "wss://csms.example.com/CP-CONNECTING".to_string(),
+    };
+    state.uptime = Duration::from_millis(500);
+    app.charger_state = Some(state);
+    let (_result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    app.connect_result_receiver = Some(result_receiver);
+
+    assert_snapshot("dashboard_header_connecting", &render(&app, 120, 34));
 }
 
 #[test]
