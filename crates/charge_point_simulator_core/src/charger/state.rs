@@ -72,7 +72,18 @@ impl fmt::Display for ConnectorStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vehicle {
     pub id: String,
-    pub state_of_charge: Option<u8>,
+    /// State of charge as a percentage (0.0-100.0), or `None` when unknown (e.g. a vehicle
+    /// synthesized from a live CSMS snapshot before any SoC has been reported - see
+    /// [`super::ocpp_bridge::apply_ocpp_state`]).
+    ///
+    /// Deliberately an exact `f64`, not a whole-percent `u8`: [`EvseState::tick`] accumulates
+    /// many small simulated increments here (the TUI ticks roughly every ~100ms), and a `u8`
+    /// that gets rounded and written back on every single tick would throw away the sub-percent
+    /// remainder each time - at a slow enough per-tick rate that can round every increment back
+    /// down to zero and leave the value stuck forever, however long simulated time runs (see the
+    /// `EvseState::tick` regression tests comparing many small ticks against one large one).
+    /// Round to a whole percent only where something displays it.
+    pub state_of_charge: Option<f64>,
 }
 
 /// Live metering data for an EVSE.
@@ -88,6 +99,14 @@ pub struct ConnectorState {
     pub id: u32,
     pub status: ConnectorStatus,
     pub vehicle: Option<Vehicle>,
+    /// Simulated time this connector's current charging session has been running, accumulated by
+    /// [`EvseState::tick`] from the same simulated `elapsed` used for metrics - never wall-clock.
+    ///
+    /// It advances only while `status` is `Charging`, holds steady (rather than resetting) across
+    /// a pause such as `Charging -> Occupied -> Charging` (e.g. a cleared fault, or a CSMS
+    /// suspending and resuming the same session), and resets to zero once `status` returns to
+    /// `Available` - the point at which the vehicle is gone and the session is genuinely over.
+    pub session_duration: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,11 +123,37 @@ impl EvseState {
     /// Nominal single-phase voltage used to derive a simulated current reading from power.
     const NOMINAL_VOLTAGE: f64 = 230.0;
 
+    /// Simulated state-of-charge gain per second of simulated time while a connector is
+    /// `Charging`. This is a demo pace, not a physically derived one (it isn't back-calculated
+    /// from [`Self::SIMULATED_CHARGING_POWER_KW`] and a battery capacity) - much like
+    /// [`ChargerState::SIMULATED_BOOT_DURATION`] isn't a real boot time. At this rate, a vehicle
+    /// plugged in at the default 20% (see [`crate::charger::Command::PlugInVehicle`]) reaches
+    /// 100% after exactly 4 simulated minutes of charging, which is fast enough that a session
+    /// visibly progresses within a short live demo without looking instantaneous.
+    const SOC_PERCENT_PER_SECOND: f64 = 1.0 / 3.0;
+
     /// Advances this EVSE's simulated meter reading by `elapsed`: power and current reflect
     /// how many connectors are currently `Charging` (multiple charging connectors on one EVSE
     /// simply add up - this simulator has no per-connector meter, only an EVSE-level one), and
     /// energy accumulates accordingly. Power/current drop to zero (energy holds) once nothing's
     /// charging.
+    ///
+    /// Also drives two pieces of per-connector state from the same simulated `elapsed`: each
+    /// `Charging` connector's [`ConnectorState::session_duration`] accumulates and its plugged-in
+    /// vehicle's [`Vehicle::state_of_charge`] rises (clamped at 100, see
+    /// [`Self::SOC_PERCENT_PER_SECOND`]); a connector that returns to `Available` has its session
+    /// duration reset to zero since the vehicle is gone. Neither field moves for any other
+    /// status (`Occupied`, `Faulted`, `Unavailable`, `Reserved`) - a connector merely paused
+    /// mid-session (e.g. `Charging -> Occupied -> Charging` after a fault clears) holds its
+    /// accumulated duration and SoC rather than losing them, since it's still the same session.
+    ///
+    /// `state_of_charge` accumulates as the exact `f64` it's stored as (see the doc comment on
+    /// [`Vehicle::state_of_charge`]) - it is never rounded to a coarser type mid-simulation, only
+    /// when something displays it, so the result is identical (within floating-point rounding)
+    /// however many ticks the same total elapsed time is split across.
+    ///
+    /// Charging never tapers or stops once the vehicle reaches 100% SoC - that's
+    /// charging-strategy behavior for a later phase, not this simulator's meter/session tick.
     pub fn tick(&mut self, elapsed: std::time::Duration) {
         let charging_connectors = self
             .connectors
@@ -124,6 +169,24 @@ impl EvseState {
             0.0
         };
         self.metrics.energy_kwh += power_kw * (elapsed.as_secs_f64() / 3600.0);
+
+        for connector in &mut self.connectors {
+            match connector.status {
+                ConnectorStatus::Charging => {
+                    connector.session_duration += elapsed;
+                    if let Some(vehicle) = connector.vehicle.as_mut()
+                        && let Some(soc) = vehicle.state_of_charge
+                    {
+                        let increase = Self::SOC_PERCENT_PER_SECOND * elapsed.as_secs_f64();
+                        vehicle.state_of_charge = Some((soc + increase).min(100.0));
+                    }
+                }
+                ConnectorStatus::Available => {
+                    connector.session_duration = Duration::ZERO;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -164,6 +227,7 @@ impl ChargerState {
                         id: connector_id,
                         status: ConnectorStatus::Available,
                         vehicle: None,
+                        session_duration: Duration::ZERO,
                     })
                     .collect(),
                 metrics: EvseMetrics::default(),
@@ -449,5 +513,185 @@ mod tests {
 
         assert_eq!(state.connection_status, ConnectionStatus::Connected);
         assert!(state.evses[0].metrics.energy_kwh > 0.0);
+    }
+
+    #[test]
+    fn a_fresh_connector_has_zero_session_duration() {
+        let state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        assert_eq!(state.evses[0].connectors[0].session_duration, Duration::ZERO);
+    }
+
+    #[test]
+    fn session_duration_accumulates_while_charging() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+
+        state.tick(Duration::from_secs(30));
+        state.tick(Duration::from_secs(30));
+
+        assert_eq!(state.evses[0].connectors[0].session_duration, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn session_duration_does_not_advance_for_a_non_charging_connector() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Occupied;
+
+        state.tick(Duration::from_secs(60));
+
+        assert_eq!(state.evses[0].connectors[0].session_duration, Duration::ZERO);
+    }
+
+    #[test]
+    fn session_duration_holds_steady_rather_than_resetting_across_a_pause() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.tick(Duration::from_secs(60));
+
+        // A fault interrupts the session without unplugging the vehicle.
+        state.evses[0].connectors[0].status = ConnectorStatus::Occupied;
+        state.tick(Duration::from_secs(60));
+        assert_eq!(state.evses[0].connectors[0].session_duration, Duration::from_secs(60));
+
+        // Clearing the fault resumes the same session rather than starting a new one.
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.tick(Duration::from_secs(30));
+
+        assert_eq!(state.evses[0].connectors[0].session_duration, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn session_duration_resets_once_the_connector_returns_to_available() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.tick(Duration::from_secs(60));
+        assert_eq!(state.evses[0].connectors[0].session_duration, Duration::from_secs(60));
+
+        state.evses[0].connectors[0].status = ConnectorStatus::Available;
+        state.tick(Duration::from_secs(1));
+
+        assert_eq!(state.evses[0].connectors[0].session_duration, Duration::ZERO);
+    }
+
+    #[test]
+    fn state_of_charge_rises_while_charging() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.evses[0].connectors[0].vehicle = Some(Vehicle {
+            id: "EV-1".into(),
+            state_of_charge: Some(20.0),
+        });
+
+        // 3 simulated minutes at SOC_PERCENT_PER_SECOND (1/3 %/s) is 60 percentage points.
+        state.tick(Duration::from_secs(180));
+
+        let soc = state.evses[0].connectors[0].vehicle.as_ref().unwrap().state_of_charge.unwrap();
+        assert!((soc - 80.0).abs() < 1e-9, "expected ~80.0, got {soc}");
+    }
+
+    #[test]
+    fn state_of_charge_clamps_at_100_and_keeps_charging() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.evses[0].connectors[0].vehicle = Some(Vehicle {
+            id: "EV-1".into(),
+            state_of_charge: Some(95.0),
+        });
+
+        state.tick(Duration::from_secs(3600));
+
+        let connector = &state.evses[0].connectors[0];
+        assert_eq!(connector.vehicle.as_ref().unwrap().state_of_charge, Some(100.0));
+        // Reaching 100% does not taper or stop the simulated charge - see the doc comment on
+        // `EvseState::tick` - so metrics keep reflecting a charging connector.
+        assert_eq!(state.evses[0].metrics.power_kw, EvseState::SIMULATED_CHARGING_POWER_KW);
+    }
+
+    #[test]
+    fn state_of_charge_does_not_advance_while_not_charging() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Occupied;
+        state.evses[0].connectors[0].vehicle = Some(Vehicle {
+            id: "EV-1".into(),
+            state_of_charge: Some(20.0),
+        });
+
+        state.tick(Duration::from_secs(3600));
+
+        assert_eq!(
+            state.evses[0].connectors[0].vehicle.as_ref().unwrap().state_of_charge,
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn state_of_charge_stays_none_when_unknown() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.evses[0].connectors[0].vehicle = Some(Vehicle {
+            id: "EV-1".into(),
+            state_of_charge: None,
+        });
+
+        state.tick(Duration::from_secs(60));
+
+        assert_eq!(
+            state.evses[0].connectors[0].vehicle.as_ref().unwrap().state_of_charge,
+            None
+        );
+    }
+
+    // Regression test for a real bug: `state_of_charge` used to be an `Option<u8>` that got
+    // rounded and written back on every single tick. At the TUI's real ~100ms tick cadence, one
+    // tick's increase (1/3 %/s * 0.1s = 0.0333...%) rounds straight back down to nothing, so the
+    // value never moved no matter how long the session ran. This drives the same total simulated
+    // time through many small ticks - the shape the real app actually produces - rather than one
+    // big one, which is the only shape the old, buggy tests exercised.
+    #[test]
+    fn state_of_charge_advances_correctly_across_many_small_ticks_like_the_real_app_does() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.evses[0].connectors[0].vehicle = Some(Vehicle {
+            id: "EV-1".into(),
+            state_of_charge: Some(20.0),
+        });
+
+        for _ in 0..600 {
+            state.tick(Duration::from_millis(100));
+        }
+
+        let soc = state.evses[0].connectors[0].vehicle.as_ref().unwrap().state_of_charge.unwrap();
+        assert!(
+            soc > 25.0,
+            "600 ticks of 100ms (60s simulated) should meaningfully raise SoC above 20%, got {soc}"
+        );
+    }
+
+    #[test]
+    fn state_of_charge_is_independent_of_how_the_same_total_elapsed_time_is_split_into_ticks() {
+        let mut many_small_ticks = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        many_small_ticks.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        many_small_ticks.evses[0].connectors[0].vehicle = Some(Vehicle {
+            id: "EV-1".into(),
+            state_of_charge: Some(20.0),
+        });
+        for _ in 0..600 {
+            many_small_ticks.tick(Duration::from_millis(100));
+        }
+
+        let mut one_big_tick = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        one_big_tick.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        one_big_tick.evses[0].connectors[0].vehicle = Some(Vehicle {
+            id: "EV-1".into(),
+            state_of_charge: Some(20.0),
+        });
+        one_big_tick.tick(Duration::from_secs(60));
+
+        let small = many_small_ticks.evses[0].connectors[0].vehicle.as_ref().unwrap().state_of_charge.unwrap();
+        let big = one_big_tick.evses[0].connectors[0].vehicle.as_ref().unwrap().state_of_charge.unwrap();
+        assert!(
+            (small - big).abs() < 1e-6,
+            "600x100ms ticks ({small}) should match one 60s tick ({big}) covering the same simulated time"
+        );
     }
 }

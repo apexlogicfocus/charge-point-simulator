@@ -1,13 +1,17 @@
-use super::state::{ChargerState, ConnectorStatus, EvseState, Vehicle};
+use super::state::{ChargerState, ConnectorState, ConnectorStatus, EvseState, Vehicle};
 
 /// A simulated real-world event that can be dispatched against an EVSE, e.g.
-/// a vehicle plugging in or a connector faulting. Each command targets the
-/// first connector within the EVSE that's in an eligible state for it.
+/// a vehicle plugging in or a connector faulting. [`Self::is_available`]/[`Self::apply`] target
+/// the first connector within the EVSE that's in an eligible state for it;
+/// [`Self::is_available_for_connector`]/[`Self::apply_to`] target one specific connector by index
+/// instead, for callers (e.g. a dashboard focused on a single connector) where silently acting on
+/// a different connector than the one the user is looking at would be a bug. The EVSE-scoped
+/// methods are expressed in terms of the connector-scoped ones.
 ///
 /// `SetDisplayMessage`/`ClearDisplayMessage` are the exception: a charger's display isn't
 /// per-EVSE, so those two target the charger as a whole (see
 /// [`Command::is_display_command`]/[`Command::is_available_for_charger`]/[`Command::apply_to_charger`]
-/// instead of the EVSE-scoped methods).
+/// instead of the EVSE-scoped or connector-scoped methods).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     PlugInVehicle,
@@ -139,6 +143,14 @@ impl Command {
         }
     }
 
+    /// Whether `connector` is individually eligible for this command - the same eligibility rule
+    /// [`Self::is_available`] applies across every connector in an EVSE, exposed per-connector for
+    /// callers that need to check (or explain) one specific connector rather than the EVSE as a
+    /// whole.
+    pub fn is_available_for_connector(&self, connector: &ConnectorState) -> bool {
+        self.applies_to(connector.status)
+    }
+
     /// Applies this command to the first eligible connector in `evse`,
     /// mutating its state and returning a human-readable log line. Returns
     /// `None` (and mutates nothing) if no connector is eligible.
@@ -146,29 +158,48 @@ impl Command {
     /// `input` is the value collected for this command's [`parameter`](Self::parameter),
     /// or blank for commands that don't have one. A blank value falls back to a
     /// generated default rather than rejecting the command.
+    ///
+    /// This is [`Self::apply_to`] aimed at whichever connector comes first; callers that already
+    /// know which connector they mean (e.g. a UI focused on one) should use `apply_to` directly
+    /// rather than relying on this "first eligible" search picking the right one.
     pub fn apply(&self, evse: &mut EvseState, input: &str) -> Option<String> {
-        let status_applies = |status| self.applies_to(status);
-        let connector = evse
+        let connector_index = evse
             .connectors
-            .iter_mut()
-            .find(|connector| status_applies(connector.status))?;
+            .iter()
+            .position(|connector| self.applies_to(connector.status))?;
+        self.apply_to(evse, connector_index, input)
+    }
+
+    /// Applies this command to the connector at `connector_index` within `evse`, mutating its
+    /// state and returning a human-readable log line. Returns `None` (and mutates nothing) if
+    /// `connector_index` is out of range or that connector isn't eligible for this command.
+    ///
+    /// `input` is the value collected for this command's [`parameter`](Self::parameter),
+    /// or blank for commands that don't have one. A blank value falls back to a
+    /// generated default rather than rejecting the command.
+    pub fn apply_to(&self, evse: &mut EvseState, connector_index: usize, input: &str) -> Option<String> {
+        let evse_id = evse.id;
+        let connector = evse.connectors.get_mut(connector_index)?;
+        if !self.applies_to(connector.status) {
+            return None;
+        }
         let input = input.trim();
 
         let message = match self {
             Command::PlugInVehicle => {
                 let vehicle_id = if input.is_empty() {
-                    format!("EV-E{}C{}", evse.id, connector.id)
+                    format!("EV-E{}C{}", evse_id, connector.id)
                 } else {
                     input.to_string()
                 };
                 connector.status = ConnectorStatus::Occupied;
                 connector.vehicle = Some(Vehicle {
                     id: vehicle_id.clone(),
-                    state_of_charge: Some(20),
+                    state_of_charge: Some(20.0),
                 });
                 format!(
                     "EVSE {} connector {}: vehicle {} plugged in",
-                    evse.id, connector.id, vehicle_id
+                    evse_id, connector.id, vehicle_id
                 )
             }
             Command::PresentRfid => {
@@ -176,7 +207,7 @@ impl Command {
                 connector.status = ConnectorStatus::Charging;
                 format!(
                     "EVSE {} connector {}: RFID {} presented, charging started",
-                    evse.id, connector.id, tag
+                    evse_id, connector.id, tag
                 )
             }
             Command::UnplugVehicle => {
@@ -188,7 +219,7 @@ impl Command {
                 connector.status = ConnectorStatus::Available;
                 format!(
                     "EVSE {} connector {}: {} unplugged",
-                    evse.id, connector.id, vehicle_id
+                    evse_id, connector.id, vehicle_id
                 )
             }
             Command::ReportFault => {
@@ -196,15 +227,15 @@ impl Command {
                 connector.status = ConnectorStatus::Faulted;
                 format!(
                     "EVSE {} connector {}: fault reported ({})",
-                    evse.id, connector.id, code
+                    evse_id, connector.id, code
                 )
             }
             Command::ClearFault => {
                 connector.status = ConnectorStatus::Available;
-                format!("EVSE {} connector {}: fault cleared", evse.id, connector.id)
+                format!("EVSE {} connector {}: fault cleared", evse_id, connector.id)
             }
-            // `applies_to` always returns `false` for these, so the `?` above already
-            // returned before a connector could ever be found for one.
+            // `applies_to` always returns `false` for these, so the check above already
+            // returned before this point could ever be reached for one.
             Command::SetDisplayMessage | Command::ClearDisplayMessage => unreachable!(
                 "display commands never match a connector via applies_to"
             ),
@@ -239,6 +270,7 @@ mod tests {
                     id: index as u32 + 1,
                     status,
                     vehicle: None,
+                    session_duration: std::time::Duration::ZERO,
                 })
                 .collect(),
             metrics: Default::default(),
@@ -306,7 +338,7 @@ mod tests {
         let mut evse = evse_with_statuses(&[ConnectorStatus::Charging]);
         evse.connectors[0].vehicle = Some(Vehicle {
             id: "EV-1".into(),
-            state_of_charge: Some(80),
+            state_of_charge: Some(80.0),
         });
 
         let message = Command::UnplugVehicle.apply(&mut evse, "").unwrap();
@@ -438,5 +470,62 @@ mod tests {
 
         assert_eq!(result, None);
         assert_eq!(charger.display_message, None);
+    }
+
+    #[test]
+    fn is_available_for_connector_checks_one_connector_in_isolation() {
+        let evse = evse_with_statuses(&[ConnectorStatus::Available, ConnectorStatus::Occupied]);
+
+        assert!(Command::PlugInVehicle.is_available_for_connector(&evse.connectors[0]));
+        assert!(!Command::PlugInVehicle.is_available_for_connector(&evse.connectors[1]));
+        assert!(Command::PresentRfid.is_available_for_connector(&evse.connectors[1]));
+        assert!(!Command::PresentRfid.is_available_for_connector(&evse.connectors[0]));
+    }
+
+    #[test]
+    fn apply_to_acts_on_the_given_connector_even_when_an_earlier_one_would_also_be_eligible() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Available, ConnectorStatus::Available]);
+
+        let message = Command::PlugInVehicle.apply_to(&mut evse, 1, "MY-EV").unwrap();
+
+        assert_eq!(evse.connectors[0].status, ConnectorStatus::Available);
+        assert!(evse.connectors[0].vehicle.is_none());
+        assert_eq!(evse.connectors[1].status, ConnectorStatus::Occupied);
+        assert_eq!(evse.connectors[1].vehicle.as_ref().unwrap().id, "MY-EV");
+        assert!(message.contains("connector 2"));
+    }
+
+    #[test]
+    fn apply_to_returns_none_and_mutates_nothing_for_an_ineligible_connector() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Available, ConnectorStatus::Occupied]);
+        let before = evse.clone();
+
+        let result = Command::PlugInVehicle.apply_to(&mut evse, 1, "");
+
+        assert_eq!(result, None);
+        assert_eq!(evse, before);
+    }
+
+    #[test]
+    fn apply_to_returns_none_and_mutates_nothing_for_an_out_of_range_index() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Available]);
+        let before = evse.clone();
+
+        let result = Command::PlugInVehicle.apply_to(&mut evse, 5, "");
+
+        assert_eq!(result, None);
+        assert_eq!(evse, before);
+    }
+
+    #[test]
+    fn apply_and_apply_to_agree_on_the_first_eligible_connector() {
+        let mut via_apply = evse_with_statuses(&[ConnectorStatus::Occupied, ConnectorStatus::Available]);
+        let mut via_apply_to = via_apply.clone();
+
+        let message_apply = Command::PlugInVehicle.apply(&mut via_apply, "SAME-EV").unwrap();
+        let message_apply_to = Command::PlugInVehicle.apply_to(&mut via_apply_to, 1, "SAME-EV").unwrap();
+
+        assert_eq!(via_apply, via_apply_to);
+        assert_eq!(message_apply, message_apply_to);
     }
 }
