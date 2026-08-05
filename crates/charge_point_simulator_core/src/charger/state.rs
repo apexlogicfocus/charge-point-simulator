@@ -78,6 +78,36 @@ pub struct EvseState {
     pub metrics: EvseMetrics,
 }
 
+impl EvseState {
+    /// Simulated charging power per actively-charging connector, in kW - a plausible
+    /// single-phase AC rate, not derived from any real hardware spec.
+    const SIMULATED_CHARGING_POWER_KW: f64 = 7.4;
+    /// Nominal single-phase voltage used to derive a simulated current reading from power.
+    const NOMINAL_VOLTAGE: f64 = 230.0;
+
+    /// Advances this EVSE's simulated meter reading by `elapsed`: power and current reflect
+    /// how many connectors are currently `Charging` (multiple charging connectors on one EVSE
+    /// simply add up - this simulator has no per-connector meter, only an EVSE-level one), and
+    /// energy accumulates accordingly. Power/current drop to zero (energy holds) once nothing's
+    /// charging.
+    pub fn tick(&mut self, elapsed: std::time::Duration) {
+        let charging_connectors = self
+            .connectors
+            .iter()
+            .filter(|connector| connector.status == ConnectorStatus::Charging)
+            .count();
+        let power_kw = Self::SIMULATED_CHARGING_POWER_KW * charging_connectors as f64;
+
+        self.metrics.power_kw = power_kw;
+        self.metrics.current_a = if power_kw > 0.0 {
+            power_kw * 1000.0 / Self::NOMINAL_VOLTAGE
+        } else {
+            0.0
+        };
+        self.metrics.energy_kwh += power_kw * (elapsed.as_secs_f64() / 3600.0);
+    }
+}
+
 /// The live, mutable state of a running charger, seeded from its
 /// [`ChargerConfig`]. This is what the TUI (and later, other frontends)
 /// render and what simulated events mutate.
@@ -125,12 +155,20 @@ impl ChargerState {
             display_message: None,
         }
     }
+
+    /// Advances every EVSE's simulated meter reading by `elapsed` (see [`EvseState::tick`]).
+    pub fn tick(&mut self, elapsed: std::time::Duration) {
+        for evse in &mut self.evses {
+            evse.tick(elapsed);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::charger::config::{EvseConfig, OcppVersion};
+    use std::time::Duration;
 
     fn config(evses: Vec<EvseConfig>) -> ChargerConfig {
         ChargerConfig {
@@ -206,6 +244,69 @@ mod tests {
         }]));
 
         assert_eq!(state.evses[0].metrics, EvseMetrics::default());
+    }
+
+    #[test]
+    fn ticking_with_no_charging_connectors_leaves_metrics_at_zero() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+
+        state.tick(Duration::from_secs(3600));
+
+        assert_eq!(state.evses[0].metrics, EvseMetrics::default());
+    }
+
+    #[test]
+    fn ticking_an_hour_with_one_charging_connector_adds_a_full_hour_of_energy() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+
+        state.tick(Duration::from_secs(3600));
+
+        let metrics = state.evses[0].metrics;
+        assert_eq!(metrics.power_kw, EvseState::SIMULATED_CHARGING_POWER_KW);
+        assert!((metrics.energy_kwh - EvseState::SIMULATED_CHARGING_POWER_KW).abs() < 1e-9);
+        assert!(metrics.current_a > 0.0);
+    }
+
+    #[test]
+    fn energy_accumulates_across_multiple_ticks() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+
+        state.tick(Duration::from_secs(1800));
+        state.tick(Duration::from_secs(1800));
+
+        assert!((state.evses[0].metrics.energy_kwh - EvseState::SIMULATED_CHARGING_POWER_KW).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_charging_connectors_on_one_evse_double_the_simulated_power() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 2 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.evses[0].connectors[1].status = ConnectorStatus::Charging;
+
+        state.tick(Duration::from_secs(3600));
+
+        assert_eq!(
+            state.evses[0].metrics.power_kw,
+            EvseState::SIMULATED_CHARGING_POWER_KW * 2.0
+        );
+    }
+
+    #[test]
+    fn power_and_current_drop_back_to_zero_once_charging_stops_but_energy_holds() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        state.tick(Duration::from_secs(3600));
+        let energy_after_charging = state.evses[0].metrics.energy_kwh;
+
+        state.evses[0].connectors[0].status = ConnectorStatus::Available;
+        state.tick(Duration::from_secs(3600));
+
+        let metrics = state.evses[0].metrics;
+        assert_eq!(metrics.power_kw, 0.0);
+        assert_eq!(metrics.current_a, 0.0);
+        assert_eq!(metrics.energy_kwh, energy_after_charging);
     }
 
     #[test]

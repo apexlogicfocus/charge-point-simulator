@@ -5,7 +5,7 @@
 
 use ocpp_charge_point::state::{
     ChargePointEvent, ChargePointState, ConnectorEvent, ConnectorState as OcppConnectorState,
-    EvseEvent, IdToken, IdTokenKind, RegistrationStatus, StopReason,
+    EvseEvent, IdToken, IdTokenKind, MeterSample, RegistrationStatus, StopReason,
 };
 
 use super::command::Command;
@@ -130,6 +130,34 @@ pub fn build_ocpp_event(
         evse_id,
         event: EvseEvent::Connector { connector_id, event },
     })
+}
+
+/// Builds a `MeterValueSampled` event for every currently-`Charging` connector, carrying its
+/// EVSE's simulated cumulative energy reading (see [`super::state::EvseState::tick`]). Real
+/// meter values are per-connector; this simulator's energy simulation is aggregated per EVSE
+/// (there's no per-connector meter), so every charging connector on the same EVSE reports that
+/// EVSE's shared total - a known simplification, harmless for the common single-connector EVSE
+/// case this crate's presets use.
+pub fn meter_sample_events(charger: &ChargerState) -> Vec<ChargePointEvent> {
+    charger
+        .evses
+        .iter()
+        .enumerate()
+        .flat_map(|(evse_id, evse)| {
+            let energy_wh = (evse.metrics.energy_kwh * 1000.0).round() as i64;
+            evse.connectors
+                .iter()
+                .enumerate()
+                .filter(|(_, connector)| connector.status == ConnectorStatus::Charging)
+                .map(move |(connector_id, _)| ChargePointEvent::Evse {
+                    evse_id,
+                    event: EvseEvent::Connector {
+                        connector_id,
+                        event: ConnectorEvent::MeterValueSampled(MeterSample { energy_wh }),
+                    },
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -338,5 +366,54 @@ mod tests {
     fn build_ocpp_event_returns_none_for_an_unknown_evse_id() {
         let ocpp = ocpp_state_with(vec![OcppConnectorState::Available]);
         assert_eq!(build_ocpp_event(&ocpp, 5, Command::PlugInVehicle, ""), None);
+    }
+
+    #[test]
+    fn meter_sample_events_reports_only_charging_connectors() {
+        let mut charger = charger_state();
+        charger.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        charger.evses[0].connectors[1].status = ConnectorStatus::Available;
+        charger.evses[0].metrics.energy_kwh = 1.5;
+
+        let events = meter_sample_events(&charger);
+
+        assert_eq!(
+            events,
+            vec![ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::MeterValueSampled(MeterSample { energy_wh: 1500 }),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn meter_sample_events_is_empty_when_nothing_is_charging() {
+        let charger = charger_state();
+        assert_eq!(meter_sample_events(&charger), Vec::new());
+    }
+
+    #[test]
+    fn meter_sample_events_reports_every_charging_connector_on_an_evse() {
+        let mut charger = charger_state();
+        charger.evses[0].connectors[0].status = ConnectorStatus::Charging;
+        charger.evses[0].connectors[1].status = ConnectorStatus::Charging;
+        charger.evses[0].metrics.energy_kwh = 2.0;
+
+        let events = meter_sample_events(&charger);
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| matches!(
+            event,
+            ChargePointEvent::Evse {
+                event: EvseEvent::Connector {
+                    event: ConnectorEvent::MeterValueSampled(MeterSample { energy_wh: 2000 }),
+                    ..
+                },
+                ..
+            }
+        )));
     }
 }

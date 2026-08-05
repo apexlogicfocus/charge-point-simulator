@@ -8,7 +8,7 @@ use crate::theme::{BRAND_TEAL, bordered_block, connection_status_color, connecto
 use charge_point_simulator_core::charger::{
     ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, ConnectionProfile,
     ConnectionStore, OcppVersion, SecurityProfile, apply_ocpp_state, build_ocpp_event,
-    connect_charger,
+    connect_charger, meter_sample_events,
 };
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tui_big_text::{BigText, PixelSize};
@@ -31,6 +31,12 @@ const BANNER_HEIGHT: u16 = 3 * 4;
 /// externally-sourced log lines (tracing output from the simulator, and
 /// eventually `ocpp-charge-point`) show up promptly even with no input.
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often to forward simulated meter readings to a connected CSMS as real
+/// `MeterValueSampled` events. Real deployments typically use ~60s+ (configurable via
+/// `SetVariables`); shorter here so a demo session actually sees TransactionEvent traffic
+/// without waiting a minute for it.
+const METER_VALUE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 pub struct App {
@@ -67,6 +73,13 @@ pub struct App {
     /// The most recent snapshot from `ocpp_state_receiver`, used to decide what event a
     /// dispatched command maps to (see [`charge_point_simulator_core::charger::build_ocpp_event`]).
     pub live_ocpp_state: Option<ChargePointState>,
+    /// When [`Self::tick_metrics`] last ran, so it can compute real elapsed time between
+    /// frames rather than assuming a fixed interval (the main loop's actual cadence varies
+    /// with input activity).
+    pub last_metrics_tick: Option<Instant>,
+    /// When a `MeterValueSampled` event was last sent to a connected CSMS, throttling
+    /// against [`METER_VALUE_INTERVAL`].
+    pub last_meter_value_sent: Option<Instant>,
     pub exit: bool,
 }
 
@@ -83,6 +96,7 @@ impl App {
             self.drain_log_receiver();
             self.drain_ocpp_state_receiver();
             self.poll_connect_result();
+            self.tick_metrics();
             terminal.draw(|frame| self.draw(frame))?;
             if self.exit {
                 break;
@@ -826,6 +840,10 @@ impl App {
             self.charger_state = Some(ChargerState::from_config(charger.config.clone()));
             self.focused_evse = 0;
             self.status_message = None;
+            // Reset so the first tick on the new charger sees zero elapsed time instead of
+            // however long was spent idling on the picker.
+            self.last_metrics_tick = None;
+            self.last_meter_value_sent = None;
 
             if charger.config.ocpp_version == OcppVersion::V21 {
                 self.enter_connection_setup(&charger.config.id);
@@ -1013,6 +1031,48 @@ impl App {
             self.live_ocpp_state = Some(state);
         }
     }
+
+    /// Advances the focused charger's simulated meter reading by the real time elapsed since
+    /// the last call (not a fixed per-frame amount, since the main loop's cadence varies with
+    /// input activity), then forwards a `MeterValueSampled` event per charging connector to a
+    /// connected CSMS if [`METER_VALUE_INTERVAL`] has elapsed since the last one was sent.
+    fn tick_metrics(&mut self) {
+        let now = Instant::now();
+        let elapsed = self
+            .last_metrics_tick
+            .map(|last| now.duration_since(last))
+            .unwrap_or_default();
+        self.last_metrics_tick = Some(now);
+        self.tick_metrics_with(elapsed, now);
+    }
+
+    fn tick_metrics_with(&mut self, elapsed: Duration, now: Instant) {
+        if let Some(state) = &mut self.charger_state {
+            state.tick(elapsed);
+        }
+        self.maybe_send_meter_values(now);
+    }
+
+    fn maybe_send_meter_values(&mut self, now: Instant) {
+        let Some(sender) = &self.ocpp_event_sender else {
+            return;
+        };
+        let due = match self.last_meter_value_sent {
+            Some(last) => now.duration_since(last) >= METER_VALUE_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_meter_value_sent = Some(now);
+
+        let Some(state) = &self.charger_state else {
+            return;
+        };
+        for event in meter_sample_events(state) {
+            let _ = sender.send(event);
+        }
+    }
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -1027,7 +1087,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use charge_point_simulator_core::charger::{
-        ChargerConfig, ChargerSource, ConnectionStatus, EvseConfig, OcppVersion,
+        ChargerConfig, ChargerSource, ConnectionStatus, ConnectorStatus, EvseConfig, OcppVersion,
     };
     use ocpp_charge_point::state::{
         ConnectorEvent, ConnectorState as OcppConnectorState, EvseEvent, RegistrationStatus,
@@ -1800,6 +1860,71 @@ mod tests {
         state.registration = Some(RegistrationStatus::Accepted);
         state.evses[0].connectors[0] = connector;
         state
+    }
+
+    #[test]
+    fn tick_metrics_advances_the_focused_chargers_simulated_meter_by_the_given_elapsed_time() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Charging;
+
+        app.tick_metrics_with(Duration::from_secs(3600), Instant::now());
+
+        let metrics = app.charger_state.as_ref().unwrap().evses[0].metrics;
+        assert!(metrics.power_kw > 0.0);
+        assert!(metrics.energy_kwh > 0.0);
+    }
+
+    #[test]
+    fn tick_metrics_does_nothing_without_a_selected_charger() {
+        let mut app = App::new(vec![]);
+        // Just proving this doesn't panic with no charger selected.
+        app.tick_metrics_with(Duration::from_secs(1), Instant::now());
+        assert!(app.charger_state.is_none());
+    }
+
+    #[test]
+    fn maybe_send_meter_values_sends_immediately_the_first_time_a_csms_is_connected() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Charging;
+        app.charger_state.as_mut().unwrap().evses[0].metrics.energy_kwh = 1.0;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.ocpp_event_sender = Some(sender);
+
+        app.tick_metrics_with(Duration::ZERO, Instant::now());
+
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn maybe_send_meter_values_is_throttled_until_the_interval_elapses() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Charging;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.ocpp_event_sender = Some(sender);
+
+        let start = Instant::now();
+        app.tick_metrics_with(Duration::ZERO, start);
+        receiver.try_recv().unwrap(); // drain the first, immediate send
+
+        app.tick_metrics_with(Duration::ZERO, start + Duration::from_secs(1));
+        assert!(receiver.try_recv().is_err(), "resent before the interval elapsed");
+
+        app.tick_metrics_with(Duration::ZERO, start + METER_VALUE_INTERVAL);
+        assert!(receiver.try_recv().is_ok(), "did not resend once the interval elapsed");
+    }
+
+    #[test]
+    fn maybe_send_meter_values_does_nothing_without_a_live_csms_sender() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Charging;
+
+        // No panic and nothing queued, since there's no `ocpp_event_sender` to send through.
+        app.tick_metrics_with(Duration::from_secs(3600), Instant::now());
+        assert!(app.ocpp_event_sender.is_none());
     }
 
     #[test]
