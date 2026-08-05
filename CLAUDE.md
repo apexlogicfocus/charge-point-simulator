@@ -69,7 +69,15 @@ cargo fmt --all
 
 ## Notes on current state
 
-The codebase is in early scaffolding: `charge_point_simulator_core/src/lib.rs` is empty, and
-`App::draw` in the TUI is `todo!()`. There is no simulation, OCPP, or YAML config logic implemented yet
-— when adding the first real features, establish the core module structure (e.g. hardware model,
-charger/vehicle config, OCPP version abstraction) deliberately, since later code will build on it.
+`core` implements the charger/EVSE/connector state model, YAML config parsing, the command
+model, fake hardware, and a live OCPP 2.1 bridge (`connect_charger` + `apply_ocpp_state`); the
+TUI has a working picker → connection setup → dashboard flow.
+
+Two things worth knowing before touching the dashboard:
+
+- A charger's `connection_status` is only ever advanced by the live OCPP 2.1 bridge
+  (`ocpp_bridge.rs`). A local (1.6J / unconnected) simulation is seeded `Booting` by
+  `ChargerState::from_config` and stays there, so the dashboard currently reports `booting`
+  forever for those.
+- `LogBuffer::set_filter`/`clear_filter` are implemented and tested but no key binding reaches
+  them yet — that's the source of the workspace's one `dead_code` warning.

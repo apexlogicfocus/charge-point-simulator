@@ -108,7 +108,7 @@ impl App {
         Ok(())
     }
 
-    fn draw(&self, frame: &mut Frame) {
+    pub(crate) fn draw(&self, frame: &mut Frame) {
         if is_terminal_too_small(frame.area()) {
             self.render_too_small(frame);
             return;

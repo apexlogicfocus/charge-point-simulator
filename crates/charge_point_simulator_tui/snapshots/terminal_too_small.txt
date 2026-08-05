@@ -1,0 +1,9 @@
+                Terminal too small.
+             Resize to at least 60x16.
+
+
+
+
+
+
+
