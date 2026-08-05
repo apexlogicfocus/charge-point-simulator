@@ -164,7 +164,7 @@ pub fn meter_sample_events(charger: &ChargerState) -> Vec<ChargePointEvent> {
 mod tests {
     use super::*;
     use crate::charger::config::{ChargerConfig, EvseConfig, OcppVersion};
-    use crate::charger::state::{ChargerState, ConnectorStatus};
+    use crate::charger::state::{ChargerState, ConnectorStatus, SimulationMode};
     use ocpp_charge_point::state::{EvseState as OcppEvseState, LifecycleState};
 
     fn charger_state() -> ChargerState {
@@ -220,6 +220,41 @@ mod tests {
             map_connection_status(Some(RegistrationStatus::Rejected)),
             ConnectionStatus::Reconnecting
         );
+    }
+
+    #[test]
+    fn apply_ocpp_state_never_touches_mode_or_uptime() {
+        let mut charger = charger_state();
+        charger.mode = SimulationMode::LiveCsms {
+            url: "ws://csms.example/CP001".into(),
+        };
+        charger.uptime = std::time::Duration::from_secs(42);
+        let ocpp = ocpp_state_with(vec![OcppConnectorState::Locked, OcppConnectorState::Available]);
+
+        apply_ocpp_state(&mut charger, &ocpp);
+
+        assert_eq!(
+            charger.mode,
+            SimulationMode::LiveCsms { url: "ws://csms.example/CP001".into() }
+        );
+        assert_eq!(charger.uptime, std::time::Duration::from_secs(42));
+    }
+
+    #[test]
+    fn a_live_csms_chargers_status_comes_from_the_bridge_never_from_tick() {
+        let mut charger = charger_state();
+        charger.mode = SimulationMode::LiveCsms {
+            url: "ws://csms.example/CP001".into(),
+        };
+
+        // Ticking alone, however long, must never move a LiveCsms charger off Booting.
+        charger.tick(std::time::Duration::from_secs(3600));
+        assert_eq!(charger.connection_status, ConnectionStatus::Booting);
+
+        // Only the bridge, mirroring the real CSMS registration outcome, may advance it.
+        let ocpp = ocpp_state_with(vec![OcppConnectorState::Available, OcppConnectorState::Available]);
+        apply_ocpp_state(&mut charger, &ocpp);
+        assert_eq!(charger.connection_status, ConnectionStatus::Connected);
     }
 
     #[test]

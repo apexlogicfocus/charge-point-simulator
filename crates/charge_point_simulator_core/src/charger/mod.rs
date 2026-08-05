@@ -20,5 +20,5 @@ pub use ocpp_charge_point::state::{ChargePointEvent, ChargePointState};
 pub use ocpp_charge_point::{ChargePointRuntime, ConnectAndSetupError};
 pub use state::{
     ChargerState, ConnectionStatus, ConnectorState, ConnectorStatus, EvseMetrics, EvseState,
-    Vehicle,
+    SimulationMode, Vehicle,
 };

@@ -1,6 +1,25 @@
 use std::fmt;
+use std::time::Duration;
 
 use super::config::ChargerConfig;
+
+/// How a charger's `connection_status` gets driven, and therefore who is allowed to write it.
+///
+/// The two variants own `ChargerState::connection_status` for mutually exclusive reasons:
+/// - `Local`: there's no real CSMS in the picture, so [`ChargerState::tick`] drives the whole
+///   boot-to-connected lifecycle itself, purely from simulated elapsed time.
+/// - `LiveCsms`: a real OCPP connection exists, and [`super::ocpp_bridge::apply_ocpp_state`]
+///   mirrors the CSMS's actual registration/connector state onto `connection_status` every time
+///   a snapshot arrives. `tick` must never touch `connection_status` in this mode - doing so
+///   would race the real protocol state and make the display flicker between what the bridge
+///   just set and what a local simulated clock thinks it should be.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SimulationMode {
+    /// No CSMS connection: the simulator owns the whole lifecycle itself.
+    Local,
+    /// Driven by a live CSMS connection; the OCPP bridge owns connection_status.
+    LiveCsms { url: String },
+}
 
 /// The charger's connection to the CSMS. Every charger starts out `Booting`
 /// until the simulated boot notification flow completes.
@@ -120,9 +139,18 @@ pub struct ChargerState {
     /// meaningful when `config.has_display` is `true`. Set/cleared via
     /// [`crate::charger::Command::SetDisplayMessage`]/[`crate::charger::Command::ClearDisplayMessage`].
     pub display_message: Option<String>,
+    /// Who drives `connection_status` - see [`SimulationMode`] for the ownership split.
+    pub mode: SimulationMode,
+    /// Simulated elapsed time since this charger was created, accumulated by [`Self::tick`].
+    /// This is simulated time, not wall-clock, so it stays deterministic and testable.
+    pub uptime: Duration,
 }
 
 impl ChargerState {
+    /// Simulated time a locally-driven charger spends `Booting` before `tick` promotes it to
+    /// `Connected`. ~1.5s reads as a plausible boot handshake without making a demo wait for it.
+    const SIMULATED_BOOT_DURATION: Duration = Duration::from_millis(1500);
+
     /// Builds the initial state for a freshly started charger: booting,
     /// every connector available, no vehicles plugged in, and zeroed metrics.
     pub fn from_config(config: ChargerConfig) -> Self {
@@ -153,11 +181,26 @@ impl ChargerState {
             evses,
             config,
             display_message: None,
+            mode: SimulationMode::Local,
+            uptime: Duration::ZERO,
         }
     }
 
-    /// Advances every EVSE's simulated meter reading by `elapsed` (see [`EvseState::tick`]).
+    /// Advances every EVSE's simulated meter reading by `elapsed` (see [`EvseState::tick`]) and
+    /// accumulates simulated `uptime`. In [`SimulationMode::Local`], also drives the charger from
+    /// `Booting` to `Connected` once `uptime` reaches [`Self::SIMULATED_BOOT_DURATION`]. In
+    /// [`SimulationMode::LiveCsms`], `connection_status` is never touched here - the OCPP bridge
+    /// owns it exclusively (see [`SimulationMode`]).
     pub fn tick(&mut self, elapsed: std::time::Duration) {
+        self.uptime += elapsed;
+
+        if self.mode == SimulationMode::Local
+            && self.connection_status == ConnectionStatus::Booting
+            && self.uptime >= Self::SIMULATED_BOOT_DURATION
+        {
+            self.connection_status = ConnectionStatus::Connected;
+        }
+
         for evse in &mut self.evses {
             evse.tick(elapsed);
         }
@@ -321,5 +364,90 @@ mod tests {
         assert_eq!(ConnectionStatus::Reconnecting.to_string(), "reconnecting");
         assert_eq!(ConnectorStatus::Charging.to_string(), "charging");
         assert_eq!(ConnectorStatus::Faulted.to_string(), "faulted");
+    }
+
+    #[test]
+    fn a_fresh_charger_defaults_to_local_mode_with_zero_uptime() {
+        let state = ChargerState::from_config(config(vec![]));
+        assert_eq!(state.mode, SimulationMode::Local);
+        assert_eq!(state.uptime, Duration::ZERO);
+    }
+
+    #[test]
+    fn uptime_accumulates_across_ticks() {
+        let mut state = ChargerState::from_config(config(vec![]));
+
+        state.tick(Duration::from_millis(400));
+        state.tick(Duration::from_millis(400));
+
+        assert_eq!(state.uptime, Duration::from_millis(800));
+    }
+
+    #[test]
+    fn a_local_charger_stays_booting_before_the_boot_duration_elapses() {
+        let mut state = ChargerState::from_config(config(vec![]));
+
+        state.tick(ChargerState::SIMULATED_BOOT_DURATION - Duration::from_millis(1));
+
+        assert_eq!(state.connection_status, ConnectionStatus::Booting);
+    }
+
+    #[test]
+    fn a_local_charger_connects_once_the_boot_duration_elapses() {
+        let mut state = ChargerState::from_config(config(vec![]));
+
+        state.tick(ChargerState::SIMULATED_BOOT_DURATION);
+
+        assert_eq!(state.connection_status, ConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn the_boot_transition_survives_being_reached_across_several_small_ticks() {
+        let mut state = ChargerState::from_config(config(vec![]));
+        let step = ChargerState::SIMULATED_BOOT_DURATION / 10;
+
+        for _ in 0..9 {
+            state.tick(step);
+        }
+        assert_eq!(state.connection_status, ConnectionStatus::Booting);
+
+        state.tick(step);
+
+        assert_eq!(state.connection_status, ConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn a_local_charger_does_not_regress_from_connected_back_to_booting() {
+        let mut state = ChargerState::from_config(config(vec![]));
+        state.tick(ChargerState::SIMULATED_BOOT_DURATION);
+        assert_eq!(state.connection_status, ConnectionStatus::Connected);
+
+        state.tick(Duration::from_secs(3600));
+
+        assert_eq!(state.connection_status, ConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn a_live_csms_charger_never_self_transitions_no_matter_how_long_it_ticks() {
+        let mut state = ChargerState::from_config(config(vec![]));
+        state.mode = SimulationMode::LiveCsms {
+            url: "ws://csms.example/CP001".into(),
+        };
+
+        state.tick(Duration::from_secs(3600));
+
+        assert_eq!(state.connection_status, ConnectionStatus::Booting);
+        assert_eq!(state.uptime, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn metrics_still_tick_normally_alongside_the_boot_lifecycle() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig { id: 1, connectors: 1 }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
+
+        state.tick(ChargerState::SIMULATED_BOOT_DURATION);
+
+        assert_eq!(state.connection_status, ConnectionStatus::Connected);
+        assert!(state.evses[0].metrics.energy_kwh > 0.0);
     }
 }
