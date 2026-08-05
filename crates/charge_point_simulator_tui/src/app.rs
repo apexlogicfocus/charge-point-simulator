@@ -36,7 +36,9 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct App {
     pub screen: Screen,
     pub chargers: Vec<ChargerEntry>,
+    /// Indexes into [`Self::filtered_chargers`], not `chargers` directly.
     pub selected_charger: usize,
+    pub picker_filter: TextField,
     pub charger_state: Option<ChargerState>,
     pub focused_evse: usize,
     pub logs: LogBuffer,
@@ -158,20 +160,36 @@ impl App {
     }
 
     fn render_charger_list(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let items: Vec<ListItem> = self
-            .chargers
-            .iter()
-            .map(|entry| {
-                let evse_count = entry.config.evses.len();
-                ListItem::new(format!(
-                    "{}  [{}]  {} EVSE{}",
-                    entry.config.id,
-                    entry.config.ocpp_version,
-                    evse_count,
-                    if evse_count == 1 { "" } else { "s" }
-                ))
-            })
-            .collect();
+        let chargers = self.filtered_chargers();
+        let [filter_area, list_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(area);
+
+        frame.render_widget(
+            Paragraph::new(self.picker_filter.value()).block(bordered_block("Filter")),
+            filter_area,
+        );
+        frame.set_cursor_position((
+            filter_area.x + 1 + self.picker_filter.cursor() as u16,
+            filter_area.y + 1,
+        ));
+
+        let items: Vec<ListItem> = if chargers.is_empty() {
+            vec![ListItem::new("no chargers match")]
+        } else {
+            chargers
+                .iter()
+                .map(|entry| {
+                    let evse_count = entry.config.evses.len();
+                    ListItem::new(format!(
+                        "{}  [{}]  {} EVSE{}",
+                        entry.config.id,
+                        entry.config.ocpp_version,
+                        evse_count,
+                        if evse_count == 1 { "" } else { "s" }
+                    ))
+                })
+                .collect()
+        };
 
         let list = List::new(items)
             .block(bordered_block("Select a charger"))
@@ -179,11 +197,11 @@ impl App {
             .highlight_symbol("> ");
 
         let mut state = ListState::default();
-        if !self.chargers.is_empty() {
+        if !chargers.is_empty() {
             state.select(Some(self.selected_charger));
         }
 
-        frame.render_stateful_widget(list, area, &mut state);
+        frame.render_stateful_widget(list, list_area, &mut state);
     }
 
     fn render_connection_setup(&self, frame: &mut Frame) {
@@ -440,8 +458,10 @@ impl App {
              \u{20}q            quit (confirm)\n\
              \u{20}?            toggle this help\n\n\
              Charger picker\n\
-             \u{20}\u{2191}/\u{2193} or k/j    move selection\n\
-             \u{20}Enter        select charger\n\n\
+             \u{20}\u{2191}/\u{2193}        move selection\n\
+             \u{20}type         filter by charger id\n\
+             \u{20}Enter        select charger\n\
+             \u{20}Esc          clear filter (or quit)\n\n\
              Dashboard\n\
              \u{20}Esc          back to picker\n\
              \u{20}\u{2190}/\u{2192} or Tab   focus EVSE\n\
@@ -527,10 +547,13 @@ impl App {
         }
 
         // On the connection setup screen 'q'/'?' need to be typeable (URLs and passwords can
-        // contain either), so the global shortcuts don't apply there.
+        // contain either), so the global shortcuts don't apply there. On the picker, 'q' also
+        // needs to be typeable into the charger filter (Esc still quits when the filter's
+        // empty - see `handle_pick_charger_key`); '?' stays global there since charger ids
+        // never contain it and losing Help on the very first screen would be worse.
         if self.screen != Screen::ConnectionSetup {
             match key_event.code {
-                KeyCode::Char('q') => {
+                KeyCode::Char('q') if self.screen != Screen::PickCharger => {
                     self.quit_confirm_open = true;
                     return;
                 }
@@ -566,9 +589,27 @@ impl App {
 
     fn handle_pick_charger_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode::Down | KeyCode::Char('j') => self.select_next_charger(),
-            KeyCode::Up | KeyCode::Char('k') => self.select_previous_charger(),
+            KeyCode::Down => self.select_next_charger(),
+            KeyCode::Up => self.select_previous_charger(),
             KeyCode::Enter => self.confirm_charger_selection(),
+            // Esc clears an active filter first (so it doesn't double as "quit" while
+            // narrowing the list); with no filter typed, it opens the quit confirmation.
+            KeyCode::Esc => {
+                if self.picker_filter.value().is_empty() {
+                    self.quit_confirm_open = true;
+                } else {
+                    self.picker_filter = TextField::default();
+                    self.selected_charger = 0;
+                }
+            }
+            KeyCode::Backspace => {
+                self.picker_filter.backspace();
+                self.selected_charger = 0;
+            }
+            KeyCode::Char(c) => {
+                self.picker_filter.insert_char(c);
+                self.selected_charger = 0;
+            }
             _ => {}
         }
     }
@@ -635,11 +676,22 @@ impl App {
         }
     }
 
+    /// [`Self::chargers`] narrowed by the picker's filter text (case-insensitive substring
+    /// match on the charger id).
+    fn filtered_chargers(&self) -> Vec<&ChargerEntry> {
+        let filter = self.picker_filter.value().to_lowercase();
+        self.chargers
+            .iter()
+            .filter(|entry| entry.config.id.to_lowercase().contains(&filter))
+            .collect()
+    }
+
     fn select_next_charger(&mut self) {
-        if self.chargers.is_empty() {
+        let count = self.filtered_chargers().len();
+        if count == 0 {
             return;
         }
-        if self.selected_charger + 1 < self.chargers.len() {
+        if self.selected_charger + 1 < count {
             self.selected_charger += 1;
         }
     }
@@ -768,7 +820,7 @@ impl App {
     }
 
     fn confirm_charger_selection(&mut self) {
-        if let Some(charger) = self.chargers.get(self.selected_charger).cloned() {
+        if let Some(charger) = self.filtered_chargers().get(self.selected_charger).map(|entry| (*entry).clone()) {
             self.logs = LogBuffer::default();
             self.logs.push(format!("{} booting", charger.config.id));
             self.charger_state = Some(ChargerState::from_config(charger.config.clone()));
@@ -1035,8 +1087,10 @@ mod tests {
 
     #[test]
     fn q_opens_a_quit_confirmation_instead_of_exiting_immediately() {
+        // On the picker, 'q' is typeable into the charger filter instead - Esc (with the
+        // filter empty) is how the picker opens the quit confirmation.
         let mut app = App::new(vec![charger("CP001")]);
-        app.handle_key_event(key(KeyCode::Char('q')));
+        app.handle_key_event(key(KeyCode::Esc));
         assert!(app.quit_confirm_open);
         assert!(!app.exit);
 
@@ -1050,12 +1104,12 @@ mod tests {
     #[test]
     fn y_or_enter_confirms_the_quit() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.handle_key_event(key(KeyCode::Char('q')));
+        app.handle_key_event(key(KeyCode::Esc));
         app.handle_key_event(key(KeyCode::Char('y')));
         assert!(app.exit);
 
         let mut app = App::new(vec![charger("CP001")]);
-        app.handle_key_event(key(KeyCode::Char('q')));
+        app.handle_key_event(key(KeyCode::Esc));
         app.handle_key_event(key(KeyCode::Enter));
         assert!(app.exit);
     }
@@ -1063,13 +1117,13 @@ mod tests {
     #[test]
     fn n_or_esc_cancels_the_quit() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.handle_key_event(key(KeyCode::Char('q')));
+        app.handle_key_event(key(KeyCode::Esc));
         app.handle_key_event(key(KeyCode::Char('n')));
         assert!(!app.quit_confirm_open);
         assert!(!app.exit);
 
         let mut app = App::new(vec![charger("CP001")]);
-        app.handle_key_event(key(KeyCode::Char('q')));
+        app.handle_key_event(key(KeyCode::Esc));
         app.handle_key_event(key(KeyCode::Esc));
         assert!(!app.quit_confirm_open);
         assert!(!app.exit);
@@ -1135,6 +1189,65 @@ mod tests {
         app.handle_key_event(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Dashboard);
         assert_eq!(app.charger_state.unwrap().config.id, "CP002");
+    }
+
+    #[test]
+    fn typing_in_the_picker_filters_by_charger_id_and_resets_the_selection() {
+        let mut app = App::new(vec![charger("CP001"), charger("CP002")]);
+        app.handle_key_event(key(KeyCode::Down));
+        assert_eq!(app.selected_charger, 1);
+
+        for c in "cp002".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+
+        let ids: Vec<&str> = app.filtered_chargers().iter().map(|e| e.config.id.as_str()).collect();
+        assert_eq!(ids, vec!["CP002"]);
+        assert_eq!(app.selected_charger, 0);
+    }
+
+    #[test]
+    fn enter_selects_the_highlighted_charger_from_the_filtered_list() {
+        let mut app = App::new(vec![charger("CP001"), charger("CP002")]);
+        for c in "cp002".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(app.charger_state.unwrap().config.id, "CP002");
+    }
+
+    #[test]
+    fn esc_clears_the_filter_before_opening_the_quit_confirmation() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.handle_key_event(key(KeyCode::Char('x')));
+        assert_eq!(app.picker_filter.value(), "x");
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(app.picker_filter.value(), "");
+        assert!(!app.quit_confirm_open);
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.quit_confirm_open);
+    }
+
+    #[test]
+    fn q_is_typed_into_the_picker_filter_instead_of_opening_quit_confirm() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.handle_key_event(key(KeyCode::Char('q')));
+
+        assert_eq!(app.picker_filter.value(), "q");
+        assert!(!app.quit_confirm_open);
+    }
+
+    #[test]
+    fn question_mark_still_opens_help_from_the_picker() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.handle_key_event(key(KeyCode::Char('?')));
+
+        assert!(app.help_open);
+        assert_eq!(app.picker_filter.value(), "");
     }
 
     #[test]
