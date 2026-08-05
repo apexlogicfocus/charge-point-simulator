@@ -12,6 +12,26 @@ pub enum Command {
     ClearFault,
 }
 
+/// A single free-text value a [`Command`] needs before it can be applied,
+/// collected from the user via a parameter prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandParameter {
+    VehicleId,
+    RfidTag,
+    FaultCode,
+}
+
+impl CommandParameter {
+    /// The parameter prompt's title, and a placeholder shown when the field is empty.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CommandParameter::VehicleId => "Vehicle ID",
+            CommandParameter::RfidTag => "RFID tag",
+            CommandParameter::FaultCode => "Fault code",
+        }
+    }
+}
+
 impl Command {
     pub const ALL: [Command; 5] = [
         Command::PlugInVehicle,
@@ -28,6 +48,16 @@ impl Command {
             Command::UnplugVehicle => "Unplug vehicle",
             Command::ReportFault => "Report fault",
             Command::ClearFault => "Clear fault",
+        }
+    }
+
+    /// The parameter this command prompts for before it can be applied, if any.
+    pub fn parameter(&self) -> Option<CommandParameter> {
+        match self {
+            Command::PlugInVehicle => Some(CommandParameter::VehicleId),
+            Command::PresentRfid => Some(CommandParameter::RfidTag),
+            Command::ReportFault => Some(CommandParameter::FaultCode),
+            Command::UnplugVehicle | Command::ClearFault => None,
         }
     }
 
@@ -53,16 +83,25 @@ impl Command {
     /// Applies this command to the first eligible connector in `evse`,
     /// mutating its state and returning a human-readable log line. Returns
     /// `None` (and mutates nothing) if no connector is eligible.
-    pub fn apply(&self, evse: &mut EvseState) -> Option<String> {
+    ///
+    /// `input` is the value collected for this command's [`parameter`](Self::parameter),
+    /// or blank for commands that don't have one. A blank value falls back to a
+    /// generated default rather than rejecting the command.
+    pub fn apply(&self, evse: &mut EvseState, input: &str) -> Option<String> {
         let status_applies = |status| self.applies_to(status);
         let connector = evse
             .connectors
             .iter_mut()
             .find(|connector| status_applies(connector.status))?;
+        let input = input.trim();
 
         let message = match self {
             Command::PlugInVehicle => {
-                let vehicle_id = format!("EV-E{}C{}", evse.id, connector.id);
+                let vehicle_id = if input.is_empty() {
+                    format!("EV-E{}C{}", evse.id, connector.id)
+                } else {
+                    input.to_string()
+                };
                 connector.status = ConnectorStatus::Occupied;
                 connector.vehicle = Some(Vehicle {
                     id: vehicle_id.clone(),
@@ -74,10 +113,11 @@ impl Command {
                 )
             }
             Command::PresentRfid => {
+                let tag = if input.is_empty() { "unknown" } else { input };
                 connector.status = ConnectorStatus::Charging;
                 format!(
-                    "EVSE {} connector {}: RFID presented, charging started",
-                    evse.id, connector.id
+                    "EVSE {} connector {}: RFID {} presented, charging started",
+                    evse.id, connector.id, tag
                 )
             }
             Command::UnplugVehicle => {
@@ -93,8 +133,12 @@ impl Command {
                 )
             }
             Command::ReportFault => {
+                let code = if input.is_empty() { "GenericError" } else { input };
                 connector.status = ConnectorStatus::Faulted;
-                format!("EVSE {} connector {}: fault reported", evse.id, connector.id)
+                format!(
+                    "EVSE {} connector {}: fault reported ({})",
+                    evse.id, connector.id, code
+                )
             }
             Command::ClearFault => {
                 connector.status = ConnectorStatus::Available;
@@ -139,7 +183,7 @@ mod tests {
     #[test]
     fn plug_in_vehicle_occupies_the_first_free_connector_with_a_vehicle() {
         let mut evse = evse_with_statuses(&[ConnectorStatus::Occupied, ConnectorStatus::Available]);
-        let message = Command::PlugInVehicle.apply(&mut evse).unwrap();
+        let message = Command::PlugInVehicle.apply(&mut evse, "").unwrap();
 
         assert_eq!(evse.connectors[1].status, ConnectorStatus::Occupied);
         assert!(evse.connectors[1].vehicle.is_some());
@@ -147,10 +191,34 @@ mod tests {
     }
 
     #[test]
+    fn plug_in_vehicle_uses_the_given_vehicle_id_when_provided() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Available]);
+        let message = Command::PlugInVehicle.apply(&mut evse, "MY-EV-1").unwrap();
+
+        assert_eq!(evse.connectors[0].vehicle.as_ref().unwrap().id, "MY-EV-1");
+        assert!(message.contains("MY-EV-1"));
+    }
+
+    #[test]
+    fn plug_in_vehicle_falls_back_to_a_generated_id_when_left_blank() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Available]);
+        Command::PlugInVehicle.apply(&mut evse, "  ").unwrap();
+
+        assert_eq!(evse.connectors[0].vehicle.as_ref().unwrap().id, "EV-E1C1");
+    }
+
+    #[test]
     fn present_rfid_starts_charging_on_an_occupied_connector() {
         let mut evse = evse_with_statuses(&[ConnectorStatus::Occupied]);
-        Command::PresentRfid.apply(&mut evse).unwrap();
+        Command::PresentRfid.apply(&mut evse, "").unwrap();
         assert_eq!(evse.connectors[0].status, ConnectorStatus::Charging);
+    }
+
+    #[test]
+    fn present_rfid_includes_the_given_tag_in_the_log_line() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Occupied]);
+        let message = Command::PresentRfid.apply(&mut evse, "TAG-42").unwrap();
+        assert!(message.contains("TAG-42"));
     }
 
     #[test]
@@ -167,7 +235,7 @@ mod tests {
             state_of_charge: Some(80),
         });
 
-        let message = Command::UnplugVehicle.apply(&mut evse).unwrap();
+        let message = Command::UnplugVehicle.apply(&mut evse, "").unwrap();
 
         assert_eq!(evse.connectors[0].status, ConnectorStatus::Available);
         assert_eq!(evse.connectors[0].vehicle, None);
@@ -184,8 +252,15 @@ mod tests {
     #[test]
     fn report_fault_faults_the_first_non_faulted_connector() {
         let mut evse = evse_with_statuses(&[ConnectorStatus::Faulted, ConnectorStatus::Available]);
-        Command::ReportFault.apply(&mut evse).unwrap();
+        Command::ReportFault.apply(&mut evse, "").unwrap();
         assert_eq!(evse.connectors[1].status, ConnectorStatus::Faulted);
+    }
+
+    #[test]
+    fn report_fault_includes_the_given_fault_code_in_the_log_line() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Available]);
+        let message = Command::ReportFault.apply(&mut evse, "OverCurrentFailure").unwrap();
+        assert!(message.contains("OverCurrentFailure"));
     }
 
     #[test]
@@ -197,7 +272,7 @@ mod tests {
     #[test]
     fn clear_fault_restores_a_faulted_connector_to_available() {
         let mut evse = evse_with_statuses(&[ConnectorStatus::Faulted]);
-        Command::ClearFault.apply(&mut evse).unwrap();
+        Command::ClearFault.apply(&mut evse, "").unwrap();
         assert_eq!(evse.connectors[0].status, ConnectorStatus::Available);
     }
 
@@ -212,9 +287,18 @@ mod tests {
         let mut evse = evse_with_statuses(&[ConnectorStatus::Available]);
         let before = evse.clone();
 
-        let result = Command::PresentRfid.apply(&mut evse);
+        let result = Command::PresentRfid.apply(&mut evse, "");
 
         assert_eq!(result, None);
         assert_eq!(evse, before);
+    }
+
+    #[test]
+    fn only_commands_that_need_extra_input_report_a_parameter() {
+        assert_eq!(Command::PlugInVehicle.parameter(), Some(CommandParameter::VehicleId));
+        assert_eq!(Command::PresentRfid.parameter(), Some(CommandParameter::RfidTag));
+        assert_eq!(Command::ReportFault.parameter(), Some(CommandParameter::FaultCode));
+        assert_eq!(Command::UnplugVehicle.parameter(), None);
+        assert_eq!(Command::ClearFault.parameter(), None);
     }
 }

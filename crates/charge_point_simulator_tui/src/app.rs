@@ -42,6 +42,9 @@ pub struct App {
     pub log_receiver: Option<UnboundedReceiver<String>>,
     pub command_palette_open: bool,
     pub command_palette_selected: usize,
+    pub command_palette_filter: TextField,
+    pub parameter_prompt: Option<Command>,
+    pub parameter_field: TextField,
     pub help_open: bool,
     pub quit_confirm_open: bool,
     pub status_message: Option<String>,
@@ -91,6 +94,9 @@ impl App {
                 self.render_dashboard(frame);
                 if self.command_palette_open {
                     self.render_command_palette(frame);
+                }
+                if let Some(command) = self.parameter_prompt {
+                    self.render_parameter_prompt(frame, command);
                 }
             }
         }
@@ -339,16 +345,29 @@ impl App {
     }
 
     fn render_command_palette(&self, frame: &mut Frame) {
-        let commands = self.available_commands();
+        let commands = self.palette_commands();
         let area = frame.area();
         let width = area.width.min(50);
-        let height = (commands.len() as u16 + 2).max(3).min(area.height);
+        let height = (commands.len() as u16 + 5).max(6).min(area.height);
         let popup = centered_rect(width, height, area);
 
         frame.render_widget(Clear, popup);
 
+        let [filter_area, list_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(popup);
+
+        frame.render_widget(
+            Paragraph::new(self.command_palette_filter.value())
+                .block(bordered_block("Filter")),
+            filter_area,
+        );
+        frame.set_cursor_position((
+            filter_area.x + 1 + self.command_palette_filter.cursor() as u16,
+            filter_area.y + 1,
+        ));
+
         let items: Vec<ListItem> = if commands.is_empty() {
-            vec![ListItem::new("no commands available for this EVSE")]
+            vec![ListItem::new("no commands match")]
         } else {
             commands.iter().map(|command| ListItem::new(command.label())).collect()
         };
@@ -363,7 +382,26 @@ impl App {
             state.select(Some(self.command_palette_selected));
         }
 
-        frame.render_stateful_widget(list, popup, &mut state);
+        frame.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    fn render_parameter_prompt(&self, frame: &mut Frame, command: Command) {
+        let Some(parameter) = command.parameter() else {
+            return;
+        };
+        let area = frame.area();
+        let popup = centered_rect(area.width.min(50), 3, area);
+        frame.render_widget(Clear, popup);
+
+        frame.render_widget(
+            Paragraph::new(self.parameter_field.value())
+                .block(bordered_block(parameter.label())),
+            popup,
+        );
+        frame.set_cursor_position((
+            popup.x + 1 + self.parameter_field.cursor() as u16,
+            popup.y + 1,
+        ));
     }
 
     fn render_help(&self, frame: &mut Frame) {
@@ -416,6 +454,17 @@ impl App {
             .collect()
     }
 
+    /// [`available_commands`](Self::available_commands) further narrowed by
+    /// the command palette's filter text (case-insensitive substring match
+    /// on the command's label).
+    fn palette_commands(&self) -> Vec<Command> {
+        let filter = self.command_palette_filter.value().to_lowercase();
+        self.available_commands()
+            .into_iter()
+            .filter(|command| command.label().to_lowercase().contains(&filter))
+            .collect()
+    }
+
     fn handle_events(&mut self) -> Result<()> {
         match event::read()? {
             // it's important to check that the event is a key press event as
@@ -431,6 +480,10 @@ impl App {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         if self.quit_confirm_open {
             self.handle_quit_confirm_key(key_event);
+            return;
+        }
+        if self.parameter_prompt.is_some() {
+            self.handle_parameter_prompt_key(key_event);
             return;
         }
         if self.command_palette_open {
@@ -524,6 +577,29 @@ impl App {
             KeyCode::Down => self.select_next_command(),
             KeyCode::Up => self.select_previous_command(),
             KeyCode::Enter => self.dispatch_selected_command(),
+            KeyCode::Backspace => {
+                self.command_palette_filter.backspace();
+                self.command_palette_selected = 0;
+            }
+            KeyCode::Char(c) => {
+                self.command_palette_filter.insert_char(c);
+                self.command_palette_selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_parameter_prompt_key(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Esc => self.cancel_parameter_prompt(),
+            KeyCode::Enter => self.submit_parameter_prompt(),
+            KeyCode::Backspace => self.parameter_field.backspace(),
+            KeyCode::Delete => self.parameter_field.delete(),
+            KeyCode::Left => self.parameter_field.move_left(),
+            KeyCode::Right => self.parameter_field.move_right(),
+            KeyCode::Home => self.parameter_field.move_home(),
+            KeyCode::End => self.parameter_field.move_end(),
+            KeyCode::Char(c) => self.parameter_field.insert_char(c),
             _ => {}
         }
     }
@@ -559,6 +635,7 @@ impl App {
             return;
         }
         self.command_palette_selected = 0;
+        self.command_palette_filter = TextField::default();
         self.command_palette_open = true;
     }
 
@@ -567,7 +644,7 @@ impl App {
     }
 
     fn select_next_command(&mut self) {
-        let count = self.available_commands().len();
+        let count = self.palette_commands().len();
         if count == 0 {
             return;
         }
@@ -580,21 +657,48 @@ impl App {
         self.command_palette_selected = self.command_palette_selected.saturating_sub(1);
     }
 
+    /// Dispatches the highlighted palette command, or, if it needs a
+    /// parameter first (e.g. an RFID tag), closes the palette and opens a
+    /// parameter prompt for it instead; the command is actually applied once
+    /// that prompt is submitted (see [`submit_parameter_prompt`](Self::submit_parameter_prompt)).
     fn dispatch_selected_command(&mut self) {
-        let commands = self.available_commands();
+        let commands = self.palette_commands();
         let command = commands.get(self.command_palette_selected).copied();
         self.close_command_palette();
 
         let Some(command) = command else {
             return;
         };
+
+        if command.parameter().is_some() {
+            self.parameter_field = TextField::default();
+            self.parameter_prompt = Some(command);
+            return;
+        }
+
+        self.apply_command(command, "");
+    }
+
+    fn cancel_parameter_prompt(&mut self) {
+        self.parameter_prompt = None;
+    }
+
+    fn submit_parameter_prompt(&mut self) {
+        let Some(command) = self.parameter_prompt.take() else {
+            return;
+        };
+        let input = self.parameter_field.value().to_string();
+        self.apply_command(command, &input);
+    }
+
+    fn apply_command(&mut self, command: Command, input: &str) {
         let Some(state) = &mut self.charger_state else {
             return;
         };
         let Some(evse) = state.evses.get_mut(self.focused_evse) else {
             return;
         };
-        if let Some(log_line) = command.apply(evse) {
+        if let Some(log_line) = command.apply(evse, input) {
             self.logs.push(log_line);
             self.status_message = Some(format!("✓ {}", command.label()));
         }
@@ -1017,6 +1121,93 @@ mod tests {
     }
 
     #[test]
+    fn typing_in_the_command_palette_filters_by_label_and_resets_the_selection() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+
+        // a fresh connector offers "Plug in vehicle" and "Report fault"
+        app.handle_key_event(key(KeyCode::Down));
+        assert_eq!(app.command_palette_selected, 1);
+
+        for c in "fault".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+
+        let labels: Vec<&str> = app.palette_commands().iter().map(|c| c.label()).collect();
+        assert_eq!(labels, vec!["Report fault"]);
+        assert_eq!(app.command_palette_selected, 0);
+    }
+
+    #[test]
+    fn backspacing_the_command_palette_filter_restores_hidden_commands() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+
+        for c in "fault".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        for _ in 0..5 {
+            app.handle_key_event(key(KeyCode::Backspace));
+        }
+
+        assert_eq!(app.palette_commands().len(), app.available_commands().len());
+    }
+
+    #[test]
+    fn selecting_a_command_that_needs_a_parameter_opens_a_prompt_instead_of_dispatching() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+        app.handle_key_event(key(KeyCode::Enter)); // highlighted command is "Plug in vehicle"
+
+        assert!(!app.command_palette_open);
+        assert_eq!(app.parameter_prompt, Some(Command::PlugInVehicle));
+        // nothing applied yet
+        assert_eq!(
+            app.charger_state.unwrap().evses[0].connectors[0].vehicle,
+            None
+        );
+    }
+
+    #[test]
+    fn submitting_the_parameter_prompt_applies_the_command_with_the_given_input() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+        app.handle_key_event(key(KeyCode::Enter)); // opens the "Vehicle ID" prompt
+
+        for c in "MY-EV-1".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert!(app.parameter_prompt.is_none());
+        let state = app.charger_state.unwrap();
+        assert_eq!(
+            state.evses[0].connectors[0].vehicle.as_ref().unwrap().id,
+            "MY-EV-1"
+        );
+    }
+
+    #[test]
+    fn esc_cancels_the_parameter_prompt_without_applying_the_command() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+        app.handle_key_event(key(KeyCode::Enter)); // opens the prompt
+
+        app.handle_key_event(key(KeyCode::Esc));
+
+        assert!(app.parameter_prompt.is_none());
+        assert_eq!(
+            app.charger_state.unwrap().evses[0].connectors[0].vehicle,
+            None
+        );
+    }
+
+    #[test]
     fn down_and_up_move_the_command_palette_selection_and_clamp() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
@@ -1041,9 +1232,11 @@ mod tests {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
         app.handle_key_event(key(KeyCode::Char('c')));
-        app.handle_key_event(key(KeyCode::Enter));
+        app.handle_key_event(key(KeyCode::Enter)); // opens the "Vehicle ID" parameter prompt
+        app.handle_key_event(key(KeyCode::Enter)); // submits it blank, applying the command
 
         assert!(!app.command_palette_open);
+        assert!(app.parameter_prompt.is_none());
         let state = app.charger_state.unwrap();
         assert_eq!(
             state.evses[0].connectors[0].status,
@@ -1058,7 +1251,8 @@ mod tests {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
         app.handle_key_event(key(KeyCode::Char('c')));
-        app.handle_key_event(key(KeyCode::Enter)); // plug in vehicle
+        app.handle_key_event(key(KeyCode::Enter)); // opens the parameter prompt
+        app.handle_key_event(key(KeyCode::Enter)); // submits it blank: plug in vehicle
 
         app.handle_key_event(key(KeyCode::Char('c')));
         let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
@@ -1074,7 +1268,8 @@ mod tests {
         assert_eq!(app.status_message, None);
 
         app.handle_key_event(key(KeyCode::Char('c')));
-        app.handle_key_event(key(KeyCode::Enter));
+        app.handle_key_event(key(KeyCode::Enter)); // opens the parameter prompt
+        app.handle_key_event(key(KeyCode::Enter)); // submits it blank
 
         assert_eq!(app.status_message, Some("✓ Plug in vehicle".to_string()));
     }
