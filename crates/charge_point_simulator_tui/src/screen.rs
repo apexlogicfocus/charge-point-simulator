@@ -3,5 +3,6 @@
 pub enum Screen {
     #[default]
     PickCharger,
+    ConnectionSetup,
     Dashboard,
 }

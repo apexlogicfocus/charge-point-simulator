@@ -1,5 +1,15 @@
 use charge_point_simulator_core::charger::{ConnectionStatus, ConnectorStatus};
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
+use ratatui::widgets::Block;
+
+/// Flowion brand teal, used as the base color for the banner and block borders.
+pub const BRAND_TEAL: Color = Color::Rgb(0x14, 0xB8, 0xA6);
+
+/// A bordered block styled with the brand teal border color.
+pub fn bordered_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+    Block::bordered().title(title).border_style(Style::new().fg(BRAND_TEAL))
+}
 
 pub fn connection_status_color(status: ConnectionStatus) -> Color {
     match status {

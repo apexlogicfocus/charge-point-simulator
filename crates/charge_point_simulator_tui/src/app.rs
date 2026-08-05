@@ -1,9 +1,14 @@
+use crate::connection_setup::connection_setup_layout;
 use crate::dashboard::{dashboard_layout, is_terminal_too_small};
 use crate::logs::LogBuffer;
 use crate::picker::picker_layout;
 use crate::screen::Screen;
-use crate::theme::{connection_status_color, connector_status_color};
-use charge_point_simulator_core::charger::{ChargerEntry, ChargerState, Command};
+use crate::text_field::TextField;
+use crate::theme::{BRAND_TEAL, bordered_block, connection_status_color, connector_status_color};
+use charge_point_simulator_core::charger::{
+    ChargerEntry, ChargerState, Command, ConnectionProfile, ConnectionStore, OcppVersion,
+    SecurityProfile, connect_charger,
+};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -11,13 +16,22 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot;
 use tui_big_text::{BigText, PixelSize};
 
 /// Rows occupied by the stacked "CHARGE" / "POINT" / "SIMULATOR" banner at
 /// `PixelSize::Quadrant` (4 terminal rows per glyph line).
 const BANNER_HEIGHT: u16 = 3 * 4;
 
-#[derive(Debug, Clone, Default)]
+/// How long to wait for a keyboard event before redrawing anyway, so
+/// externally-sourced log lines (tracing output from the simulator, and
+/// eventually `ocpp-charge-point`) show up promptly even with no input.
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Default)]
 pub struct App {
     pub screen: Screen,
     pub chargers: Vec<ChargerEntry>,
@@ -25,11 +39,19 @@ pub struct App {
     pub charger_state: Option<ChargerState>,
     pub focused_evse: usize,
     pub logs: LogBuffer,
+    pub log_receiver: Option<UnboundedReceiver<String>>,
     pub command_palette_open: bool,
     pub command_palette_selected: usize,
     pub help_open: bool,
     pub quit_confirm_open: bool,
     pub status_message: Option<String>,
+    pub connection_store: ConnectionStore,
+    pub connection_store_path: Option<PathBuf>,
+    pub connection_csms_url: TextField,
+    pub connection_ocpp_identity: TextField,
+    pub connection_password: TextField,
+    pub connection_focused_field: usize,
+    pub connect_result_receiver: Option<oneshot::Receiver<Result<(), String>>>,
     pub exit: bool,
 }
 
@@ -43,11 +65,15 @@ impl App {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
+            self.drain_log_receiver();
+            self.poll_connect_result();
             terminal.draw(|frame| self.draw(frame))?;
             if self.exit {
                 break;
             }
-            self.handle_events()?;
+            if event::poll(INPUT_POLL_INTERVAL)? {
+                self.handle_events()?;
+            }
         }
         Ok(())
     }
@@ -60,6 +86,7 @@ impl App {
 
         match self.screen {
             Screen::PickCharger => self.render_picker(frame),
+            Screen::ConnectionSetup => self.render_connection_setup(frame),
             Screen::Dashboard => {
                 self.render_dashboard(frame);
                 if self.command_palette_open {
@@ -105,7 +132,7 @@ impl App {
 
         let big_text = BigText::builder()
             .pixel_size(PixelSize::Quadrant)
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .style(Style::new().fg(BRAND_TEAL).add_modifier(Modifier::BOLD))
             .centered()
             .lines(vec!["CHARGE".into(), "POINT".into(), "SIMULATOR".into()])
             .build();
@@ -130,7 +157,7 @@ impl App {
             .collect();
 
         let list = List::new(items)
-            .block(Block::bordered().title("Select a charger"))
+            .block(bordered_block("Select a charger"))
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
             .highlight_symbol("> ");
 
@@ -140,6 +167,60 @@ impl App {
         }
 
         frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn render_connection_setup(&self, frame: &mut Frame) {
+        let layout = connection_setup_layout(frame.area());
+
+        let field_block = |title: &'static str, focused: bool| {
+            let style = if focused {
+                Style::new().fg(BRAND_TEAL).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(BRAND_TEAL)
+            };
+            Block::bordered().title(title).border_style(style)
+        };
+
+        let fields: [(&str, &TextField, bool, Rect); 3] = [
+            (
+                "CSMS URL",
+                &self.connection_csms_url,
+                self.connection_focused_field == 0,
+                layout.csms_url,
+            ),
+            (
+                "OCPP Identity",
+                &self.connection_ocpp_identity,
+                self.connection_focused_field == 1,
+                layout.ocpp_identity,
+            ),
+            (
+                "Password",
+                &self.connection_password,
+                self.connection_focused_field == 2,
+                layout.password,
+            ),
+        ];
+
+        for (title, field, focused, area) in fields {
+            let display_value = if title == "Password" {
+                "*".repeat(field.value().chars().count())
+            } else {
+                field.value().to_string()
+            };
+            frame.render_widget(
+                Paragraph::new(display_value).block(field_block(title, focused)),
+                area,
+            );
+            if focused {
+                frame.set_cursor_position((area.x + 1 + field.cursor() as u16, area.y + 1));
+            }
+        }
+
+        frame.render_widget(
+            Paragraph::new("Tab: next field  Enter: connect  Esc: cancel"),
+            layout.hint,
+        );
     }
 
     fn render_dashboard(&self, frame: &mut Frame) {
@@ -159,7 +240,7 @@ impl App {
             None => Line::from("no charger selected"),
         };
         frame.render_widget(
-            Paragraph::new(overview_line).block(Block::bordered().title("Overview")),
+            Paragraph::new(overview_line).block(bordered_block("Overview")),
             layout.overview,
         );
 
@@ -185,7 +266,7 @@ impl App {
         };
         frame.render_widget(
             Paragraph::new(evse_strip_line)
-                .block(Block::bordered().title("EVSEs"))
+                .block(bordered_block("EVSEs"))
                 .wrap(Wrap { trim: true }),
             layout.evse_strip,
         );
@@ -224,7 +305,7 @@ impl App {
             None => vec![Line::from("no charger selected")],
         };
         frame.render_widget(
-            Paragraph::new(evse_detail_lines).block(Block::bordered().title(evse_detail_title)),
+            Paragraph::new(evse_detail_lines).block(bordered_block(evse_detail_title)),
             layout.evse_detail,
         );
 
@@ -241,12 +322,15 @@ impl App {
             .map(Line::from)
             .collect();
         frame.render_widget(
-            Paragraph::new(log_lines).block(Block::bordered().title(log_title)),
+            Paragraph::new(log_lines).block(bordered_block(log_title)),
             layout.log,
         );
 
         let command_bar_line = match &self.status_message {
-            Some(message) => Line::styled(message.clone(), Style::new().fg(Color::Green)),
+            Some(message) => {
+                let color = if message.starts_with('✗') { Color::Red } else { Color::Green };
+                Line::styled(message.clone(), Style::new().fg(color))
+            }
             None => Line::from(
                 "q: quit  Esc: back  ←/→/Tab: focus EVSE  PgUp/PgDn: scroll logs  c: command  ?: help",
             ),
@@ -270,7 +354,7 @@ impl App {
         };
 
         let list = List::new(items)
-            .block(Block::bordered().title("Command"))
+            .block(bordered_block("Command"))
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
             .highlight_symbol("> ");
 
@@ -300,7 +384,7 @@ impl App {
              \u{20}c            open command palette";
 
         frame.render_widget(
-            Paragraph::new(text).block(Block::bordered().title("Help (Esc to close)")),
+            Paragraph::new(text).block(bordered_block("Help (Esc to close)")),
             popup,
         );
     }
@@ -313,7 +397,7 @@ impl App {
         frame.render_widget(
             Paragraph::new("Quit the simulator? (y/n)")
                 .alignment(Alignment::Center)
-                .block(Block::bordered().title("Quit?")),
+                .block(bordered_block("Quit?")),
             popup,
         );
     }
@@ -358,20 +442,25 @@ impl App {
             return;
         }
 
-        match key_event.code {
-            KeyCode::Char('q') => {
-                self.quit_confirm_open = true;
-                return;
+        // On the connection setup screen 'q'/'?' need to be typeable (URLs and passwords can
+        // contain either), so the global shortcuts don't apply there.
+        if self.screen != Screen::ConnectionSetup {
+            match key_event.code {
+                KeyCode::Char('q') => {
+                    self.quit_confirm_open = true;
+                    return;
+                }
+                KeyCode::Char('?') => {
+                    self.help_open = true;
+                    return;
+                }
+                _ => {}
             }
-            KeyCode::Char('?') => {
-                self.help_open = true;
-                return;
-            }
-            _ => {}
         }
 
         match self.screen {
             Screen::PickCharger => self.handle_pick_charger_key(key_event),
+            Screen::ConnectionSetup => self.handle_connection_setup_key(key_event),
             Screen::Dashboard => self.handle_dashboard_key(key_event),
         }
     }
@@ -396,6 +485,23 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.select_next_charger(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_charger(),
             KeyCode::Enter => self.confirm_charger_selection(),
+            _ => {}
+        }
+    }
+
+    fn handle_connection_setup_key(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Esc => self.return_to_picker(),
+            KeyCode::Tab | KeyCode::Down => self.connection_focus_next(),
+            KeyCode::BackTab | KeyCode::Up => self.connection_focus_previous(),
+            KeyCode::Enter => self.confirm_connection_setup(),
+            KeyCode::Backspace => self.focused_connection_field_mut().backspace(),
+            KeyCode::Delete => self.focused_connection_field_mut().delete(),
+            KeyCode::Left => self.focused_connection_field_mut().move_left(),
+            KeyCode::Right => self.focused_connection_field_mut().move_right(),
+            KeyCode::Home => self.focused_connection_field_mut().move_home(),
+            KeyCode::End => self.focused_connection_field_mut().move_end(),
+            KeyCode::Char(c) => self.focused_connection_field_mut().insert_char(c),
             _ => {}
         }
     }
@@ -495,13 +601,127 @@ impl App {
     }
 
     fn confirm_charger_selection(&mut self) {
-        if let Some(charger) = self.chargers.get(self.selected_charger) {
+        if let Some(charger) = self.chargers.get(self.selected_charger).cloned() {
             self.logs = LogBuffer::default();
             self.logs.push(format!("{} booting", charger.config.id));
             self.charger_state = Some(ChargerState::from_config(charger.config.clone()));
             self.focused_evse = 0;
             self.status_message = None;
-            self.screen = Screen::Dashboard;
+
+            if charger.config.ocpp_version == OcppVersion::V21 {
+                self.enter_connection_setup(&charger.config.id);
+                self.screen = Screen::ConnectionSetup;
+            } else {
+                self.screen = Screen::Dashboard;
+            }
+        }
+    }
+
+    /// Prefills the connection setup fields from the last-remembered profile for
+    /// `charger_id`, or sensible blanks (identity defaulting to the charger id) if
+    /// there isn't one yet.
+    fn enter_connection_setup(&mut self, charger_id: &str) {
+        match self.connection_store.get(charger_id).cloned() {
+            Some(profile) => {
+                let SecurityProfile::Basic { password } = profile.security;
+                self.connection_csms_url = TextField::new(profile.csms_url);
+                self.connection_ocpp_identity = TextField::new(profile.ocpp_identity);
+                self.connection_password =
+                    TextField::new(password).with_max_bytes(SecurityProfile::MAX_BASIC_PASSWORD_BYTES);
+            }
+            None => {
+                self.connection_csms_url = TextField::default();
+                self.connection_ocpp_identity = TextField::new(charger_id);
+                self.connection_password =
+                    TextField::default().with_max_bytes(SecurityProfile::MAX_BASIC_PASSWORD_BYTES);
+            }
+        }
+        self.connection_focused_field = 0;
+    }
+
+    fn connection_focus_next(&mut self) {
+        if self.connection_focused_field + 1 < 3 {
+            self.connection_focused_field += 1;
+        }
+    }
+
+    fn connection_focus_previous(&mut self) {
+        self.connection_focused_field = self.connection_focused_field.saturating_sub(1);
+    }
+
+    fn focused_connection_field_mut(&mut self) -> &mut TextField {
+        match self.connection_focused_field {
+            0 => &mut self.connection_csms_url,
+            1 => &mut self.connection_ocpp_identity,
+            _ => &mut self.connection_password,
+        }
+    }
+
+    fn confirm_connection_setup(&mut self) {
+        let Some(state) = &self.charger_state else {
+            return;
+        };
+        let charger_id = state.config.id.clone();
+        let config = state.config.clone();
+
+        let profile = ConnectionProfile {
+            csms_url: self.connection_csms_url.value().to_string(),
+            ocpp_identity: self.connection_ocpp_identity.value().to_string(),
+            security: SecurityProfile::Basic {
+                password: self.connection_password.value().to_string(),
+            },
+        };
+
+        self.connection_store.remember(charger_id, profile.clone());
+        if let Some(path) = &self.connection_store_path
+            && let Err(error) = self.connection_store.save(path)
+        {
+            tracing::warn!(%error, "failed to save connection store");
+        }
+
+        self.screen = Screen::Dashboard;
+
+        if !profile.csms_url.trim().is_empty() {
+            let (sender, receiver) = oneshot::channel();
+            self.connect_result_receiver = Some(receiver);
+            // `connect_and_setup`'s future isn't `Send` (upstream uses non-Send sync
+            // primitives internally), so it can't go through `tokio::spawn`. A dedicated
+            // thread with its own single-threaded runtime sidesteps that: `block_on`
+            // doesn't require `Send`.
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build a runtime for the CSMS connection attempt");
+                let outcome = runtime.block_on(connect_charger(&config, &profile));
+                let result = match &outcome {
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = sender.send(result);
+            });
+        }
+    }
+
+    /// Checks whether a background CSMS connection attempt has resolved, and if so
+    /// surfaces the outcome as a status message.
+    fn poll_connect_result(&mut self) {
+        let Some(receiver) = &mut self.connect_result_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(())) => {
+                self.status_message = Some("✓ connected to CSMS".to_string());
+                self.connect_result_receiver = None;
+            }
+            Ok(Err(error)) => {
+                self.status_message = Some(format!("✗ CSMS connection failed: {error}"));
+                self.connect_result_receiver = None;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.connect_result_receiver = None;
+            }
         }
     }
 
@@ -509,6 +729,17 @@ impl App {
         self.charger_state = None;
         self.status_message = None;
         self.screen = Screen::PickCharger;
+    }
+
+    /// Pulls every line currently buffered in the tracing bridge's channel
+    /// (if one is installed) into the log panel.
+    fn drain_log_receiver(&mut self) {
+        let Some(receiver) = &mut self.log_receiver else {
+            return;
+        };
+        while let Ok(line) = receiver.try_recv() {
+            self.logs.push(line);
+        }
     }
 }
 
@@ -541,6 +772,17 @@ mod tests {
                 id: id.into(),
                 ocpp_version: OcppVersion::V16J,
                 evses,
+            },
+            source: ChargerSource::BuiltIn,
+        }
+    }
+
+    fn charger_v21(id: &str) -> ChargerEntry {
+        ChargerEntry {
+            config: ChargerConfig {
+                id: id.into(),
+                ocpp_version: OcppVersion::V21,
+                evses: vec![EvseConfig { id: 1, connectors: 1 }],
             },
             source: ChargerSource::BuiltIn,
         }
@@ -854,5 +1096,193 @@ mod tests {
         app.handle_key_event(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::PickCharger);
         assert!(app.charger_state.is_none());
+    }
+
+    #[test]
+    fn draining_the_log_receiver_appends_every_pending_line() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(vec![]);
+        app.log_receiver = Some(receiver);
+
+        sender.send("first".to_string()).unwrap();
+        sender.send("second".to_string()).unwrap();
+
+        app.drain_log_receiver();
+        assert_eq!(app.logs.visible_lines(10), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn draining_without_a_receiver_installed_does_nothing() {
+        let mut app = App::new(vec![]);
+        app.drain_log_receiver();
+        assert_eq!(app.logs.visible_lines(10), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn selecting_a_2_1_charger_goes_to_connection_setup_not_the_dashboard() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        assert_eq!(app.screen, Screen::ConnectionSetup);
+    }
+
+    #[test]
+    fn selecting_a_1_6j_or_2_0_1_charger_still_goes_straight_to_the_dashboard() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        assert_eq!(app.screen, Screen::Dashboard);
+    }
+
+    #[test]
+    fn connection_setup_defaults_to_an_empty_url_and_the_charger_id_as_identity() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+
+        assert_eq!(app.connection_csms_url.value(), "");
+        assert_eq!(app.connection_ocpp_identity.value(), "CP-2.1");
+        assert_eq!(app.connection_password.value(), "");
+        assert_eq!(app.connection_focused_field, 0);
+    }
+
+    #[test]
+    fn connection_setup_prefills_from_a_remembered_profile() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.connection_store.remember(
+            "CP-2.1",
+            ConnectionProfile {
+                csms_url: "wss://csms.example.com".into(),
+                ocpp_identity: "remembered-id".into(),
+                security: SecurityProfile::Basic {
+                    password: "secret".into(),
+                },
+            },
+        );
+
+        app.confirm_charger_selection();
+
+        assert_eq!(app.connection_csms_url.value(), "wss://csms.example.com");
+        assert_eq!(app.connection_ocpp_identity.value(), "remembered-id");
+        assert_eq!(app.connection_password.value(), "secret");
+    }
+
+    #[test]
+    fn tab_and_shifttab_move_focus_between_fields_and_clamp() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.connection_focused_field, 1);
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.connection_focused_field, 2);
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.connection_focused_field, 2);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.connection_focused_field, 1);
+    }
+
+    #[test]
+    fn typing_edits_the_focused_field() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+
+        for c in "ws://host".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.connection_csms_url.value(), "ws://host");
+
+        app.handle_key_event(key(KeyCode::Backspace));
+        assert_eq!(app.connection_csms_url.value(), "ws://hos");
+    }
+
+    #[test]
+    fn q_and_question_mark_are_typed_into_the_field_instead_of_opening_global_modals() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Char('q')));
+        app.handle_key_event(key(KeyCode::Char('?')));
+
+        assert_eq!(app.connection_csms_url.value(), "q?");
+        assert!(!app.quit_confirm_open);
+        assert!(!app.help_open);
+    }
+
+    #[test]
+    fn esc_on_connection_setup_returns_to_the_picker() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::PickCharger);
+    }
+
+    #[test]
+    fn confirming_with_a_url_remembers_the_profile_and_starts_a_connect_attempt() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+
+        for c in "ws://localhost:9999/dev".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        // identity already defaults to the charger id (see
+        // `connection_setup_defaults_to_an_empty_url_and_the_charger_id_as_identity`)
+
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert!(app.connect_result_receiver.is_some());
+        let remembered = app.connection_store.get("CP-2.1").unwrap();
+        assert_eq!(remembered.csms_url, "ws://localhost:9999/dev");
+        assert_eq!(remembered.ocpp_identity, "CP-2.1");
+    }
+
+    #[test]
+    fn confirming_with_a_blank_url_does_not_start_a_connect_attempt() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert!(app.connect_result_receiver.is_none());
+    }
+
+    #[test]
+    fn poll_connect_result_reports_success() {
+        let (sender, receiver) = oneshot::channel();
+        let mut app = App::new(vec![]);
+        app.connect_result_receiver = Some(receiver);
+        sender.send(Ok(())).unwrap();
+
+        app.poll_connect_result();
+
+        assert_eq!(app.status_message, Some("✓ connected to CSMS".to_string()));
+        assert!(app.connect_result_receiver.is_none());
+    }
+
+    #[test]
+    fn poll_connect_result_reports_failure() {
+        let (sender, receiver) = oneshot::channel();
+        let mut app = App::new(vec![]);
+        app.connect_result_receiver = Some(receiver);
+        sender.send(Err("boom".to_string())).unwrap();
+
+        app.poll_connect_result();
+
+        assert_eq!(
+            app.status_message,
+            Some("✗ CSMS connection failed: boom".to_string())
+        );
+        assert!(app.connect_result_receiver.is_none());
+    }
+
+    #[test]
+    fn poll_connect_result_leaves_status_untouched_while_still_pending() {
+        let (_sender, receiver) = oneshot::channel();
+        let mut app = App::new(vec![]);
+        app.connect_result_receiver = Some(receiver);
+
+        app.poll_connect_result();
+
+        assert_eq!(app.status_message, None);
+        assert!(app.connect_result_receiver.is_some());
     }
 }

@@ -26,6 +26,9 @@ pub struct EvseConfig {
     pub connectors: u32,
 }
 
+/// A charger's hardware definition: OCPP version and EVSE/connector layout. Deliberately
+/// carries no CSMS connection details - the same definition can be dialed against different
+/// CSMS endpoints (see [`crate::charger::connection`]).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ChargerConfig {
     pub id: String,

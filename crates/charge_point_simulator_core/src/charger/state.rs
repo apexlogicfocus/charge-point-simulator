@@ -92,7 +92,7 @@ impl ChargerState {
     /// Builds the initial state for a freshly started charger: booting,
     /// every connector available, no vehicles plugged in, and zeroed metrics.
     pub fn from_config(config: ChargerConfig) -> Self {
-        let evses = config
+        let evses: Vec<EvseState> = config
             .evses
             .iter()
             .map(|evse_config| EvseState {
@@ -107,6 +107,12 @@ impl ChargerState {
                 metrics: EvseMetrics::default(),
             })
             .collect();
+
+        tracing::info!(
+            charger = %config.id,
+            evses = evses.len(),
+            "charger state initialized"
+        );
 
         Self {
             connection_status: ConnectionStatus::Booting,

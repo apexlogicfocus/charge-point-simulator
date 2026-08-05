@@ -10,4 +10,5 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tracing = "0.1"

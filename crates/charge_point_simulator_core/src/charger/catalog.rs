@@ -68,8 +68,23 @@ pub fn discover_configured_chargers(dir: &Path) -> Vec<ChargerEntry> {
                 Some("yaml") | Some("yml")
             )
         })
-        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-        .filter_map(|contents| ChargerConfig::from_yaml(&contents).ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "failed to read charger config");
+                    return None;
+                }
+            };
+            match ChargerConfig::from_yaml(&contents) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "skipping invalid charger config");
+                    None
+                }
+            }
+        })
         .map(|config| ChargerEntry {
             config,
             source: ChargerSource::Configured,
