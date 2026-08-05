@@ -1,10 +1,6 @@
-use crate::connection_setup::connection_setup_layout;
-use crate::dashboard::{dashboard_layout, is_terminal_too_small};
 use crate::logs::LogBuffer;
-use crate::picker::picker_layout;
 use crate::screen::Screen;
 use crate::text_field::TextField;
-use crate::theme::{BRAND_TEAL, bordered_block, connection_status_color, connector_status_color};
 use charge_point_simulator_core::charger::{
     ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, ConnectionProfile,
     ConnectionStore, OcppVersion, SecurityProfile, apply_ocpp_state, build_ocpp_event,
@@ -12,20 +8,11 @@ use charge_point_simulator_core::charger::{
 };
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
-use tui_big_text::{BigText, PixelSize};
-
-/// Rows occupied by the stacked "CHARGE" / "POINT" / "SIMULATOR" banner at
-/// `PixelSize::Quadrant` (4 terminal rows per glyph line).
-const BANNER_HEIGHT: u16 = 3 * 4;
 
 /// How long to wait for a keyboard event before redrawing anyway, so
 /// externally-sourced log lines (tracing output from the simulator, and
@@ -37,6 +24,16 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// `SetVariables`); shorter here so a demo session actually sees TransactionEvent traffic
 /// without waiting a minute for it.
 const METER_VALUE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How a status message in the command bar should read: [`theme::ok`] or [`theme::error`].
+/// Carried alongside the message text itself rather than left for the renderer to infer from
+/// the message's content (the previous approach parsed a `✗` prefix out of the string, which
+/// broke silently for any message that didn't happen to start with it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusSeverity {
+    Ok,
+    Error,
+}
 
 #[derive(Debug, Default)]
 pub struct App {
@@ -56,7 +53,7 @@ pub struct App {
     pub parameter_field: TextField,
     pub help_open: bool,
     pub quit_confirm_open: bool,
-    pub status_message: Option<String>,
+    pub status_message: Option<(StatusSeverity, String)>,
     pub connection_store: ConnectionStore,
     pub connection_store_path: Option<PathBuf>,
     pub connection_csms_url: TextField,
@@ -109,400 +106,11 @@ impl App {
     }
 
     pub(crate) fn draw(&self, frame: &mut Frame) {
-        if is_terminal_too_small(frame.area()) {
-            self.render_too_small(frame);
-            return;
-        }
-
-        match self.screen {
-            Screen::PickCharger => self.render_picker(frame),
-            Screen::ConnectionSetup => self.render_connection_setup(frame),
-            Screen::Dashboard => {
-                self.render_dashboard(frame);
-                if self.command_palette_open {
-                    self.render_command_palette(frame);
-                }
-                if let Some(command) = self.parameter_prompt {
-                    self.render_parameter_prompt(frame, command);
-                }
-            }
-        }
-
-        if self.help_open {
-            self.render_help(frame);
-        }
-        if self.quit_confirm_open {
-            self.render_quit_confirm(frame);
-        }
-    }
-
-    fn render_too_small(&self, frame: &mut Frame) {
-        let area = frame.area();
-        frame.render_widget(
-            Paragraph::new(format!(
-                "Terminal too small.\nResize to at least {}x{}.",
-                crate::dashboard::MIN_WIDTH,
-                crate::dashboard::MIN_HEIGHT
-            ))
-            .alignment(Alignment::Center),
-            area,
-        );
-    }
-
-    fn render_picker(&self, frame: &mut Frame) {
-        let layout = picker_layout(frame.area());
-        self.render_banner(frame, layout.banner);
-        self.render_charger_list(frame, layout.list);
-    }
-
-    fn render_banner(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let [_, banner, _] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(BANNER_HEIGHT),
-            Constraint::Fill(1),
-        ])
-        .areas(area);
-
-        let big_text = BigText::builder()
-            .pixel_size(PixelSize::Quadrant)
-            .style(Style::new().fg(BRAND_TEAL).add_modifier(Modifier::BOLD))
-            .centered()
-            .lines(vec!["CHARGE".into(), "POINT".into(), "SIMULATOR".into()])
-            .build();
-
-        frame.render_widget(big_text, banner);
-    }
-
-    fn render_charger_list(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let chargers = self.filtered_chargers();
-        let [filter_area, list_area] =
-            Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(area);
-
-        frame.render_widget(
-            Paragraph::new(self.picker_filter.value()).block(bordered_block("Filter")),
-            filter_area,
-        );
-        frame.set_cursor_position((
-            filter_area.x + 1 + self.picker_filter.cursor() as u16,
-            filter_area.y + 1,
-        ));
-
-        let items: Vec<ListItem> = if chargers.is_empty() {
-            vec![ListItem::new("no chargers match")]
-        } else {
-            chargers
-                .iter()
-                .map(|entry| {
-                    let evse_count = entry.config.evses.len();
-                    ListItem::new(format!(
-                        "{}  [{}]  {} EVSE{}",
-                        entry.config.id,
-                        entry.config.ocpp_version,
-                        evse_count,
-                        if evse_count == 1 { "" } else { "s" }
-                    ))
-                })
-                .collect()
-        };
-
-        let list = List::new(items)
-            .block(bordered_block("Select a charger"))
-            .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("> ");
-
-        let mut state = ListState::default();
-        if !chargers.is_empty() {
-            state.select(Some(self.selected_charger));
-        }
-
-        frame.render_stateful_widget(list, list_area, &mut state);
-    }
-
-    fn render_connection_setup(&self, frame: &mut Frame) {
-        let layout = connection_setup_layout(frame.area());
-
-        let field_block = |title: &'static str, focused: bool| {
-            let style = if focused {
-                Style::new().fg(BRAND_TEAL).add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(BRAND_TEAL)
-            };
-            Block::bordered().title(title).border_style(style)
-        };
-
-        let fields: [(&str, &TextField, bool, Rect); 3] = [
-            (
-                "CSMS URL",
-                &self.connection_csms_url,
-                self.connection_focused_field == 0,
-                layout.csms_url,
-            ),
-            (
-                "OCPP Identity",
-                &self.connection_ocpp_identity,
-                self.connection_focused_field == 1,
-                layout.ocpp_identity,
-            ),
-            (
-                "Password",
-                &self.connection_password,
-                self.connection_focused_field == 2,
-                layout.password,
-            ),
-        ];
-
-        for (title, field, focused, area) in fields {
-            let display_value = if title == "Password" {
-                "*".repeat(field.value().chars().count())
-            } else {
-                field.value().to_string()
-            };
-            frame.render_widget(
-                Paragraph::new(display_value).block(field_block(title, focused)),
-                area,
-            );
-            if focused {
-                frame.set_cursor_position((area.x + 1 + field.cursor() as u16, area.y + 1));
-            }
-        }
-
-        frame.render_widget(
-            Paragraph::new("Tab: next field  Enter: connect  Esc: cancel"),
-            layout.hint,
-        );
-    }
-
-    fn render_dashboard(&self, frame: &mut Frame) {
-        let has_display = self
-            .charger_state
-            .as_ref()
-            .is_some_and(|state| state.config.has_display);
-        let layout = dashboard_layout(frame.area(), has_display);
-
-        if has_display {
-            let message = self
-                .charger_state
-                .as_ref()
-                .and_then(|state| state.display_message.as_deref())
-                .unwrap_or("(blank)");
-            frame.render_widget(
-                Paragraph::new(message).block(bordered_block("Display")),
-                layout.display,
-            );
-        }
-
-        let overview_line = match &self.charger_state {
-            Some(state) => Line::from(vec![
-                Span::raw(format!(
-                    "{}  |  {}  |  status: ",
-                    state.config.id, state.config.ocpp_version
-                )),
-                Span::styled(
-                    state.connection_status.to_string(),
-                    Style::new().fg(connection_status_color(state.connection_status)),
-                ),
-            ]),
-            None => Line::from("no charger selected"),
-        };
-        frame.render_widget(
-            Paragraph::new(overview_line).block(bordered_block("Overview")),
-            layout.overview,
-        );
-
-        let evse_strip_line = match &self.charger_state {
-            Some(state) if !state.evses.is_empty() => {
-                let spans: Vec<Span> = state
-                    .evses
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(index, evse)| {
-                        let label = format!(" EVSE {} ({}) ", evse.id, evse.connectors.len());
-                        let style = if index == self.focused_evse {
-                            Style::new().add_modifier(Modifier::REVERSED)
-                        } else {
-                            Style::new()
-                        };
-                        [Span::styled(label, style), Span::raw("  ")]
-                    })
-                    .collect();
-                Line::from(spans)
-            }
-            _ => Line::from("no EVSEs"),
-        };
-        frame.render_widget(
-            Paragraph::new(evse_strip_line)
-                .block(bordered_block("EVSEs"))
-                .wrap(Wrap { trim: true }),
-            layout.evse_strip,
-        );
-
-        let evse_detail_title = match &self.charger_state {
-            Some(state) if !state.evses.is_empty() => {
-                format!("EVSE detail ({}/{})", self.focused_evse + 1, state.evses.len())
-            }
-            _ => "EVSE detail".to_string(),
-        };
-        let evse_detail_lines: Vec<Line> = match &self.charger_state {
-            Some(state) if !state.evses.is_empty() => {
-                let evse = &state.evses[self.focused_evse.min(state.evses.len() - 1)];
-                let mut lines = vec![Line::from(format!(
-                    "EVSE {}  |  {:.2} kW  {:.1} A  {:.3} kWh",
-                    evse.id, evse.metrics.power_kw, evse.metrics.current_a, evse.metrics.energy_kwh
-                ))];
-                lines.extend(evse.connectors.iter().map(|connector| {
-                    let vehicle = connector
-                        .vehicle
-                        .as_ref()
-                        .map(|vehicle| format!(" - {}", vehicle.id))
-                        .unwrap_or_default();
-                    Line::from(vec![
-                        Span::raw(format!("  connector {}: ", connector.id)),
-                        Span::styled(
-                            connector.status.to_string(),
-                            Style::new().fg(connector_status_color(connector.status)),
-                        ),
-                        Span::raw(vehicle),
-                    ])
-                }));
-                lines
-            }
-            Some(_) => vec![Line::from("no EVSEs configured")],
-            None => vec![Line::from("no charger selected")],
-        };
-        frame.render_widget(
-            Paragraph::new(evse_detail_lines).block(bordered_block(evse_detail_title)),
-            layout.evse_detail,
-        );
-
-        let log_title = if self.logs.is_paused() {
-            "Logs (scrolled up, paused)"
-        } else {
-            "Logs"
-        };
-        let log_height = layout.log.height.saturating_sub(2) as usize;
-        let log_lines: Vec<Line> = self
-            .logs
-            .visible_lines(log_height)
-            .into_iter()
-            .map(Line::from)
-            .collect();
-        frame.render_widget(
-            Paragraph::new(log_lines).block(bordered_block(log_title)),
-            layout.log,
-        );
-
-        let command_bar_line = match &self.status_message {
-            Some(message) => {
-                let color = if message.starts_with('✗') { Color::Red } else { Color::Green };
-                Line::styled(message.clone(), Style::new().fg(color))
-            }
-            None => Line::from(
-                "q: quit  Esc: back  ←/→/Tab: focus EVSE  PgUp/PgDn: scroll logs  c: command  ?: help",
-            ),
-        };
-        frame.render_widget(Paragraph::new(command_bar_line), layout.command_bar);
-    }
-
-    fn render_command_palette(&self, frame: &mut Frame) {
-        let commands = self.palette_commands();
-        let area = frame.area();
-        let width = area.width.min(50);
-        let height = (commands.len() as u16 + 5).max(6).min(area.height);
-        let popup = centered_rect(width, height, area);
-
-        frame.render_widget(Clear, popup);
-
-        let [filter_area, list_area] =
-            Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(popup);
-
-        frame.render_widget(
-            Paragraph::new(self.command_palette_filter.value())
-                .block(bordered_block("Filter")),
-            filter_area,
-        );
-        frame.set_cursor_position((
-            filter_area.x + 1 + self.command_palette_filter.cursor() as u16,
-            filter_area.y + 1,
-        ));
-
-        let items: Vec<ListItem> = if commands.is_empty() {
-            vec![ListItem::new("no commands match")]
-        } else {
-            commands.iter().map(|command| ListItem::new(command.label())).collect()
-        };
-
-        let list = List::new(items)
-            .block(bordered_block("Command"))
-            .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("> ");
-
-        let mut state = ListState::default();
-        if !commands.is_empty() {
-            state.select(Some(self.command_palette_selected));
-        }
-
-        frame.render_stateful_widget(list, list_area, &mut state);
-    }
-
-    fn render_parameter_prompt(&self, frame: &mut Frame, command: Command) {
-        let Some(parameter) = command.parameter() else {
-            return;
-        };
-        let area = frame.area();
-        let popup = centered_rect(area.width.min(50), 3, area);
-        frame.render_widget(Clear, popup);
-
-        frame.render_widget(
-            Paragraph::new(self.parameter_field.value())
-                .block(bordered_block(parameter.label())),
-            popup,
-        );
-        frame.set_cursor_position((
-            popup.x + 1 + self.parameter_field.cursor() as u16,
-            popup.y + 1,
-        ));
-    }
-
-    fn render_help(&self, frame: &mut Frame) {
-        let area = frame.area();
-        let popup = centered_rect(area.width.min(56), area.height.min(14), area);
-        frame.render_widget(Clear, popup);
-
-        let text = "Global\n\
-             \u{20}q            quit (confirm)\n\
-             \u{20}?            toggle this help\n\n\
-             Charger picker\n\
-             \u{20}\u{2191}/\u{2193}        move selection\n\
-             \u{20}type         filter by charger id\n\
-             \u{20}Enter        select charger\n\
-             \u{20}Esc          clear filter (or quit)\n\n\
-             Dashboard\n\
-             \u{20}Esc          back to picker\n\
-             \u{20}\u{2190}/\u{2192} or Tab   focus EVSE\n\
-             \u{20}PgUp/PgDn    scroll logs\n\
-             \u{20}c            open command palette";
-
-        frame.render_widget(
-            Paragraph::new(text).block(bordered_block("Help (Esc to close)")),
-            popup,
-        );
-    }
-
-    fn render_quit_confirm(&self, frame: &mut Frame) {
-        let area = frame.area();
-        let popup = centered_rect(area.width.min(34), 3, area);
-        frame.render_widget(Clear, popup);
-
-        frame.render_widget(
-            Paragraph::new("Quit the simulator? (y/n)")
-                .alignment(Alignment::Center)
-                .block(bordered_block("Quit?")),
-            popup,
-        );
+        crate::ui::draw(frame, self);
     }
 
     /// Commands eligible to run against the currently focused EVSE.
-    fn available_commands(&self) -> Vec<Command> {
+    pub(crate) fn available_commands(&self) -> Vec<Command> {
         let Some(state) = &self.charger_state else {
             return Vec::new();
         };
@@ -522,7 +130,7 @@ impl App {
     /// [`available_commands`](Self::available_commands) further narrowed by
     /// the command palette's filter text (case-insensitive substring match
     /// on the command's label).
-    fn palette_commands(&self) -> Vec<Command> {
+    pub(crate) fn palette_commands(&self) -> Vec<Command> {
         let filter = self.command_palette_filter.value().to_lowercase();
         self.available_commands()
             .into_iter()
@@ -692,7 +300,7 @@ impl App {
 
     /// [`Self::chargers`] narrowed by the picker's filter text (case-insensitive substring
     /// match on the charger id).
-    fn filtered_chargers(&self) -> Vec<&ChargerEntry> {
+    pub(crate) fn filtered_chargers(&self) -> Vec<&ChargerEntry> {
         let filter = self.picker_filter.value().to_lowercase();
         self.chargers
             .iter()
@@ -802,7 +410,7 @@ impl App {
                 && let Some(log_line) = command.apply_to_charger(state, input)
             {
                 self.logs.push(log_line);
-                self.status_message = Some(format!("✓ {}", command.label()));
+                self.status_message = Some((StatusSeverity::Ok, format!("✓ {}", command.label())));
             }
             return;
         }
@@ -812,10 +420,13 @@ impl App {
                 Some(event) => {
                     let _ = sender.send(event);
                     self.logs.push(format!("{} sent to CSMS", command.label()));
-                    self.status_message = Some(format!("→ {}", command.label()));
+                    self.status_message = Some((StatusSeverity::Ok, format!("→ {}", command.label())));
                 }
                 None => {
-                    self.status_message = Some(format!("✗ {} not ready yet", command.label()));
+                    self.status_message = Some((
+                        StatusSeverity::Error,
+                        format!("✗ {} not ready yet", command.label()),
+                    ));
                 }
             }
             return;
@@ -829,7 +440,7 @@ impl App {
         };
         if let Some(log_line) = command.apply(evse, input) {
             self.logs.push(log_line);
-            self.status_message = Some(format!("✓ {}", command.label()));
+            self.status_message = Some((StatusSeverity::Ok, format!("✓ {}", command.label())));
         }
     }
 
@@ -980,11 +591,14 @@ impl App {
         };
         match receiver.try_recv() {
             Ok(Ok(())) => {
-                self.status_message = Some("✓ connected to CSMS".to_string());
+                self.status_message = Some((StatusSeverity::Ok, "✓ connected to CSMS".to_string()));
                 self.connect_result_receiver = None;
             }
             Ok(Err(error)) => {
-                self.status_message = Some(format!("✗ CSMS connection failed: {error}"));
+                self.status_message = Some((
+                    StatusSeverity::Error,
+                    format!("✗ CSMS connection failed: {error}"),
+                ));
                 self.connect_result_receiver = None;
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
@@ -1073,14 +687,6 @@ impl App {
             let _ = sender.send(event);
         }
     }
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    let x = area.x + (area.width - width) / 2;
-    let y = area.y + (area.height - height) / 2;
-    Rect::new(x, y, width, height)
 }
 
 #[cfg(test)]
@@ -1444,7 +1050,7 @@ mod tests {
         );
         assert_eq!(
             app.status_message,
-            Some("✓ Set display message".to_string())
+            Some((StatusSeverity::Ok, "✓ Set display message".to_string()))
         );
         let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
         assert!(labels.contains(&"Clear display message"));
@@ -1643,14 +1249,17 @@ mod tests {
         app.handle_key_event(key(KeyCode::Enter)); // opens the parameter prompt
         app.handle_key_event(key(KeyCode::Enter)); // submits it blank
 
-        assert_eq!(app.status_message, Some("✓ Plug in vehicle".to_string()));
+        assert_eq!(
+            app.status_message,
+            Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string()))
+        );
     }
 
     #[test]
     fn returning_to_the_picker_clears_any_status_message() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.status_message = Some("✓ Plug in vehicle".to_string());
+        app.status_message = Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string()));
 
         app.handle_key_event(key(KeyCode::Esc));
         assert_eq!(app.status_message, None);
@@ -1823,7 +1432,10 @@ mod tests {
 
         app.poll_connect_result();
 
-        assert_eq!(app.status_message, Some("✓ connected to CSMS".to_string()));
+        assert_eq!(
+            app.status_message,
+            Some((StatusSeverity::Ok, "✓ connected to CSMS".to_string()))
+        );
         assert!(app.connect_result_receiver.is_none());
     }
 
@@ -1838,7 +1450,10 @@ mod tests {
 
         assert_eq!(
             app.status_message,
-            Some("✗ CSMS connection failed: boom".to_string())
+            Some((
+                StatusSeverity::Error,
+                "✗ CSMS connection failed: boom".to_string()
+            ))
         );
         assert!(app.connect_result_receiver.is_none());
     }
@@ -1980,7 +1595,10 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         assert_eq!(
             app.status_message,
-            Some("✗ Plug in vehicle not ready yet".to_string())
+            Some((
+                StatusSeverity::Error,
+                "✗ Plug in vehicle not ready yet".to_string()
+            ))
         );
     }
 

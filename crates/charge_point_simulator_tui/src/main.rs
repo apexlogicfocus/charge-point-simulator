@@ -1,14 +1,12 @@
 mod screen;
 mod app;
-mod connection_setup;
-mod dashboard;
 mod logs;
-mod picker;
 #[cfg(test)]
 mod snapshot;
 mod text_field;
 mod theme;
 mod tracing_bridge;
+mod ui;
 
 use std::path::PathBuf;
 
