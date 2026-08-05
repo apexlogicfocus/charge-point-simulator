@@ -1,12 +1,12 @@
 ● connected  |  CP-LOCAL  |  OCPP 1.6J  |  local simulation  |  up 0s
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-EVSEs───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-EVSE 1 (1)
-EVSE detail (1/1)───────────────────────────────────────────────────────────────────────────────────────────────────────
-EVSE 1  |  0.00 kW  0.0 A  0.000 kWh
-○ connector 1: available
+EVSEs (1/1)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
+EVSE 1  ○ available   0.00 kW  0.0 A  0.000 kWh                                         EVSE 1 / C1
+  ▸ C1  ○ available                                                                     ○ available
+                                                                                        no vehicle
+                                                                                        session  0s
 
-
+                                                                                        0.00 kW  0.0 A  0.000 kWh
 
 
 
@@ -31,4 +31,4 @@ Logs─────────────────────────�
 
 
 
-q: quit  Esc: back  ←/→/Tab: focus EVSE  PgUp/PgDn: scroll logs  c: command  ?: help
+q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  PgUp/PgDn: scroll logs  c: command  ?: help

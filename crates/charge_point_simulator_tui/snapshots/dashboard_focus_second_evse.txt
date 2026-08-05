@@ -1,11 +1,11 @@
-● connected  |  CP-LIVE  |  OCPP 2.1  |  wss://csms.example.com/CP-LIVE  |  up 0s
+● connected  |  CP-MULTI  |  OCPP 1.6J  |  local simulation  |  up 10m 00s
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-EVSEs (1/1)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
-EVSE 1  ○ available   0.00 kW  0.0 A  0.000 kWh                                         EVSE 1 / C1
-  ▸ C1  ○ available                                                                     ○ available
-                                                                                        no vehicle
-                                                                                        session  0s
-
+EVSEs (2/2)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
+EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh                                         EVSE 2 / C1
+    C1  ● charging   MY-EV-1   100%                                                     ✕ faulted
+    C2  ○ available                                                                     no vehicle
+EVSE 2  ✕ faulted   0.00 kW  0.0 A  0.000 kWh                                           session  0s
+  ▸ C1  ✕ faulted
                                                                                         0.00 kW  0.0 A  0.000 kWh
 
 

@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::app::App;
+use crate::app::{App, FocusedConnector};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
@@ -313,6 +313,58 @@ fn dashboard_narrow() {
     let app = charging_dashboard_app();
 
     assert_snapshot("dashboard_narrow", &render(&app, 80, 24));
+}
+
+/// A charger with two EVSEs whose connectors are all in different states at once: EVSE 1's
+/// first connector charging with a vehicle plugged in, its second connector free, and EVSE 2's
+/// only connector faulted. This is exactly the case the old EVSE-strip/single-EVSE-detail UI
+/// hid - finding the fault meant Tab-cycling through every EVSE - so the tree is expected to
+/// show every connector's status at once without any navigation at all.
+fn multi_evse_mixed_status_app() -> App {
+    let config = charger_config(
+        "CP-MULTI",
+        OcppVersion::V16J,
+        vec![
+            EvseConfig { id: 1, connectors: 2 },
+            EvseConfig { id: 2, connectors: 1 },
+        ],
+        false,
+    );
+    let mut app = dashboard_app(config);
+    let state = app.charger_state.as_mut().unwrap();
+    Command::PlugInVehicle.apply_to(&mut state.evses[0], 0, "MY-EV-1");
+    Command::PresentRfid.apply_to(&mut state.evses[0], 0, "TAG-1");
+    Command::ReportFault.apply_to(&mut state.evses[1], 0, "OverCurrentFailure");
+    state.tick(Duration::from_secs(600));
+    app
+}
+
+#[test]
+fn dashboard_multi_evse_mixed_status() {
+    let app = multi_evse_mixed_status_app();
+
+    assert_snapshot("dashboard_multi_evse_mixed_status", &render(&app, 120, 34));
+}
+
+/// Focus on a connector belonging to the *second* EVSE - the sidebar must track it there, not
+/// stay pinned to EVSE 1's first connector.
+#[test]
+fn dashboard_focus_second_evse() {
+    let mut app = multi_evse_mixed_status_app();
+    app.focused = FocusedConnector { evse: 1, connector: 0 };
+
+    assert_snapshot("dashboard_focus_second_evse", &render(&app, 120, 34));
+}
+
+/// The same mixed-status, multi-EVSE charger as [`dashboard_multi_evse_mixed_status`], but at
+/// 80 columns: below the sidebar's width threshold, so the focused connector's detail must
+/// appear inline beneath its row in the tree instead of in a sidebar, and every EVSE/connector
+/// must still be visible without anything running off the right edge.
+#[test]
+fn dashboard_narrow_multi_evse() {
+    let app = multi_evse_mixed_status_app();
+
+    assert_snapshot("dashboard_narrow_multi_evse", &render(&app, 80, 24));
 }
 
 /// The header's `Local` case: "local simulation" in place of a CSMS URL. Every other

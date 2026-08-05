@@ -1,0 +1,24 @@
+● connected  |  CP-MULTI  |  OCPP 1.6J  |  local simulation  |  up 10m 00s
+────────────────────────────────────────────────────────────────────────────────
+EVSEs (1/2)─────────────────────────────────────────────────────────────────────
+EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh
+  ▸ C1  ● charging   MY-EV-1   100%
+        MY-EV-1  100% ██████████  session 10m 00s  7.40 kW
+    C2  ○ available
+EVSE 2  ✕ faulted   0.00 kW  0.0 A  0.000 kWh
+    C1  ✕ faulted
+
+
+
+Logs────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  PgUp/PgDn: scroll logs  c: co

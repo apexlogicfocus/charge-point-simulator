@@ -1,13 +1,13 @@
-● connected  |  CP-IDLE  |  OCPP 1.6J  |  local simulation  |  up 0s
+● connected  |  CP-MULTI  |  OCPP 1.6J  |  local simulation  |  up 10m 00s
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 EVSEs (1/2)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
-EVSE 1  ○ available   0.00 kW  0.0 A  0.000 kWh                                         EVSE 1 / C1
-  ▸ C1  ○ available                                                                     ○ available
-EVSE 2  ○ available   0.00 kW  0.0 A  0.000 kWh                                         no vehicle
-    C1  ○ available                                                                     session  0s
-    C2  ○ available
-                                                                                        0.00 kW  0.0 A  0.000 kWh
+EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh                                         EVSE 1 / C1
+  ▸ C1  ● charging   MY-EV-1   100%                                                     ● charging
+    C2  ○ available                                                                     vehicle  MY-EV-1
+EVSE 2  ✕ faulted   0.00 kW  0.0 A  0.000 kWh                                           soc      100% ██████████
+    C1  ✕ faulted                                                                       session  10m 00s
 
+                                                                                        7.40 kW  32.2 A  1.233 kWh
 
 
 

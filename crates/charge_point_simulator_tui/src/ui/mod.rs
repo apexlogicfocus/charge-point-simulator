@@ -3,11 +3,13 @@ mod dashboard;
 mod overlays;
 mod palette;
 mod picker;
+mod view;
 
 use crate::app::App;
 use crate::screen::Screen;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use view::{DashboardView, ParameterPromptView, PaletteView};
 
 pub(crate) fn draw(frame: &mut Frame, app: &App) {
     if dashboard::is_terminal_too_small(frame.area()) {
@@ -19,12 +21,12 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
         Screen::PickCharger => picker::render(frame, app),
         Screen::ConnectionSetup => connection_setup::render(frame, app),
         Screen::Dashboard => {
-            dashboard::render(frame, app);
+            dashboard::render(frame, &DashboardView::from_app(app));
             if app.command_palette_open {
-                palette::render_command_palette(frame, app);
+                palette::render_command_palette(frame, &PaletteView::from_app(app));
             }
             if let Some(command) = app.parameter_prompt {
-                palette::render_parameter_prompt(frame, app, command);
+                palette::render_parameter_prompt(frame, &ParameterPromptView::from_app(app, command));
             }
         }
     }

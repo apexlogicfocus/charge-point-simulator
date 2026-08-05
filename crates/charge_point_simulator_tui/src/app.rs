@@ -4,7 +4,7 @@ use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, ConnectionProfile,
     ConnectionStore, OcppVersion, SecurityProfile, SimulationMode, apply_ocpp_state,
-    build_ocpp_event, connect_charger, meter_sample_events,
+    build_ocpp_event_for_connector, connect_charger, meter_sample_events,
 };
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -35,6 +35,19 @@ pub enum StatusSeverity {
     Error,
 }
 
+/// Identifies one connector within the currently loaded charger: which EVSE, and which
+/// connector within it (both 0-indexed into [`ChargerState::evses`]/`EvseState::connectors`).
+///
+/// Replaces the old `focused_evse: usize` - commands (see [`App::available_commands`] and
+/// [`App::apply_command`]) now dispatch against exactly the connector this points at, not just
+/// "the first eligible connector on the focused EVSE." `Default` points at the first connector
+/// of the first EVSE, matching a freshly selected charger.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FocusedConnector {
+    pub evse: usize,
+    pub connector: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct App {
     pub screen: Screen,
@@ -43,7 +56,7 @@ pub struct App {
     pub selected_charger: usize,
     pub picker_filter: TextField,
     pub charger_state: Option<ChargerState>,
-    pub focused_evse: usize,
+    pub focused: FocusedConnector,
     pub logs: LogBuffer,
     pub log_receiver: Option<UnboundedReceiver<String>>,
     pub command_palette_open: bool,
@@ -124,19 +137,25 @@ impl App {
         crate::ui::draw(frame, self);
     }
 
-    /// Commands eligible to run against the currently focused EVSE.
+    /// Commands eligible to run against the currently focused connector (see
+    /// [`FocusedConnector`]) - not merely the focused EVSE's first eligible connector, so the
+    /// palette never offers something that would silently act on a different connector than
+    /// the one on screen.
     pub(crate) fn available_commands(&self) -> Vec<Command> {
         let Some(state) = &self.charger_state else {
             return Vec::new();
         };
-        let evse = state.evses.get(self.focused_evse);
+        let connector = state
+            .evses
+            .get(self.focused.evse)
+            .and_then(|evse| evse.connectors.get(self.focused.connector));
         Command::ALL
             .into_iter()
             .filter(|command| {
                 if command.is_display_command() {
                     command.is_available_for_charger(state)
                 } else {
-                    evse.is_some_and(|evse| command.is_available(evse))
+                    connector.is_some_and(|connector| command.is_available_for_connector(connector))
                 }
             })
             .collect()
@@ -273,6 +292,8 @@ impl App {
             KeyCode::Esc => self.return_to_picker(),
             KeyCode::PageUp => self.logs.scroll_up(),
             KeyCode::PageDown => self.logs.scroll_down(),
+            KeyCode::Down => self.select_next_connector(),
+            KeyCode::Up => self.select_previous_connector(),
             KeyCode::Right | KeyCode::Tab => self.select_next_evse(),
             KeyCode::Left | KeyCode::BackTab => self.select_previous_evse(),
             KeyCode::Char('c') => self.open_command_palette(),
@@ -337,17 +358,92 @@ impl App {
         self.selected_charger = self.selected_charger.saturating_sub(1);
     }
 
+    /// Every valid `(evse_index, connector_index)` pair in `state`, in display order - EVSEs
+    /// top to bottom, each one's connectors beneath it. This is the flattened list
+    /// [`Self::select_next_connector`]/[`Self::select_previous_connector`] walk, so `↑`/`↓`
+    /// treat the whole tree as one list and flow across EVSE boundaries instead of stopping at
+    /// them the way `Tab`/`←`/`→` do.
+    fn connector_positions(state: &ChargerState) -> Vec<(usize, usize)> {
+        state
+            .evses
+            .iter()
+            .enumerate()
+            .flat_map(|(evse_index, evse)| {
+                (0..evse.connectors.len()).map(move |connector_index| (evse_index, connector_index))
+            })
+            .collect()
+    }
+
+    /// `↓`: moves focus to the next connector in display order, flowing from the last
+    /// connector of one EVSE into the first connector of the next rather than stopping at the
+    /// EVSE boundary - see [`Self::connector_positions`]. Clamps at the last connector in the
+    /// whole tree; does nothing (rather than panicking) for a charger with no EVSEs, or whose
+    /// EVSEs have no connectors.
+    fn select_next_connector(&mut self) {
+        let Some(state) = &self.charger_state else {
+            return;
+        };
+        let positions = Self::connector_positions(state);
+        let Some(current) = positions.iter().position(|&pos| pos == (self.focused.evse, self.focused.connector))
+        else {
+            // Focus doesn't point at a real connector (e.g. an EVSE with none) - land on the
+            // first one that exists rather than doing nothing.
+            if let Some(&(evse, connector)) = positions.first() {
+                self.focused = FocusedConnector { evse, connector };
+            }
+            return;
+        };
+        if let Some(&(evse, connector)) = positions.get(current + 1) {
+            self.focused = FocusedConnector { evse, connector };
+        }
+    }
+
+    /// `↑`: the mirror image of [`Self::select_next_connector`].
+    fn select_previous_connector(&mut self) {
+        let Some(state) = &self.charger_state else {
+            return;
+        };
+        let positions = Self::connector_positions(state);
+        let Some(current) = positions.iter().position(|&pos| pos == (self.focused.evse, self.focused.connector))
+        else {
+            if let Some(&(evse, connector)) = positions.first() {
+                self.focused = FocusedConnector { evse, connector };
+            }
+            return;
+        };
+        if current > 0
+            && let Some(&(evse, connector)) = positions.get(current - 1)
+        {
+            self.focused = FocusedConnector { evse, connector };
+        }
+    }
+
+    /// `→`/`Tab`: jumps focus to the next EVSE, always landing on its first connector - unlike
+    /// `↑`/`↓` this treats the tree as EVSE-sized steps, matching the pre-Phase-3b behavior
+    /// this key retains ("keep working as they do today").
     fn select_next_evse(&mut self) {
         let Some(state) = &self.charger_state else {
             return;
         };
-        if self.focused_evse + 1 < state.evses.len() {
-            self.focused_evse += 1;
+        if state.evses.is_empty() {
+            return;
         }
+        if self.focused.evse + 1 < state.evses.len() {
+            self.focused.evse += 1;
+        }
+        self.focused.connector = 0;
     }
 
+    /// `←`/`BackTab`: the mirror image of [`Self::select_next_evse`].
     fn select_previous_evse(&mut self) {
-        self.focused_evse = self.focused_evse.saturating_sub(1);
+        let Some(state) = &self.charger_state else {
+            return;
+        };
+        if state.evses.is_empty() {
+            return;
+        }
+        self.focused.evse = self.focused.evse.saturating_sub(1);
+        self.focused.connector = 0;
     }
 
     fn open_command_palette(&mut self) {
@@ -411,10 +507,12 @@ impl App {
         self.apply_command(command, &input);
     }
 
-    /// Dispatches `command` against the focused EVSE. Once connected to a real CSMS (OCPP
-    /// 2.1), this sends the matching `ChargePointEvent` to the live connection instead of
-    /// mutating local state directly - the dashboard picks up the effect once the runtime
-    /// reports it back via [`Self::drain_ocpp_state_receiver`].
+    /// Dispatches `command` against the focused connector (see [`FocusedConnector`]) - never
+    /// merely "the focused EVSE's first eligible connector," so a command run from the palette
+    /// always acts on the connector actually shown as focused on screen. Once connected to a
+    /// real CSMS (OCPP 2.1), this sends the matching `ChargePointEvent` to the live connection
+    /// instead of mutating local state directly - the dashboard picks up the effect once the
+    /// runtime reports it back via [`Self::drain_ocpp_state_receiver`].
     ///
     /// Display commands are the exception: `ocpp-charge-point` doesn't implement the
     /// DisplayMessage functional block yet, so `SetDisplayMessage`/`ClearDisplayMessage`
@@ -431,7 +529,13 @@ impl App {
         }
 
         if let (Some(ocpp_state), Some(sender)) = (&self.live_ocpp_state, &self.ocpp_event_sender) {
-            match build_ocpp_event(ocpp_state, self.focused_evse, command, input) {
+            match build_ocpp_event_for_connector(
+                ocpp_state,
+                self.focused.evse,
+                self.focused.connector,
+                command,
+                input,
+            ) {
                 Some(event) => {
                     let _ = sender.send(event);
                     self.logs.push(format!("{} sent to CSMS", command.label()));
@@ -450,10 +554,10 @@ impl App {
         let Some(state) = &mut self.charger_state else {
             return;
         };
-        let Some(evse) = state.evses.get_mut(self.focused_evse) else {
+        let Some(evse) = state.evses.get_mut(self.focused.evse) else {
             return;
         };
-        if let Some(log_line) = command.apply(evse, input) {
+        if let Some(log_line) = command.apply_to(evse, self.focused.connector, input) {
             self.logs.push(log_line);
             self.status_message = Some((StatusSeverity::Ok, format!("✓ {}", command.label())));
         }
@@ -464,7 +568,7 @@ impl App {
             self.logs = LogBuffer::default();
             self.logs.push(format!("{} booting", charger.config.id));
             self.charger_state = Some(ChargerState::from_config(charger.config.clone()));
-            self.focused_evse = 0;
+            self.focused = FocusedConnector::default();
             self.status_message = None;
             // Reset so the first tick on the new charger sees zero elapsed time instead of
             // however long was spent idling on the picker.
@@ -971,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn confirming_a_selection_focuses_the_first_evse() {
+    fn confirming_a_selection_focuses_the_first_connector_of_the_first_evse() {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
             vec![
@@ -980,7 +1084,7 @@ mod tests {
             ],
         )]);
         app.confirm_charger_selection();
-        assert_eq!(app.focused_evse, 0);
+        assert_eq!(app.focused, FocusedConnector { evse: 0, connector: 0 });
     }
 
     #[test]
@@ -995,9 +1099,9 @@ mod tests {
         app.confirm_charger_selection();
 
         app.handle_key_event(key(KeyCode::Right));
-        assert_eq!(app.focused_evse, 1);
+        assert_eq!(app.focused.evse, 1);
         app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.focused_evse, 1);
+        assert_eq!(app.focused.evse, 1);
     }
 
     #[test]
@@ -1010,12 +1114,29 @@ mod tests {
             ],
         )]);
         app.confirm_charger_selection();
-        app.focused_evse = 1;
+        app.focused.evse = 1;
 
         app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.focused_evse, 0);
+        assert_eq!(app.focused.evse, 0);
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.focused_evse, 0);
+        assert_eq!(app.focused.evse, 0);
+    }
+
+    #[test]
+    fn jumping_evse_with_tab_resets_focus_to_that_evses_first_connector() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![
+                EvseConfig { id: 1, connectors: 2 },
+                EvseConfig { id: 2, connectors: 2 },
+            ],
+        )]);
+        app.confirm_charger_selection();
+        app.focused = FocusedConnector { evse: 0, connector: 1 };
+
+        app.handle_key_event(key(KeyCode::Tab));
+
+        assert_eq!(app.focused, FocusedConnector { evse: 1, connector: 0 });
     }
 
     #[test]
@@ -1025,7 +1146,149 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::Right));
         app.handle_key_event(key(KeyCode::Left));
-        assert_eq!(app.focused_evse, 0);
+        assert_eq!(app.focused, FocusedConnector::default());
+    }
+
+    #[test]
+    fn down_moves_focus_across_connectors_within_one_evse() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![EvseConfig { id: 1, connectors: 2 }],
+        )]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Down));
+        assert_eq!(app.focused, FocusedConnector { evse: 0, connector: 1 });
+    }
+
+    #[test]
+    fn down_flows_from_the_last_connector_of_one_evse_into_the_first_of_the_next() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![
+                EvseConfig { id: 1, connectors: 2 },
+                EvseConfig { id: 2, connectors: 1 },
+            ],
+        )]);
+        app.confirm_charger_selection();
+        app.focused = FocusedConnector { evse: 0, connector: 1 };
+
+        app.handle_key_event(key(KeyCode::Down));
+
+        assert_eq!(app.focused, FocusedConnector { evse: 1, connector: 0 });
+    }
+
+    #[test]
+    fn down_clamps_at_the_very_last_connector_of_the_whole_tree() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![
+                EvseConfig { id: 1, connectors: 1 },
+                EvseConfig { id: 2, connectors: 1 },
+            ],
+        )]);
+        app.confirm_charger_selection();
+        app.focused = FocusedConnector { evse: 1, connector: 0 };
+
+        app.handle_key_event(key(KeyCode::Down));
+
+        assert_eq!(app.focused, FocusedConnector { evse: 1, connector: 0 });
+    }
+
+    #[test]
+    fn up_flows_from_the_first_connector_of_one_evse_into_the_last_of_the_previous() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![
+                EvseConfig { id: 1, connectors: 2 },
+                EvseConfig { id: 2, connectors: 1 },
+            ],
+        )]);
+        app.confirm_charger_selection();
+        app.focused = FocusedConnector { evse: 1, connector: 0 };
+
+        app.handle_key_event(key(KeyCode::Up));
+
+        assert_eq!(app.focused, FocusedConnector { evse: 0, connector: 1 });
+    }
+
+    #[test]
+    fn up_clamps_at_the_very_first_connector_of_the_whole_tree() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![EvseConfig { id: 1, connectors: 1 }],
+        )]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Up));
+
+        assert_eq!(app.focused, FocusedConnector::default());
+    }
+
+    #[test]
+    fn up_and_down_navigation_on_a_charger_with_no_evses_does_not_panic() {
+        let mut app = App::new(vec![charger_with_evses("CP001", vec![])]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Down));
+        app.handle_key_event(key(KeyCode::Up));
+
+        assert_eq!(app.focused, FocusedConnector::default());
+    }
+
+    #[test]
+    fn up_and_down_navigation_on_an_evse_with_no_connectors_does_not_panic() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![EvseConfig { id: 1, connectors: 0 }],
+        )]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Down));
+        app.handle_key_event(key(KeyCode::Up));
+
+        assert_eq!(app.focused, FocusedConnector::default());
+    }
+
+    #[test]
+    fn apply_command_acts_on_the_specifically_focused_connector_not_just_the_first_eligible_one() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![EvseConfig { id: 1, connectors: 2 }],
+        )]);
+        app.confirm_charger_selection();
+        app.focused = FocusedConnector { evse: 0, connector: 1 };
+
+        app.apply_command(Command::PlugInVehicle, "MY-EV-2");
+
+        let state = app.charger_state.unwrap();
+        assert_eq!(state.evses[0].connectors[0].vehicle, None);
+        assert_eq!(
+            state.evses[0].connectors[1].vehicle.as_ref().unwrap().id,
+            "MY-EV-2"
+        );
+    }
+
+    #[test]
+    fn available_commands_reflect_the_specifically_focused_connector() {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![EvseConfig { id: 1, connectors: 2 }],
+        )]);
+        app.confirm_charger_selection();
+        // Occupy connector 1 (index 0) so it no longer offers "Plug in vehicle"; connector 2
+        // (index 1) stays Available and offers it.
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Occupied;
+
+        app.focused = FocusedConnector { evse: 0, connector: 0 };
+        let labels_for_connector_1: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
+        assert!(!labels_for_connector_1.contains(&"Plug in vehicle"));
+        assert!(labels_for_connector_1.contains(&"Present RFID card"));
+
+        app.focused = FocusedConnector { evse: 0, connector: 1 };
+        let labels_for_connector_2: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
+        assert!(labels_for_connector_2.contains(&"Plug in vehicle"));
+        assert!(!labels_for_connector_2.contains(&"Present RFID card"));
     }
 
     #[test]
