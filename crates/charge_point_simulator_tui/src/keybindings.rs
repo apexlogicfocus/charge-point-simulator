@@ -169,16 +169,55 @@ pub fn help_lines() -> Vec<String> {
     lines
 }
 
-/// The dashboard command bar's one-line hint, built from the table.
+/// One entry in the dashboard hint, with a priority for which entries get dropped first when
+/// the command bar is too narrow to show all of them - lowest priority dropped first.
 ///
-/// Deliberate transition step: this is kept byte-for-byte equal to the string
-/// `dashboard.rs` used to hardcode, so wiring it in doesn't churn a dozen snapshot goldens.
-/// It is not a promise that the wording stays fixed forever - once callers move off the old
-/// golden strings this can reflow to whatever fits the command bar best.
-pub fn dashboard_hint() -> String {
-    "q: quit  Esc: back  \u{2191}/\u{2193}: connector  Tab/\u{2190}/\u{2192}: EVSE  /: filter  \
-     l: level  c: command  ?: help"
-        .to_string()
+/// Mirrors `header_segments`'s approach in `ui/dashboard.rs`: rather than truncating the
+/// rendered string mid-word (which is how "?: help" - the entry that advertises the help
+/// overlay - used to get cut off at 80 columns), whole entries are dropped from the least
+/// essential end until what remains fits.
+const HINT_ENTRIES: &[(&str, u8)] = &[
+    ("q: quit", 3),
+    ("Esc: back", 3),
+    ("\u{2191}/\u{2193}: connector", 1),
+    ("Tab/\u{2190}/\u{2192}: EVSE", 1),
+    ("/: filter", 2),
+    ("l: level", 1),
+    ("c: command", 2),
+    ("?: help", 3),
+];
+
+const HINT_SEPARATOR: &str = "  ";
+
+/// Joins `entries` (already filtered to whatever priority tier fits) with the hint's separator.
+fn join_hint(entries: impl Iterator<Item = &'static str>) -> String {
+    entries.collect::<Vec<_>>().join(HINT_SEPARATOR)
+}
+
+/// The dashboard command bar's hint, shortened by priority to fit `width` columns.
+///
+/// Drops the lowest-priority entries first (see `HINT_ENTRIES`), one priority tier at a time,
+/// until the joined string fits - the same tiered-fallback shape `header_segments` uses for the
+/// header line. If even the highest-priority tier alone doesn't fit, that tier is returned
+/// as-is rather than cut mid-word: a slightly overflowing hint is preferable to leaving "?: help"
+/// visually truncated.
+pub fn dashboard_hint_for_width(width: usize) -> String {
+    let min_priority = HINT_ENTRIES.iter().map(|(_, p)| *p).min().unwrap_or(0);
+    let max_priority = HINT_ENTRIES.iter().map(|(_, p)| *p).max().unwrap_or(0);
+    let mut narrowest = join_hint(HINT_ENTRIES.iter().map(|(text, _)| *text));
+    for threshold in min_priority..=max_priority {
+        let candidate = join_hint(
+            HINT_ENTRIES
+                .iter()
+                .filter(|(_, p)| *p >= threshold)
+                .map(|(text, _)| *text),
+        );
+        if candidate.chars().count() <= width {
+            return candidate;
+        }
+        narrowest = candidate;
+    }
+    narrowest
 }
 
 #[cfg(test)]
@@ -222,12 +261,39 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_hint_matches_expected_string() {
+    fn hint_for_width_returns_the_full_hint_when_it_fits() {
         assert_eq!(
-            dashboard_hint(),
+            dashboard_hint_for_width(200),
             "q: quit  Esc: back  \u{2191}/\u{2193}: connector  Tab/\u{2190}/\u{2192}: EVSE  \
              /: filter  l: level  c: command  ?: help"
         );
+    }
+
+    #[test]
+    fn hint_for_width_drops_whole_entries_instead_of_truncating_mid_word() {
+        let hint = dashboard_hint_for_width(80);
+        assert!(hint.chars().count() <= 80);
+        // The very entry that advertises the help overlay must never be the one dropped, and
+        // must never be cut mid-word - that was the bug this function fixes.
+        assert!(hint.ends_with("?: help"));
+        assert!(hint.starts_with("q: quit"));
+    }
+
+    #[test]
+    fn hint_for_width_never_exceeds_width_once_only_the_top_priority_tier_remains() {
+        // The top tier ("q: quit  Esc: back  ?: help") is 27 columns; anything at or above
+        // that width must fit exactly.
+        let hint = dashboard_hint_for_width(27);
+        assert_eq!(hint.chars().count(), 27);
+        assert_eq!(hint, "q: quit  Esc: back  ?: help");
+    }
+
+    #[test]
+    fn hint_for_width_falls_back_to_the_narrowest_tier_when_even_that_overflows() {
+        // Pathologically small width: nothing fits, but we still return the narrowest tier
+        // rather than an empty string or a mid-word cut.
+        let hint = dashboard_hint_for_width(5);
+        assert_eq!(hint, "q: quit  Esc: back  ?: help");
     }
 
     #[test]

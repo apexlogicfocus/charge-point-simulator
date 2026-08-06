@@ -571,8 +571,13 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
                 Line::styled(message, style)
             }
             // Derived from the keybinding table rather than spelled out here, so the hint
-            // can't drift from what the keys actually do - see `crate::keybindings`.
-            None => Line::styled(crate::keybindings::dashboard_hint(), theme::text_dim()),
+            // can't drift from what the keys actually do - see `crate::keybindings`. Shortened
+            // by priority to fit the command bar's actual width, the same way `header_segments`
+            // drops its own lowest-priority segments first, rather than truncating mid-word.
+            None => Line::styled(
+                crate::keybindings::dashboard_hint_for_width(layout.command_bar.width as usize),
+                theme::text_dim(),
+            ),
         },
     };
     frame.render_widget(Paragraph::new(command_bar_line), layout.command_bar);

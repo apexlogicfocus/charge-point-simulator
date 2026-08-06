@@ -21,4 +21,4 @@ Logs─────────────────────────�
 
 
 
-q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: comma
+q: quit  Esc: back  /: filter  c: command  ?: help
