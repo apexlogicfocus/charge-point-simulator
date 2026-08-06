@@ -1,4 +1,4 @@
-use crate::logs::LogBuffer;
+use crate::logs::{LogBuffer, LogEntry};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
@@ -58,7 +58,11 @@ pub struct App {
     pub charger_state: Option<ChargerState>,
     pub focused: FocusedConnector,
     pub logs: LogBuffer,
-    pub log_receiver: Option<UnboundedReceiver<String>>,
+    pub log_receiver: Option<UnboundedReceiver<LogEntry>>,
+    /// Whether `/` has opened the log filter prompt. While open, typed characters narrow the
+    /// log pane live rather than reaching the dashboard's other bindings.
+    pub log_filter_open: bool,
+    pub log_filter_field: TextField,
     pub command_palette_open: bool,
     pub command_palette_selected: usize,
     pub command_palette_filter: TextField,
@@ -104,7 +108,9 @@ fn resolve_simulation_mode(csms_url: &str) -> SimulationMode {
     if csms_url.trim().is_empty() {
         SimulationMode::Local
     } else {
-        SimulationMode::LiveCsms { url: csms_url.to_string() }
+        SimulationMode::LiveCsms {
+            url: csms_url.to_string(),
+        }
     }
 }
 
@@ -184,7 +190,9 @@ impl App {
         Ok(())
     }
 
-    fn handle_key_event(&mut self, key_event: KeyEvent) {
+    /// `pub(crate)` so snapshot scenarios can drive the app through real key presses rather
+    /// than hand-setting the state those presses produce.
+    pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
         if self.quit_confirm_open {
             self.handle_quit_confirm_key(key_event);
             return;
@@ -199,6 +207,11 @@ impl App {
         }
         if self.help_open {
             self.handle_help_key(key_event);
+            return;
+        }
+        // Before the global 'q'/'?' shortcuts: both are typeable into a log filter.
+        if self.log_filter_open {
+            self.handle_log_filter_key(key_event);
             return;
         }
 
@@ -233,6 +246,57 @@ impl App {
             KeyCode::Char('y') | KeyCode::Enter => self.exit = true,
             KeyCode::Char('n') | KeyCode::Esc => self.quit_confirm_open = false,
             _ => {}
+        }
+    }
+
+    /// Opens the log filter prompt, seeded with whatever filter is currently applied so
+    /// refining one doesn't mean retyping it.
+    fn open_log_filter(&mut self) {
+        self.log_filter_field = TextField::default();
+        for c in self.logs.filter().unwrap_or_default().chars() {
+            self.log_filter_field.insert_char(c);
+        }
+        self.log_filter_open = true;
+    }
+
+    /// The filter applies as it is typed - the log pane narrows live rather than only on
+    /// Enter, so a filter that matches nothing is visibly wrong before it's committed.
+    fn handle_log_filter_key(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            // Esc abandons the prompt *and* the filter, matching the roadmap's "`/` to open
+            // the filter and `Esc` to clear it".
+            KeyCode::Esc => {
+                self.log_filter_open = false;
+                self.log_filter_field = TextField::default();
+                self.logs.clear_filter();
+            }
+            KeyCode::Enter => self.log_filter_open = false,
+            KeyCode::Backspace => {
+                self.log_filter_field.backspace();
+                self.apply_log_filter();
+            }
+            KeyCode::Delete => {
+                self.log_filter_field.delete();
+                self.apply_log_filter();
+            }
+            KeyCode::Left => self.log_filter_field.move_left(),
+            KeyCode::Right => self.log_filter_field.move_right(),
+            KeyCode::Home => self.log_filter_field.move_home(),
+            KeyCode::End => self.log_filter_field.move_end(),
+            KeyCode::Char(c) => {
+                self.log_filter_field.insert_char(c);
+                self.apply_log_filter();
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_log_filter(&mut self) {
+        let value = self.log_filter_field.value().to_string();
+        if value.is_empty() {
+            self.logs.clear_filter();
+        } else {
+            self.logs.set_filter(value);
         }
     }
 
@@ -289,9 +353,16 @@ impl App {
 
     fn handle_dashboard_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
+            // Esc clears an active log filter before it means "leave the dashboard", the same
+            // way it clears the picker's filter before it means "quit".
+            KeyCode::Esc if self.logs.filter().is_some() => self.logs.clear_filter(),
             KeyCode::Esc => self.return_to_picker(),
             KeyCode::PageUp => self.logs.scroll_up(),
             KeyCode::PageDown => self.logs.scroll_down(),
+            KeyCode::Char('/') => self.open_log_filter(),
+            KeyCode::Char('g') => self.logs.scroll_to_top(),
+            KeyCode::Char('G') => self.logs.scroll_to_bottom(),
+            KeyCode::Char('l') => self.logs.cycle_level_threshold(),
             KeyCode::Down => self.select_next_connector(),
             KeyCode::Up => self.select_previous_connector(),
             KeyCode::Right | KeyCode::Tab => self.select_next_evse(),
@@ -384,7 +455,9 @@ impl App {
             return;
         };
         let positions = Self::connector_positions(state);
-        let Some(current) = positions.iter().position(|&pos| pos == (self.focused.evse, self.focused.connector))
+        let Some(current) = positions
+            .iter()
+            .position(|&pos| pos == (self.focused.evse, self.focused.connector))
         else {
             // Focus doesn't point at a real connector (e.g. an EVSE with none) - land on the
             // first one that exists rather than doing nothing.
@@ -404,7 +477,9 @@ impl App {
             return;
         };
         let positions = Self::connector_positions(state);
-        let Some(current) = positions.iter().position(|&pos| pos == (self.focused.evse, self.focused.connector))
+        let Some(current) = positions
+            .iter()
+            .position(|&pos| pos == (self.focused.evse, self.focused.connector))
         else {
             if let Some(&(evse, connector)) = positions.first() {
                 self.focused = FocusedConnector { evse, connector };
@@ -539,7 +614,8 @@ impl App {
                 Some(event) => {
                     let _ = sender.send(event);
                     self.logs.push(format!("{} sent to CSMS", command.label()));
-                    self.status_message = Some((StatusSeverity::Ok, format!("→ {}", command.label())));
+                    self.status_message =
+                        Some((StatusSeverity::Ok, format!("→ {}", command.label())));
                 }
                 None => {
                     self.status_message = Some((
@@ -564,7 +640,11 @@ impl App {
     }
 
     fn confirm_charger_selection(&mut self) {
-        if let Some(charger) = self.filtered_chargers().get(self.selected_charger).map(|entry| (*entry).clone()) {
+        if let Some(charger) = self
+            .filtered_chargers()
+            .get(self.selected_charger)
+            .map(|entry| (*entry).clone())
+        {
             self.logs = LogBuffer::default();
             self.logs.push(format!("{} booting", charger.config.id));
             self.charger_state = Some(ChargerState::from_config(charger.config.clone()));
@@ -593,8 +673,8 @@ impl App {
                 let SecurityProfile::Basic { password } = profile.security;
                 self.connection_csms_url = TextField::new(profile.csms_url);
                 self.connection_ocpp_identity = TextField::new(profile.ocpp_identity);
-                self.connection_password =
-                    TextField::new(password).with_max_bytes(SecurityProfile::MAX_BASIC_PASSWORD_BYTES);
+                self.connection_password = TextField::new(password)
+                    .with_max_bytes(SecurityProfile::MAX_BASIC_PASSWORD_BYTES);
             }
             None => {
                 self.connection_csms_url = TextField::default();
@@ -752,14 +832,14 @@ impl App {
         self.screen = Screen::PickCharger;
     }
 
-    /// Pulls every line currently buffered in the tracing bridge's channel
+    /// Pulls every entry currently buffered in the tracing bridge's channel
     /// (if one is installed) into the log panel.
     fn drain_log_receiver(&mut self) {
         let Some(receiver) = &mut self.log_receiver else {
             return;
         };
-        while let Ok(line) = receiver.try_recv() {
-            self.logs.push(line);
+        while let Ok(entry) = receiver.try_recv() {
+            self.logs.push(entry);
         }
     }
 
@@ -824,6 +904,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logs::LogLevel;
     use charge_point_simulator_core::charger::{
         ChargerConfig, ChargerSource, ConnectionStatus, ConnectorStatus, EvseConfig, OcppVersion,
     };
@@ -835,8 +916,23 @@ mod tests {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
 
+    /// The visible log pane as plain strings. Most assertions here care about *which* lines
+    /// are shown, not the structure Phase 4 gave each entry.
+    fn log_messages(logs: &LogBuffer) -> Vec<String> {
+        logs.visible_lines(10)
+            .into_iter()
+            .map(|entry| entry.message.clone())
+            .collect()
+    }
+
     fn charger(id: &str) -> ChargerEntry {
-        charger_with_evses(id, vec![EvseConfig { id: 1, connectors: 1 }])
+        charger_with_evses(
+            id,
+            vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
+        )
     }
 
     fn charger_with_evses(id: &str, evses: Vec<EvseConfig>) -> ChargerEntry {
@@ -856,7 +952,10 @@ mod tests {
             config: ChargerConfig {
                 id: id.into(),
                 ocpp_version: OcppVersion::V21,
-                evses: vec![EvseConfig { id: 1, connectors: 1 }],
+                evses: vec![EvseConfig {
+                    id: 1,
+                    connectors: 1,
+                }],
                 has_display: false,
             },
             source: ChargerSource::BuiltIn,
@@ -868,7 +967,10 @@ mod tests {
             config: ChargerConfig {
                 id: id.into(),
                 ocpp_version: OcppVersion::V16J,
-                evses: vec![EvseConfig { id: 1, connectors: 1 }],
+                evses: vec![EvseConfig {
+                    id: 1,
+                    connectors: 1,
+                }],
                 has_display: true,
             },
             source: ChargerSource::BuiltIn,
@@ -999,7 +1101,11 @@ mod tests {
             app.handle_key_event(key(KeyCode::Char(c)));
         }
 
-        let ids: Vec<&str> = app.filtered_chargers().iter().map(|e| e.config.id.as_str()).collect();
+        let ids: Vec<&str> = app
+            .filtered_chargers()
+            .iter()
+            .map(|e| e.config.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["CP002"]);
         assert_eq!(app.selected_charger, 0);
     }
@@ -1071,7 +1177,7 @@ mod tests {
     fn confirming_a_selection_logs_a_boot_message() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        assert_eq!(app.logs.visible_lines(10), vec!["CP001 booting"]);
+        assert_eq!(log_messages(&app.logs), vec!["CP001 booting"]);
     }
 
     #[test]
@@ -1079,12 +1185,24 @@ mod tests {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
             vec![
-                EvseConfig { id: 1, connectors: 1 },
-                EvseConfig { id: 2, connectors: 1 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 1,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
             ],
         )]);
         app.confirm_charger_selection();
-        assert_eq!(app.focused, FocusedConnector { evse: 0, connector: 0 });
+        assert_eq!(
+            app.focused,
+            FocusedConnector {
+                evse: 0,
+                connector: 0
+            }
+        );
     }
 
     #[test]
@@ -1092,8 +1210,14 @@ mod tests {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
             vec![
-                EvseConfig { id: 1, connectors: 1 },
-                EvseConfig { id: 2, connectors: 1 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 1,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
             ],
         )]);
         app.confirm_charger_selection();
@@ -1109,8 +1233,14 @@ mod tests {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
             vec![
-                EvseConfig { id: 1, connectors: 1 },
-                EvseConfig { id: 2, connectors: 1 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 1,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
             ],
         )]);
         app.confirm_charger_selection();
@@ -1127,16 +1257,31 @@ mod tests {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
             vec![
-                EvseConfig { id: 1, connectors: 2 },
-                EvseConfig { id: 2, connectors: 2 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 2,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 2,
+                },
             ],
         )]);
         app.confirm_charger_selection();
-        app.focused = FocusedConnector { evse: 0, connector: 1 };
+        app.focused = FocusedConnector {
+            evse: 0,
+            connector: 1,
+        };
 
         app.handle_key_event(key(KeyCode::Tab));
 
-        assert_eq!(app.focused, FocusedConnector { evse: 1, connector: 0 });
+        assert_eq!(
+            app.focused,
+            FocusedConnector {
+                evse: 1,
+                connector: 0
+            }
+        );
     }
 
     #[test]
@@ -1153,12 +1298,21 @@ mod tests {
     fn down_moves_focus_across_connectors_within_one_evse() {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
-            vec![EvseConfig { id: 1, connectors: 2 }],
+            vec![EvseConfig {
+                id: 1,
+                connectors: 2,
+            }],
         )]);
         app.confirm_charger_selection();
 
         app.handle_key_event(key(KeyCode::Down));
-        assert_eq!(app.focused, FocusedConnector { evse: 0, connector: 1 });
+        assert_eq!(
+            app.focused,
+            FocusedConnector {
+                evse: 0,
+                connector: 1
+            }
+        );
     }
 
     #[test]
@@ -1166,16 +1320,31 @@ mod tests {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
             vec![
-                EvseConfig { id: 1, connectors: 2 },
-                EvseConfig { id: 2, connectors: 1 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 2,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
             ],
         )]);
         app.confirm_charger_selection();
-        app.focused = FocusedConnector { evse: 0, connector: 1 };
+        app.focused = FocusedConnector {
+            evse: 0,
+            connector: 1,
+        };
 
         app.handle_key_event(key(KeyCode::Down));
 
-        assert_eq!(app.focused, FocusedConnector { evse: 1, connector: 0 });
+        assert_eq!(
+            app.focused,
+            FocusedConnector {
+                evse: 1,
+                connector: 0
+            }
+        );
     }
 
     #[test]
@@ -1183,16 +1352,31 @@ mod tests {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
             vec![
-                EvseConfig { id: 1, connectors: 1 },
-                EvseConfig { id: 2, connectors: 1 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 1,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
             ],
         )]);
         app.confirm_charger_selection();
-        app.focused = FocusedConnector { evse: 1, connector: 0 };
+        app.focused = FocusedConnector {
+            evse: 1,
+            connector: 0,
+        };
 
         app.handle_key_event(key(KeyCode::Down));
 
-        assert_eq!(app.focused, FocusedConnector { evse: 1, connector: 0 });
+        assert_eq!(
+            app.focused,
+            FocusedConnector {
+                evse: 1,
+                connector: 0
+            }
+        );
     }
 
     #[test]
@@ -1200,23 +1384,41 @@ mod tests {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
             vec![
-                EvseConfig { id: 1, connectors: 2 },
-                EvseConfig { id: 2, connectors: 1 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 2,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
             ],
         )]);
         app.confirm_charger_selection();
-        app.focused = FocusedConnector { evse: 1, connector: 0 };
+        app.focused = FocusedConnector {
+            evse: 1,
+            connector: 0,
+        };
 
         app.handle_key_event(key(KeyCode::Up));
 
-        assert_eq!(app.focused, FocusedConnector { evse: 0, connector: 1 });
+        assert_eq!(
+            app.focused,
+            FocusedConnector {
+                evse: 0,
+                connector: 1
+            }
+        );
     }
 
     #[test]
     fn up_clamps_at_the_very_first_connector_of_the_whole_tree() {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
-            vec![EvseConfig { id: 1, connectors: 1 }],
+            vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
         )]);
         app.confirm_charger_selection();
 
@@ -1240,7 +1442,10 @@ mod tests {
     fn up_and_down_navigation_on_an_evse_with_no_connectors_does_not_panic() {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
-            vec![EvseConfig { id: 1, connectors: 0 }],
+            vec![EvseConfig {
+                id: 1,
+                connectors: 0,
+            }],
         )]);
         app.confirm_charger_selection();
 
@@ -1254,10 +1459,16 @@ mod tests {
     fn apply_command_acts_on_the_specifically_focused_connector_not_just_the_first_eligible_one() {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
-            vec![EvseConfig { id: 1, connectors: 2 }],
+            vec![EvseConfig {
+                id: 1,
+                connectors: 2,
+            }],
         )]);
         app.confirm_charger_selection();
-        app.focused = FocusedConnector { evse: 0, connector: 1 };
+        app.focused = FocusedConnector {
+            evse: 0,
+            connector: 1,
+        };
 
         app.apply_command(Command::PlugInVehicle, "MY-EV-2");
 
@@ -1273,20 +1484,32 @@ mod tests {
     fn available_commands_reflect_the_specifically_focused_connector() {
         let mut app = App::new(vec![charger_with_evses(
             "CP001",
-            vec![EvseConfig { id: 1, connectors: 2 }],
+            vec![EvseConfig {
+                id: 1,
+                connectors: 2,
+            }],
         )]);
         app.confirm_charger_selection();
         // Occupy connector 1 (index 0) so it no longer offers "Plug in vehicle"; connector 2
         // (index 1) stays Available and offers it.
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Occupied;
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Occupied;
 
-        app.focused = FocusedConnector { evse: 0, connector: 0 };
-        let labels_for_connector_1: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
+        app.focused = FocusedConnector {
+            evse: 0,
+            connector: 0,
+        };
+        let labels_for_connector_1: Vec<&str> =
+            app.available_commands().iter().map(|c| c.label()).collect();
         assert!(!labels_for_connector_1.contains(&"Plug in vehicle"));
         assert!(labels_for_connector_1.contains(&"Present RFID card"));
 
-        app.focused = FocusedConnector { evse: 0, connector: 1 };
-        let labels_for_connector_2: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
+        app.focused = FocusedConnector {
+            evse: 0,
+            connector: 1,
+        };
+        let labels_for_connector_2: Vec<&str> =
+            app.available_commands().iter().map(|c| c.label()).collect();
         assert!(labels_for_connector_2.contains(&"Plug in vehicle"));
         assert!(!labels_for_connector_2.contains(&"Present RFID card"));
     }
@@ -1512,7 +1735,11 @@ mod tests {
             charge_point_simulator_core::charger::ConnectorStatus::Occupied
         );
         assert!(state.evses[0].connectors[0].vehicle.is_some());
-        assert!(app.logs.visible_lines(10).iter().any(|l| l.contains("plugged in")));
+        assert!(
+            log_messages(&app.logs)
+                .iter()
+                .any(|l| l.contains("plugged in"))
+        );
     }
 
     #[test]
@@ -1571,18 +1798,129 @@ mod tests {
         let mut app = App::new(vec![]);
         app.log_receiver = Some(receiver);
 
-        sender.send("first".to_string()).unwrap();
-        sender.send("second".to_string()).unwrap();
+        sender.send(LogEntry::from("first")).unwrap();
+        sender.send(LogEntry::from("second")).unwrap();
 
         app.drain_log_receiver();
-        assert_eq!(app.logs.visible_lines(10), vec!["first", "second"]);
+        assert_eq!(log_messages(&app.logs), vec!["first", "second"]);
     }
 
     #[test]
     fn draining_without_a_receiver_installed_does_nothing() {
         let mut app = App::new(vec![]);
         app.drain_log_receiver();
-        assert_eq!(app.logs.visible_lines(10), Vec::<&str>::new());
+        assert_eq!(log_messages(&app.logs), Vec::<String>::new());
+    }
+
+    /// An app sitting on the dashboard with `count` log entries, for the log-binding tests.
+    fn app_with_logs(count: usize) -> App {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.logs = LogBuffer::default();
+        for i in 0..count {
+            app.logs.push(format!("entry {i}"));
+        }
+        app
+    }
+
+    #[test]
+    fn slash_opens_the_log_filter_and_typing_narrows_the_pane_live() {
+        let mut app = app_with_logs(0);
+        app.logs.push("heartbeat sent");
+        app.logs.push("connector faulted");
+
+        app.handle_key_event(key(KeyCode::Char('/')));
+        assert!(app.log_filter_open);
+
+        for c in "fault".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        // Narrowed before Enter is ever pressed - a filter that matches nothing is visible as
+        // soon as it's typed.
+        assert_eq!(log_messages(&app.logs), vec!["connector faulted"]);
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(!app.log_filter_open);
+        assert_eq!(app.logs.filter(), Some("fault"));
+    }
+
+    #[test]
+    fn esc_in_the_filter_prompt_clears_the_filter_rather_than_committing_it() {
+        let mut app = app_with_logs(0);
+        app.logs.push("heartbeat sent");
+        app.logs.push("connector faulted");
+
+        app.handle_key_event(key(KeyCode::Char('/')));
+        app.handle_key_event(key(KeyCode::Char('f')));
+        app.handle_key_event(key(KeyCode::Esc));
+
+        assert!(!app.log_filter_open);
+        assert_eq!(app.logs.filter(), None);
+        assert_eq!(
+            log_messages(&app.logs),
+            vec!["heartbeat sent", "connector faulted"]
+        );
+    }
+
+    #[test]
+    fn reopening_the_filter_prompt_seeds_it_with_the_active_filter() {
+        let mut app = app_with_logs(0);
+        app.logs.push("connector faulted");
+
+        app.handle_key_event(key(KeyCode::Char('/')));
+        app.handle_key_event(key(KeyCode::Char('f')));
+        app.handle_key_event(key(KeyCode::Enter));
+        app.handle_key_event(key(KeyCode::Char('/')));
+
+        assert_eq!(app.log_filter_field.value(), "f");
+    }
+
+    #[test]
+    fn q_and_question_mark_are_typeable_into_the_log_filter() {
+        let mut app = app_with_logs(0);
+        app.handle_key_event(key(KeyCode::Char('/')));
+        app.handle_key_event(key(KeyCode::Char('q')));
+        app.handle_key_event(key(KeyCode::Char('?')));
+
+        assert_eq!(app.log_filter_field.value(), "q?");
+        assert!(!app.quit_confirm_open);
+        assert!(!app.help_open);
+    }
+
+    #[test]
+    fn esc_on_the_dashboard_clears_an_active_log_filter_before_it_means_go_back() {
+        let mut app = app_with_logs(0);
+        app.logs.push("connector faulted");
+        app.logs.set_filter("fault");
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(app.logs.filter(), None);
+        assert_eq!(app.screen, Screen::Dashboard);
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::PickCharger);
+    }
+
+    #[test]
+    fn g_and_shift_g_jump_to_the_oldest_and_newest_log_entries() {
+        let mut app = app_with_logs(20);
+
+        app.handle_key_event(key(KeyCode::Char('g')));
+        assert!(app.logs.is_paused());
+        assert_eq!(app.logs.visible_lines(1)[0].message, "entry 0");
+
+        app.handle_key_event(key(KeyCode::Char('G')));
+        assert!(!app.logs.is_paused());
+        assert_eq!(app.logs.visible_lines(1)[0].message, "entry 19");
+    }
+
+    #[test]
+    fn l_cycles_the_log_level_threshold() {
+        let mut app = app_with_logs(0);
+        assert_eq!(app.logs.level_threshold(), LogLevel::Info);
+
+        app.handle_key_event(key(KeyCode::Char('l')));
+        assert_eq!(app.logs.level_threshold(), LogLevel::Debug);
     }
 
     #[test]
@@ -1716,7 +2054,9 @@ mod tests {
 
         assert_eq!(
             app.charger_state.unwrap().mode,
-            SimulationMode::LiveCsms { url: "ws://localhost:9999/dev".to_string() }
+            SimulationMode::LiveCsms {
+                url: "ws://localhost:9999/dev".to_string()
+            }
         );
     }
 
@@ -1749,7 +2089,9 @@ mod tests {
     fn resolve_simulation_mode_is_live_csms_with_the_url_for_a_non_blank_url() {
         assert_eq!(
             resolve_simulation_mode("wss://csms.example.com"),
-            SimulationMode::LiveCsms { url: "wss://csms.example.com".to_string() }
+            SimulationMode::LiveCsms {
+                url: "wss://csms.example.com".to_string()
+            }
         );
     }
 
@@ -1760,8 +2102,9 @@ mod tests {
         // timer must never race it and flip the dashboard to "connected" on its own.
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().mode =
-            SimulationMode::LiveCsms { url: "wss://csms.example.com".to_string() };
+        app.charger_state.as_mut().unwrap().mode = SimulationMode::LiveCsms {
+            url: "wss://csms.example.com".to_string(),
+        };
 
         app.tick_metrics_with(Duration::from_secs(60), Instant::now());
 
@@ -1775,8 +2118,9 @@ mod tests {
     fn returning_to_the_picker_leaves_no_stale_live_csms_mode_for_the_next_charger() {
         let mut app = App::new(vec![charger_v21("CP-2.1"), charger("CP001")]);
         app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().mode =
-            SimulationMode::LiveCsms { url: "wss://csms.example.com".to_string() };
+        app.charger_state.as_mut().unwrap().mode = SimulationMode::LiveCsms {
+            url: "wss://csms.example.com".to_string(),
+        };
 
         app.handle_key_event(key(KeyCode::Esc)); // back to the picker
         app.handle_key_event(key(KeyCode::Down)); // select CP001 (1.6J, straight to dashboard)
@@ -1843,7 +2187,8 @@ mod tests {
     fn tick_metrics_advances_the_focused_chargers_simulated_meter_by_the_given_elapsed_time() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Charging;
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Charging;
 
         app.tick_metrics_with(Duration::from_secs(3600), Instant::now());
 
@@ -1864,8 +2209,11 @@ mod tests {
     fn maybe_send_meter_values_sends_immediately_the_first_time_a_csms_is_connected() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Charging;
-        app.charger_state.as_mut().unwrap().evses[0].metrics.energy_kwh = 1.0;
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Charging;
+        app.charger_state.as_mut().unwrap().evses[0]
+            .metrics
+            .energy_kwh = 1.0;
         let (sender, mut receiver) = mpsc::unbounded_channel();
         app.ocpp_event_sender = Some(sender);
 
@@ -1878,7 +2226,8 @@ mod tests {
     fn maybe_send_meter_values_is_throttled_until_the_interval_elapses() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Charging;
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Charging;
         let (sender, mut receiver) = mpsc::unbounded_channel();
         app.ocpp_event_sender = Some(sender);
 
@@ -1887,17 +2236,24 @@ mod tests {
         receiver.try_recv().unwrap(); // drain the first, immediate send
 
         app.tick_metrics_with(Duration::ZERO, start + Duration::from_secs(1));
-        assert!(receiver.try_recv().is_err(), "resent before the interval elapsed");
+        assert!(
+            receiver.try_recv().is_err(),
+            "resent before the interval elapsed"
+        );
 
         app.tick_metrics_with(Duration::ZERO, start + METER_VALUE_INTERVAL);
-        assert!(receiver.try_recv().is_ok(), "did not resend once the interval elapsed");
+        assert!(
+            receiver.try_recv().is_ok(),
+            "did not resend once the interval elapsed"
+        );
     }
 
     #[test]
     fn maybe_send_meter_values_does_nothing_without_a_live_csms_sender() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status = ConnectorStatus::Charging;
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Charging;
 
         // No panic and nothing queued, since there's no `ocpp_event_sender` to send through.
         app.tick_metrics_with(Duration::from_secs(3600), Instant::now());
@@ -1911,14 +2267,19 @@ mod tests {
         let (sender, receiver) = mpsc::unbounded_channel();
         app.ocpp_state_receiver = Some(receiver);
 
-        sender.send(ocpp_state_with(OcppConnectorState::Locked)).unwrap();
+        sender
+            .send(ocpp_state_with(OcppConnectorState::Locked))
+            .unwrap();
         app.drain_ocpp_state_receiver();
 
         assert_eq!(
             app.charger_state.as_ref().unwrap().connection_status,
             ConnectionStatus::Connected
         );
-        assert_eq!(app.live_ocpp_state.as_ref().unwrap().evses[0].connectors[0], OcppConnectorState::Locked);
+        assert_eq!(
+            app.live_ocpp_state.as_ref().unwrap().evses[0].connectors[0],
+            OcppConnectorState::Locked
+        );
     }
 
     #[test]

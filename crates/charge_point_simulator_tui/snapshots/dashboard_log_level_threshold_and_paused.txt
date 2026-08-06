@@ -12,23 +12,23 @@ EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh                               
 
 
 
-                                   ┌Filter──────────────────────────────────────────┐
-                                   │unplug                                          │
-                                   └────────────────────────────────────────────────┘
-                                   ┌Command─────────────────────────────────────────┐
-                                   │> Unplug vehicle                                │
-                                   └────────────────────────────────────────────────┘
 
 
-Logs────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-10:30:03.000 INFO  → core::state    Heartbeat heartbeat sent seq=3                                                     ║
+
+
+
+
+
+
+Logs ≥DEBUG (paused)────────────────────────────────────────────────────────────────────────────────────────────────────
+10:30:01.000 INFO  → core::state    Heartbeat heartbeat sent seq=1                                                     █
+10:30:02.000 INFO  ← core::state    Heartbeat heartbeat acknowledged seq=2                                             █
+10:30:03.000 INFO  → core::state    Heartbeat heartbeat sent seq=3                                                     █
 10:30:04.000 WARN  ← core::state    Heartbeat heartbeat acknowledged seq=4                                             █
 10:30:05.000 INFO  → core::state    Heartbeat heartbeat sent seq=5                                                     █
 10:30:06.000 INFO  ← core::state    Heartbeat heartbeat acknowledged seq=6                                             █
 10:30:07.000 INFO  → core::state    Heartbeat heartbeat sent seq=7                                                     █
 10:30:08.000 INFO  ← core::state    Heartbeat heartbeat acknowledged seq=8                                             █
 10:30:09.000 INFO  → core::state    Heartbeat heartbeat sent seq=9                                                     █
-10:30:10.000 INFO  ← core::state    Heartbeat heartbeat acknowledged seq=10                                            █
-10:30:11.000 INFO  → core::state    Heartbeat heartbeat sent seq=11                                                    █
-10:30:12.000 INFO  ← core::state    Heartbeat heartbeat acknowledged seq=12                                            █
+10:30:10.000 INFO  ← core::state    Heartbeat heartbeat acknowledged seq=10                                            ║
 q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help

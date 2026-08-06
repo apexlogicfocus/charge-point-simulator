@@ -29,6 +29,10 @@ pub struct DashboardView<'a> {
     /// is `Some`), which swaps the header's status glyph for an animated spinner.
     pub connecting: bool,
     pub logs: &'a LogBuffer,
+    /// The in-progress log filter text when `/` has opened the filter prompt, which takes over
+    /// the command bar while it's open. `None` when the prompt is closed - an *applied* filter
+    /// with the prompt closed is read from `logs` instead.
+    pub log_filter_input: Option<&'a str>,
     pub status_message: Option<(StatusSeverity, &'a str)>,
 }
 
@@ -39,7 +43,11 @@ impl<'a> DashboardView<'a> {
             focused: app.focused,
             connecting: app.connect_result_receiver.is_some(),
             logs: &app.logs,
-            status_message: app.status_message.as_ref().map(|(severity, message)| (*severity, message.as_str())),
+            log_filter_input: app.log_filter_open.then(|| app.log_filter_field.value()),
+            status_message: app
+                .status_message
+                .as_ref()
+                .map(|(severity, message)| (*severity, message.as_str())),
         }
     }
 }
@@ -97,7 +105,10 @@ mod tests {
         app.charger_state = Some(ChargerState::from_config(ChargerConfig {
             id: "CP001".into(),
             ocpp_version: OcppVersion::V16J,
-            evses: vec![EvseConfig { id: 1, connectors: 2 }],
+            evses: vec![EvseConfig {
+                id: 1,
+                connectors: 2,
+            }],
             has_display: false,
         }));
         app
@@ -109,7 +120,10 @@ mod tests {
         let view = DashboardView::from_app(&app);
 
         assert_eq!(view.charger.unwrap().config.id, "CP001");
-        assert_eq!(view.charger.unwrap() as *const ChargerState, app.charger_state.as_ref().unwrap() as *const _);
+        assert_eq!(
+            view.charger.unwrap() as *const ChargerState,
+            app.charger_state.as_ref().unwrap() as *const _
+        );
     }
 
     #[test]
@@ -122,11 +136,20 @@ mod tests {
     #[test]
     fn dashboard_view_carries_the_focused_connector() {
         let mut app = app_with_charger();
-        app.focused = FocusedConnector { evse: 0, connector: 1 };
+        app.focused = FocusedConnector {
+            evse: 0,
+            connector: 1,
+        };
 
         let view = DashboardView::from_app(&app);
 
-        assert_eq!(view.focused, FocusedConnector { evse: 0, connector: 1 });
+        assert_eq!(
+            view.focused,
+            FocusedConnector {
+                evse: 0,
+                connector: 1
+            }
+        );
     }
 
     #[test]
@@ -147,7 +170,10 @@ mod tests {
 
         let view = DashboardView::from_app(&app);
 
-        assert_eq!(view.status_message, Some((StatusSeverity::Ok, "✓ Plug in vehicle")));
+        assert_eq!(
+            view.status_message,
+            Some((StatusSeverity::Ok, "✓ Plug in vehicle"))
+        );
     }
 
     #[test]
@@ -157,7 +183,14 @@ mod tests {
 
         let view = DashboardView::from_app(&app);
 
-        assert_eq!(view.logs.visible_lines(10), vec!["hello"]);
+        assert_eq!(
+            view.logs
+                .visible_lines(10)
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hello"]
+        );
     }
 
     #[test]

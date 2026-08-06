@@ -21,12 +21,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::app::{App, FocusedConnector};
+use crate::logs::{Direction, LogEntry, LogLevel};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargerConfig, ChargerEntry, ChargerSource, ChargerState, Command, ConnectionStatus,
     EvseConfig, OcppVersion, SimulationMode,
 };
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -55,7 +57,9 @@ fn render(app: &App, width: u16, height: u16) -> String {
 }
 
 fn snapshot_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("snapshots").join(format!("{name}.txt"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("snapshots")
+        .join(format!("{name}.txt"))
 }
 
 /// Compares `actual` against the golden file `snapshots/{name}.txt`, either updating it (when
@@ -117,8 +121,18 @@ fn diff_report(name: &str, expected: &str, actual: &str) -> String {
     report
 }
 
-fn charger_config(id: &str, ocpp_version: OcppVersion, evses: Vec<EvseConfig>, has_display: bool) -> ChargerConfig {
-    ChargerConfig { id: id.to_string(), ocpp_version, evses, has_display }
+fn charger_config(
+    id: &str,
+    ocpp_version: OcppVersion,
+    evses: Vec<EvseConfig>,
+    has_display: bool,
+) -> ChargerConfig {
+    ChargerConfig {
+        id: id.to_string(),
+        ocpp_version,
+        evses,
+        has_display,
+    }
 }
 
 fn charger_entry(id: &str, ocpp_version: OcppVersion, evses: Vec<EvseConfig>) -> ChargerEntry {
@@ -146,7 +160,15 @@ fn dashboard_app(config: ChargerConfig) -> App {
 /// "mid-session" dashboard as its base (the plain charging view, and both command-palette
 /// variants opened on top of it).
 fn charging_dashboard_app() -> App {
-    let config = charger_config("CP-CHARGE", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let config = charger_config(
+        "CP-CHARGE",
+        OcppVersion::V16J,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let mut app = dashboard_app(config);
     let state = app.charger_state.as_mut().unwrap();
     Command::PlugInVehicle.apply(&mut state.evses[0], "MY-EV-1");
@@ -158,8 +180,32 @@ fn charging_dashboard_app() -> App {
     // none of these scenarios set up.
     state.tick(Duration::from_secs(600));
 
+    // Structured entries rather than plain strings, so the goldens actually pin the log pane's
+    // columns: timestamp, level, direction marker, elided target, action, and fields.
+    // Timestamps are hand-written (never a wall clock) so the goldens stay deterministic.
     for i in 1..=12 {
-        app.logs.push(format!("event {i}: heartbeat sent"));
+        let outbound = i % 2 == 1;
+        app.logs.push(LogEntry {
+            timestamp: Some(format!("10:30:{i:02}.000")),
+            level: if i == 4 {
+                LogLevel::Warn
+            } else {
+                LogLevel::Info
+            },
+            target: "charge_point_simulator_core::charger::state".to_string(),
+            message: if outbound {
+                "heartbeat sent".to_string()
+            } else {
+                "heartbeat acknowledged".to_string()
+            },
+            fields: vec![("seq".to_string(), i.to_string())],
+            direction: Some(if outbound {
+                Direction::Outbound
+            } else {
+                Direction::Inbound
+            }),
+            action: Some("Heartbeat".to_string()),
+        });
     }
 
     app
@@ -168,16 +214,36 @@ fn charging_dashboard_app() -> App {
 #[test]
 fn picker() {
     let app = App::new(vec![
-        charger_entry("CP001", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }]),
+        charger_entry(
+            "CP001",
+            OcppVersion::V16J,
+            vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
+        ),
         charger_entry(
             "CP002",
             OcppVersion::V201,
             vec![
-                EvseConfig { id: 1, connectors: 2 },
-                EvseConfig { id: 2, connectors: 1 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 2,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
             ],
         ),
-        charger_entry("CP-2.1", OcppVersion::V21, vec![EvseConfig { id: 1, connectors: 1 }]),
+        charger_entry(
+            "CP-2.1",
+            OcppVersion::V21,
+            vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
+        ),
     ]);
 
     assert_snapshot("picker", &render(&app, 120, 34));
@@ -186,9 +252,30 @@ fn picker() {
 #[test]
 fn picker_filtered() {
     let mut app = App::new(vec![
-        charger_entry("CP001", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }]),
-        charger_entry("CP002", OcppVersion::V201, vec![EvseConfig { id: 1, connectors: 1 }]),
-        charger_entry("CP-2.1", OcppVersion::V21, vec![EvseConfig { id: 1, connectors: 1 }]),
+        charger_entry(
+            "CP001",
+            OcppVersion::V16J,
+            vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
+        ),
+        charger_entry(
+            "CP002",
+            OcppVersion::V201,
+            vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
+        ),
+        charger_entry(
+            "CP-2.1",
+            OcppVersion::V21,
+            vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
+        ),
     ]);
     app.picker_filter = TextField::new("cp0");
 
@@ -200,7 +287,10 @@ fn picker_no_matches() {
     let mut app = App::new(vec![charger_entry(
         "CP001",
         OcppVersion::V16J,
-        vec![EvseConfig { id: 1, connectors: 1 }],
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
     )]);
     app.picker_filter = TextField::new("zzz");
 
@@ -213,8 +303,14 @@ fn dashboard_idle() {
         "CP-IDLE",
         OcppVersion::V16J,
         vec![
-            EvseConfig { id: 1, connectors: 1 },
-            EvseConfig { id: 2, connectors: 2 },
+            EvseConfig {
+                id: 1,
+                connectors: 1,
+            },
+            EvseConfig {
+                id: 2,
+                connectors: 2,
+            },
         ],
         false,
     );
@@ -230,9 +326,48 @@ fn dashboard_charging() {
     assert_snapshot("dashboard_charging", &render(&app, 120, 34));
 }
 
+/// The log filter prompt open over the dashboard, with the filter already narrowing the pane
+/// live as it's typed - the command bar's hints are replaced by the prompt itself.
+#[test]
+fn dashboard_log_filter_prompt() {
+    let mut app = charging_dashboard_app();
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    for c in "acknowledged".chars() {
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    assert_snapshot("dashboard_log_filter_prompt", &render(&app, 120, 34));
+}
+
+/// A raised level threshold and a scrolled-up (paused) log pane: both states are only legible
+/// from the Logs section title, so this golden pins that title.
+#[test]
+fn dashboard_log_level_threshold_and_paused() {
+    let mut app = charging_dashboard_app();
+    // Info -> Debug. Deliberately not raised as far as Warn: that would leave a single
+    // matching entry, and a one-entry pane can't be scrolled, so the paused half of this
+    // scenario would silently not happen.
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+
+    assert_snapshot(
+        "dashboard_log_level_threshold_and_paused",
+        &render(&app, 120, 34),
+    );
+}
+
 #[test]
 fn dashboard_with_display() {
-    let config = charger_config("CP-DISPLAY", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }], true);
+    let config = charger_config(
+        "CP-DISPLAY",
+        OcppVersion::V16J,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        true,
+    );
     let mut app = dashboard_app(config);
     let state = app.charger_state.as_mut().unwrap();
     Command::SetDisplayMessage.apply_to_charger(state, "Welcome to Flowion");
@@ -242,7 +377,15 @@ fn dashboard_with_display() {
 
 #[test]
 fn dashboard_faulted() {
-    let config = charger_config("CP-FAULT", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let config = charger_config(
+        "CP-FAULT",
+        OcppVersion::V16J,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let mut app = dashboard_app(config);
     let state = app.charger_state.as_mut().unwrap();
     Command::ReportFault.apply(&mut state.evses[0], "OverCurrentFailure");
@@ -270,7 +413,15 @@ fn command_palette_filtered() {
 
 #[test]
 fn parameter_prompt() {
-    let config = charger_config("CP001", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let config = charger_config(
+        "CP001",
+        OcppVersion::V16J,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let mut app = dashboard_app(config);
     app.parameter_prompt = Some(Command::PlugInVehicle);
     app.parameter_field = TextField::new("MY-EV-1");
@@ -280,7 +431,15 @@ fn parameter_prompt() {
 
 #[test]
 fn help_overlay() {
-    let config = charger_config("CP001", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let config = charger_config(
+        "CP001",
+        OcppVersion::V16J,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let mut app = dashboard_app(config);
     app.help_open = true;
 
@@ -289,7 +448,15 @@ fn help_overlay() {
 
 #[test]
 fn quit_confirm() {
-    let config = charger_config("CP001", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let config = charger_config(
+        "CP001",
+        OcppVersion::V16J,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let mut app = dashboard_app(config);
     app.quit_confirm_open = true;
 
@@ -325,8 +492,14 @@ fn multi_evse_mixed_status_app() -> App {
         "CP-MULTI",
         OcppVersion::V16J,
         vec![
-            EvseConfig { id: 1, connectors: 2 },
-            EvseConfig { id: 2, connectors: 1 },
+            EvseConfig {
+                id: 1,
+                connectors: 2,
+            },
+            EvseConfig {
+                id: 2,
+                connectors: 1,
+            },
         ],
         false,
     );
@@ -351,7 +524,10 @@ fn dashboard_multi_evse_mixed_status() {
 #[test]
 fn dashboard_focus_second_evse() {
     let mut app = multi_evse_mixed_status_app();
-    app.focused = FocusedConnector { evse: 1, connector: 0 };
+    app.focused = FocusedConnector {
+        evse: 1,
+        connector: 0,
+    };
 
     assert_snapshot("dashboard_focus_second_evse", &render(&app, 120, 34));
 }
@@ -373,7 +549,15 @@ fn dashboard_narrow_multi_evse() {
 /// does.
 #[test]
 fn dashboard_header_local() {
-    let config = charger_config("CP-LOCAL", OcppVersion::V16J, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let config = charger_config(
+        "CP-LOCAL",
+        OcppVersion::V16J,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let app = dashboard_app(config);
 
     assert_snapshot("dashboard_header_local", &render(&app, 120, 34));
@@ -384,7 +568,15 @@ fn dashboard_header_local() {
 /// a user whether their commands reached a real CSMS or just mutated local state.
 #[test]
 fn dashboard_header_live_csms() {
-    let config = charger_config("CP-LIVE", OcppVersion::V21, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let config = charger_config(
+        "CP-LIVE",
+        OcppVersion::V21,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let mut app = dashboard_app(config);
     app.charger_state.as_mut().unwrap().mode = SimulationMode::LiveCsms {
         url: "wss://csms.example.com/CP-LIVE".to_string(),
@@ -400,8 +592,15 @@ fn dashboard_header_live_csms() {
 /// the third frame - never from wall-clock time, so this golden can't flake.
 #[test]
 fn dashboard_header_connecting() {
-    let config =
-        charger_config("CP-CONNECTING", OcppVersion::V21, vec![EvseConfig { id: 1, connectors: 1 }], false);
+    let config = charger_config(
+        "CP-CONNECTING",
+        OcppVersion::V21,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let mut app = App::new(vec![]);
     app.screen = Screen::Dashboard;
     let mut state = ChargerState::from_config(config);

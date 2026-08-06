@@ -31,4 +31,4 @@ Logs─────────────────────────�
 
 
 
-q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  PgUp/PgDn: scroll logs  c: command  ?: help
+q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help

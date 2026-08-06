@@ -4,10 +4,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use super::view::DashboardView;
 use crate::app::{FocusedConnector, StatusSeverity};
+use crate::logs::{Direction, LogLevel};
 use crate::theme;
 use charge_point_simulator_core::charger::{
     ChargerState, ConnectionStatus, ConnectorState, ConnectorStatus, EvseState, SimulationMode,
@@ -80,7 +81,12 @@ pub fn dashboard_layout(area: Rect) -> DashboardLayout {
     ])
     .areas(area);
 
-    DashboardLayout { header, body, log, command_bar }
+    DashboardLayout {
+        header,
+        body,
+        log,
+        command_bar,
+    }
 }
 
 /// Splits `body` into the display strip (only when `has_display`), the EVSE/connector tree, and,
@@ -95,9 +101,17 @@ pub fn body_layout(body: Rect, has_display: bool) -> BodyLayout {
     if rest.width >= SIDEBAR_MIN_BODY_WIDTH {
         let [tree, sidebar] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(SIDEBAR_WIDTH)]).areas(rest);
-        BodyLayout { display, tree, sidebar: Some(sidebar) }
+        BodyLayout {
+            display,
+            tree,
+            sidebar: Some(sidebar),
+        }
     } else {
-        BodyLayout { display, tree: rest, sidebar: None }
+        BodyLayout {
+            display,
+            tree: rest,
+            sidebar: None,
+        }
     }
 }
 
@@ -169,7 +183,10 @@ fn header_segments(state: &ChargerState, connecting: bool, width: usize) -> Vec<
     let status: Vec<(String, Style)> = if connecting {
         let connecting_style = theme::connection_style(ConnectionStatus::Booting);
         vec![
-            (theme::glyph_field(connecting_spinner_frame(state.uptime)), connecting_style),
+            (
+                theme::glyph_field(connecting_spinner_frame(state.uptime)),
+                connecting_style,
+            ),
             ("connecting...".to_string(), connecting_style),
         ]
     } else {
@@ -178,7 +195,10 @@ fn header_segments(state: &ChargerState, connecting: bool, width: usize) -> Vec<
                 theme::glyph_field(theme::connection_glyph(state.connection_status)),
                 theme::connection_style(state.connection_status),
             ),
-            (state.connection_status.to_string(), theme::connection_style(state.connection_status)),
+            (
+                state.connection_status.to_string(),
+                theme::connection_style(state.connection_status),
+            ),
         ]
     };
 
@@ -188,7 +208,10 @@ fn header_segments(state: &ChargerState, connecting: bool, width: usize) -> Vec<
     base.push(("  |  ".to_string(), theme::text_dim()));
     base.push((state.config.ocpp_version.to_string(), theme::text_dim()));
 
-    let mode_segment = vec![("  |  ".to_string(), theme::text_dim()), (mode_text(state), theme::text())];
+    let mode_segment = vec![
+        ("  |  ".to_string(), theme::text_dim()),
+        (mode_text(state), theme::text()),
+    ];
 
     let uptime_segment = vec![
         ("  |  up ".to_string(), theme::text_dim()),
@@ -204,7 +227,8 @@ fn header_segments(state: &ChargerState, connecting: bool, width: usize) -> Vec<
     };
 
     let with_mode: Vec<(String, Style)> = base.iter().cloned().chain(mode_segment).collect();
-    let with_mode_and_uptime: Vec<(String, Style)> = with_mode.iter().cloned().chain(uptime_segment).collect();
+    let with_mode_and_uptime: Vec<(String, Style)> =
+        with_mode.iter().cloned().chain(uptime_segment).collect();
 
     if width_of(&with_mode_and_uptime) <= width {
         with_mode_and_uptime
@@ -231,7 +255,11 @@ fn evse_summary_status(evse: &EvseState) -> ConnectorStatus {
     ];
     PRIORITY
         .into_iter()
-        .find(|&status| evse.connectors.iter().any(|connector| connector.status == status))
+        .find(|&status| {
+            evse.connectors
+                .iter()
+                .any(|connector| connector.status == status)
+        })
         .unwrap_or(ConnectorStatus::Available)
 }
 
@@ -250,7 +278,10 @@ fn evse_summary_line(evse: &EvseState) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("EVSE {}", evse.id), theme::text()),
         Span::raw("  "),
-        Span::styled(theme::glyph_field(theme::connector_glyph(status)), theme::connector_style(status)),
+        Span::styled(
+            theme::glyph_field(theme::connector_glyph(status)),
+            theme::connector_style(status),
+        ),
         Span::styled(status.to_string(), theme::connector_style(status)),
         Span::raw("   "),
         Span::styled(format!("{:.2}", evse.metrics.power_kw), theme::text()),
@@ -269,23 +300,42 @@ fn evse_summary_line(evse: &EvseState) -> Line<'static> {
 /// selected row.
 fn connector_line(connector: &ConnectorState, focused: bool) -> Line<'static> {
     let marker = if focused { "▸ " } else { "  " };
-    let row_style = if focused { theme::selected() } else { theme::connector_style(connector.status) };
-    let label_style = if focused { theme::selected() } else { theme::text() };
+    let row_style = if focused {
+        theme::selected()
+    } else {
+        theme::connector_style(connector.status)
+    };
+    let label_style = if focused {
+        theme::selected()
+    } else {
+        theme::text()
+    };
 
     let mut spans = vec![
         Span::raw(format!("  {marker}")),
         Span::styled(format!("C{}", connector.id), label_style),
         Span::raw("  "),
-        Span::styled(theme::glyph_field(theme::connector_glyph(connector.status)), row_style),
+        Span::styled(
+            theme::glyph_field(theme::connector_glyph(connector.status)),
+            row_style,
+        ),
         Span::styled(connector.status.to_string(), row_style),
     ];
 
     if let Some(vehicle) = &connector.vehicle {
-        let vehicle_style = if focused { theme::selected() } else { theme::text() };
+        let vehicle_style = if focused {
+            theme::selected()
+        } else {
+            theme::text()
+        };
         spans.push(Span::raw("   "));
         spans.push(Span::styled(vehicle.id.clone(), vehicle_style));
         if let Some(soc) = vehicle.state_of_charge {
-            let soc_style = if focused { theme::selected() } else { theme::text_dim() };
+            let soc_style = if focused {
+                theme::selected()
+            } else {
+                theme::text_dim()
+            };
             spans.push(Span::raw("   "));
             spans.push(Span::styled(format!("{:.0}%", soc), soc_style));
         }
@@ -305,7 +355,10 @@ fn inline_detail_line(evse: &EvseState, connector: &ConnectorState) -> Line<'sta
             spans.push(Span::styled(vehicle.id.clone(), theme::text()));
             if let Some(soc) = vehicle.state_of_charge {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(format!("{:.0}% {}", soc, soc_bar(soc)), theme::text_dim()));
+                spans.push(Span::styled(
+                    format!("{:.0}% {}", soc, soc_bar(soc)),
+                    theme::text_dim(),
+                ));
             }
             spans.push(Span::raw("  "));
         }
@@ -314,9 +367,15 @@ fn inline_detail_line(evse: &EvseState, connector: &ConnectorState) -> Line<'sta
         }
     }
     spans.push(Span::styled("session ", theme::text_dim()));
-    spans.push(Span::styled(format_uptime(connector.session_duration), theme::text()));
+    spans.push(Span::styled(
+        format_uptime(connector.session_duration),
+        theme::text(),
+    ));
     spans.push(Span::raw("  "));
-    spans.push(Span::styled(format!("{:.2} kW", evse.metrics.power_kw), theme::text_dim()));
+    spans.push(Span::styled(
+        format!("{:.2} kW", evse.metrics.power_kw),
+        theme::text_dim(),
+    ));
     Line::from(spans)
 }
 
@@ -324,15 +383,19 @@ fn inline_detail_line(evse: &EvseState, connector: &ConnectorState) -> Line<'sta
 /// small bar, session duration, and the parent EVSE's power/current/energy.
 fn sidebar_lines(evse: &EvseState, connector: &ConnectorState) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled(format!("EVSE {} / C{}", evse.id, connector.id), theme::text()),
-        ]),
+        Line::from(vec![Span::styled(
+            format!("EVSE {} / C{}", evse.id, connector.id),
+            theme::text(),
+        )]),
         Line::from(vec![
             Span::styled(
                 theme::glyph_field(theme::connector_glyph(connector.status)),
                 theme::connector_style(connector.status),
             ),
-            Span::styled(connector.status.to_string(), theme::connector_style(connector.status)),
+            Span::styled(
+                connector.status.to_string(),
+                theme::connector_style(connector.status),
+            ),
         ]),
     ];
 
@@ -374,7 +437,11 @@ fn sidebar_lines(evse: &EvseState, connector: &ConnectorState) -> Vec<Line<'stat
 /// The whole tree: every EVSE with its connectors indented beneath it as children. When
 /// `inline_detail` is set (no room for the sidebar - see [`body_layout`]), the focused
 /// connector's detail is appended directly beneath its row via [`inline_detail_line`].
-fn tree_lines(charger: &ChargerState, focused: FocusedConnector, inline_detail: bool) -> Vec<Line<'static>> {
+fn tree_lines(
+    charger: &ChargerState,
+    focused: FocusedConnector,
+    inline_detail: bool,
+) -> Vec<Line<'static>> {
     if charger.evses.is_empty() {
         return vec![Line::styled("no EVSEs configured", theme::text_muted())];
     }
@@ -420,12 +487,17 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
     let focused = false;
 
     if has_display {
-        let message = view.charger.and_then(|state| state.display_message.as_deref());
+        let message = view
+            .charger
+            .and_then(|state| state.display_message.as_deref());
         let line = match message {
             Some(message) => Line::styled(message, theme::text()),
             None => Line::styled("(blank)", theme::text_muted()),
         };
-        frame.render_widget(Paragraph::new(line).block(theme::section("Display", focused)), body.display);
+        frame.render_widget(
+            Paragraph::new(line).block(theme::section("Display", focused)),
+            body.display,
+        );
     }
 
     let header_line = match view.charger {
@@ -440,7 +512,10 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
         }
         None => Line::styled("no charger selected", theme::text_muted()),
     };
-    frame.render_widget(Paragraph::new(header_line).block(theme::header(focused)), layout.header);
+    frame.render_widget(
+        Paragraph::new(header_line).block(theme::header(focused)),
+        layout.header,
+    );
 
     let tree_title = match view.charger {
         Some(state) if !state.evses.is_empty() => {
@@ -457,42 +532,157 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
     // focus marker). A line that doesn't fit `body.tree`'s width is simply clipped at the
     // right edge instead of wrapping - the same trade `evse_detail` made before this panel
     // existed.
-    frame.render_widget(Paragraph::new(tree).block(theme::section(tree_title, focused)), body.tree);
+    frame.render_widget(
+        Paragraph::new(tree).block(theme::section(tree_title, focused)),
+        body.tree,
+    );
 
     if let Some(sidebar_area) = body.sidebar {
-        let sidebar = match view.charger.and_then(|state| focused_connector(state, view.focused)) {
+        let sidebar = match view
+            .charger
+            .and_then(|state| focused_connector(state, view.focused))
+        {
             Some((evse, connector)) => sidebar_lines(evse, connector),
             None => vec![Line::styled("no connector focused", theme::text_muted())],
         };
-        frame.render_widget(Paragraph::new(sidebar).block(theme::section("Detail", focused)), sidebar_area);
+        frame.render_widget(
+            Paragraph::new(sidebar).block(theme::section("Detail", focused)),
+            sidebar_area,
+        );
     }
 
-    let log_title = if view.logs.is_paused() { "Logs (scrolled up, paused)" } else { "Logs" };
-    // A `section` only spends 1 row on chrome (the top rule), not 2, so all but 1 row of
-    // `layout.log`'s height is available for content.
-    let log_height = layout.log.height.saturating_sub(1) as usize;
-    let log_lines: Vec<Line> = view
-        .logs
-        .visible_lines(log_height)
-        .into_iter()
-        .map(|line| Line::styled(line, theme::text()))
-        .collect();
-    frame.render_widget(Paragraph::new(log_lines).block(theme::section(log_title, focused)), layout.log);
+    render_log_pane(frame, view, layout.log, focused);
 
-    let command_bar_line = match view.status_message {
-        Some((severity, message)) => {
-            let style = match severity {
-                StatusSeverity::Ok => theme::ok(),
-                StatusSeverity::Error => theme::error(),
-            };
-            Line::styled(message, style)
-        }
-        None => Line::styled(
-            "q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  PgUp/PgDn: scroll logs  c: command  ?: help",
-            theme::text_dim(),
-        ),
+    let command_bar_line = match view.log_filter_input {
+        // The filter prompt owns the command bar while it's open: it's a modal input, and
+        // showing keybinding hints for keys that are currently being typed into it would lie.
+        Some(input) => Line::from(vec![
+            Span::styled("/", theme::accent()),
+            Span::styled(input, theme::text()),
+            Span::styled("▏", theme::accent()),
+            Span::styled("  Enter: keep  Esc: clear", theme::text_dim()),
+        ]),
+        None => match view.status_message {
+            Some((severity, message)) => {
+                let style = match severity {
+                    StatusSeverity::Ok => theme::ok(),
+                    StatusSeverity::Error => theme::error(),
+                };
+                Line::styled(message, style)
+            }
+            None => Line::styled(
+                "q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help",
+                theme::text_dim(),
+            ),
+        },
     };
     frame.render_widget(Paragraph::new(command_bar_line), layout.command_bar);
+}
+
+/// The log pane: a protocol trace rather than a wall of pre-formatted strings. Each entry is
+/// rendered as columns - timestamp, level, direction, elided target, message - so the eye can
+/// find one column without reading the others (see the "density over decoration" principle).
+fn render_log_pane(frame: &mut Frame, view: &DashboardView, area: Rect, focused: bool) {
+    let logs = view.logs;
+    // A `section` only spends 1 row on chrome (the top rule), not 2, so all but 1 row of
+    // `area`'s height is available for content.
+    let log_height = area.height.saturating_sub(1) as usize;
+
+    // The title carries the pane's whole state - filter, level threshold, and whether the view
+    // is following the tail - because none of those are visible from the lines themselves.
+    let mut title = String::from("Logs");
+    if let Some(filter) = logs.filter() {
+        title.push_str(&format!(" /{filter}"));
+    }
+    if logs.level_threshold() != LogLevel::Info {
+        title.push_str(&format!(" ≥{}", level_label(logs.level_threshold())));
+    }
+    if logs.is_paused() {
+        title.push_str(" (paused)");
+    }
+
+    // A real scrollbar, so "where am I in the buffer" doesn't have to be inferred from the
+    // title alone. Only worth drawing when there's more to see than fits.
+    let total = logs.filtered_len();
+    let needs_scrollbar = total > log_height && log_height > 0;
+
+    // The block is drawn on the full area (so its top rule still spans the pane), but the text
+    // gives up the rightmost column when a scrollbar is present - otherwise the thumb
+    // overwrites the tail of every long message.
+    let block = theme::section(title, focused);
+    let mut text_area = block.inner(area);
+    if needs_scrollbar {
+        text_area.width = text_area.width.saturating_sub(1);
+    }
+    frame.render_widget(block, area);
+    let lines: Vec<Line> = logs
+        .visible_lines(log_height)
+        .into_iter()
+        .map(log_line)
+        .collect();
+    frame.render_widget(Paragraph::new(lines), text_area);
+
+    if needs_scrollbar {
+        let mut state = ScrollbarState::new(total.saturating_sub(log_height)).position(
+            total
+                .saturating_sub(log_height)
+                .saturating_sub(logs.scroll_offset()),
+        );
+        let track = Rect {
+            y: area.y + 1,
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            track,
+            &mut state,
+        );
+    }
+}
+
+fn level_label(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Error => "ERROR",
+        LogLevel::Warn => "WARN",
+        LogLevel::Info => "INFO",
+        LogLevel::Debug => "DEBUG",
+        LogLevel::Trace => "TRACE",
+    }
+}
+
+/// One log entry as aligned columns. Entries the TUI generates itself have no timestamp; their
+/// column is left blank rather than filled with a wall-clock reading they didn't come from.
+fn log_line(entry: &crate::logs::LogEntry) -> Line<'_> {
+    let mut spans = vec![
+        Span::styled(
+            format!("{:<12} ", entry.timestamp.as_deref().unwrap_or("")),
+            theme::text_muted(),
+        ),
+        Span::styled(
+            format!("{:<5} ", level_label(entry.level)),
+            theme::log_level(entry.level),
+        ),
+        Span::styled(
+            match entry.direction {
+                Some(Direction::Outbound) => "→ ",
+                Some(Direction::Inbound) => "← ",
+                None => "  ",
+            },
+            theme::accent(),
+        ),
+        Span::styled(format!("{:<14} ", entry.short_target()), theme::text_dim()),
+    ];
+    if let Some(action) = &entry.action {
+        spans.push(Span::styled(format!("{action} "), theme::accent()));
+    }
+    spans.push(Span::styled(entry.message.as_str(), theme::text()));
+    for (name, value) in &entry.fields {
+        spans.push(Span::styled(format!(" {name}={value}"), theme::text_dim()));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -692,7 +882,9 @@ mod tests {
     #[test]
     fn header_segments_show_the_csms_url_for_a_live_csms_charger() {
         let mut state = charger_state_for_header("CP-CHARGE");
-        state.mode = SimulationMode::LiveCsms { url: "wss://csms.example.com".to_string() };
+        state.mode = SimulationMode::LiveCsms {
+            url: "wss://csms.example.com".to_string(),
+        };
         let text = segments_text(&header_segments(&state, false, 120));
 
         assert!(text.contains("wss://csms.example.com"));
@@ -723,21 +915,35 @@ mod tests {
         let base = header_segments(&state, false, 0);
         let base_width: usize = base.iter().map(|(text, _)| text.chars().count()).sum();
 
-        let mode_only_width = base_width + "  |  ".chars().count() + mode_text(&state).chars().count();
-        let with_uptime_width =
-            mode_only_width + "  |  up ".chars().count() + format_uptime(state.uptime).chars().count();
+        let mode_only_width =
+            base_width + "  |  ".chars().count() + mode_text(&state).chars().count();
+        let with_uptime_width = mode_only_width
+            + "  |  up ".chars().count()
+            + format_uptime(state.uptime).chars().count();
 
         let everything = segments_text(&header_segments(&state, false, with_uptime_width));
         assert!(everything.contains("local simulation"));
         assert!(everything.contains("up 4m 12s"));
 
         let mode_only = segments_text(&header_segments(&state, false, with_uptime_width - 1));
-        assert!(mode_only.contains("local simulation"), "mode should still fit: {mode_only:?}");
-        assert!(!mode_only.contains("up 4m 12s"), "uptime should have been dropped: {mode_only:?}");
+        assert!(
+            mode_only.contains("local simulation"),
+            "mode should still fit: {mode_only:?}"
+        );
+        assert!(
+            !mode_only.contains("up 4m 12s"),
+            "uptime should have been dropped: {mode_only:?}"
+        );
 
         let floor_only = segments_text(&header_segments(&state, false, mode_only_width - 1));
-        assert!(!floor_only.contains("local simulation"), "mode should have been dropped: {floor_only:?}");
-        assert!(floor_only.contains("CP-CHARGE"), "the id/status floor must never be dropped: {floor_only:?}");
+        assert!(
+            !floor_only.contains("local simulation"),
+            "mode should have been dropped: {floor_only:?}"
+        );
+        assert!(
+            floor_only.contains("CP-CHARGE"),
+            "the id/status floor must never be dropped: {floor_only:?}"
+        );
     }
 
     // --- evse_summary_status -------------------------------------------------------------

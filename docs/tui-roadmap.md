@@ -1,6 +1,6 @@
 # TUI redesign roadmap
 
-A staged plan for making the dashboard legible and modern. Phases 0–3 have landed on
+A staged plan for making the dashboard legible and modern. Phases 0–4 have landed on
 `tui-redesign-phase-0-1`; what follows them is described here in enough detail to pick up cold.
 
 The guiding principles, which every remaining phase should be checked against:
@@ -24,28 +24,16 @@ The guiding principles, which every remaining phase should be checked against:
   states whether commands drive a real CSMS or local state.
 - **Phase 3** — per-connector command targeting, session duration, SoC progression, and the EVSE
   tree with detail sidebar.
+- **Phase 4** — the log pane as a protocol trace: a structured `LogEntry` (timestamp, level,
+  target, message, fields, direction, OCPP action) replacing `Vec<String>`, populated by
+  `tracing_bridge.rs`; column rendering with elided targets and `→`/`←` markers; `/` filter,
+  `l` level threshold, `g`/`G`, and a real scrollbar; a 5000-entry ring with a cached filtered
+  view. The workspace's `dead_code` warning is gone — the filter now has a key binding.
 
-## Phase 4 — the log pane as a protocol trace
-
-The highest-value work remaining. Today every line reads
-`[INFO] charge_point_simulator_core::charger::state: heartbeat sent` — roughly 60 columns of
-module path before the message, no timestamps, no level colors, and no indication of which
-direction a message travelled.
-
-- Replace `LogBuffer`'s `Vec<String>` with a structured entry: timestamp, level, target, message,
-  fields, optional direction (inbound/outbound), optional OCPP action name. `tracing_bridge.rs`
-  populates the structure instead of pre-formatting a string.
-- Render as columns with elided targets (`charge_point_simulator_core::charger::state` →
-  `core::state`), level colors from the theme's severity tier, and `→`/`←` direction markers.
-- **Wire up the filter that already exists.** `LogBuffer::set_filter`/`clear_filter` are
-  implemented and tested but no key binding reaches them — this is the source of the workspace's
-  only `dead_code` warning. Bind `/` to open the filter and `Esc` to clear it.
-- Add a level threshold, cycled with a key.
-- Bound the buffer (ring, ~5000 entries) and cache the filtered view. `visible_lines` currently
-  calls `filtered()`, allocating a `Vec` of every entry, on every frame, and the buffer grows
-  without limit for the life of the session.
-- `g`/`G` for top and bottom, and a `Scrollbar` showing real position. The "paused" state is
-  currently conveyed only by the panel title.
+  The help-overlay sizing fix listed under Phase 5 was pulled forward: this phase added four
+  bindings to the bottom of a popup that was clipping its own last three lines, so they would
+  have been documented somewhere the user could never see. `render_help` now sizes to its
+  content. The rest of Phase 5 is untouched.
 
 ## Phase 5 — command palette, feedback, and help
 
@@ -58,10 +46,9 @@ direction a message travelled.
 - **Toasts must expire.** `status_message` currently persists indefinitely, permanently hiding the
   keybinding hint line. Give it a timestamp and clear it after a few seconds. Use an injectable
   clock, following the pattern already established by `tick_metrics_with`.
-- **Fix the help overlay**, which does not fit its own content: the popup is sized
-  `min(56, 14)` — 12 usable rows — against 15 lines of text, so the last entries never render.
-  Size it to its content and make it scrollable. Since Phase 1b gave the log pane more height,
-  the popup also now overlaps the Logs section rule; sizing it properly resolves both.
+- ~~Fix the help overlay's sizing~~ — done in Phase 4, which needed it to document its own new
+  bindings. Still outstanding: making the overlay *scrollable*, for a terminal too short to fit
+  the content even at its natural size.
 - Derive the help text from a single keybinding table, so help cannot drift from behavior again.
 
 ## Phase 6 — picker and connection setup

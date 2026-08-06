@@ -20,16 +20,10 @@ pub(super) fn render_too_small(frame: &mut Frame) {
 
 pub(super) fn render_help(frame: &mut Frame) {
     let area = frame.area();
-    let popup = super::centered_rect(area.width.min(56), area.height.min(14), area);
-    frame.render_widget(Clear, popup);
-
     // The "Dashboard" section's focus line packs both `↑`/`↓` (connector-level, flows across
     // EVSE boundaries) and `Tab`/`←`/`→` (EVSE-level jumps) onto one line rather than two, even
     // though they're meaningfully different - see `App::select_next_connector`/
-    // `App::select_next_evse`. This overlay already clips its last three lines on a
-    // comfortably-sized terminal (a known bug, not this phase's to fix - see Phase 5); adding a
-    // second line here would push a fourth line off, so the two bindings share one line instead
-    // to leave that clipping exactly as it already was.
+    // `App::select_next_evse`.
     let text = "Global\n\
          \u{20}q            quit (confirm)\n\
          \u{20}?            toggle this help\n\n\
@@ -41,11 +35,25 @@ pub(super) fn render_help(frame: &mut Frame) {
          Dashboard\n\
          \u{20}Esc          back to picker\n\
          \u{20}\u{2191}/\u{2193} \u{2190}/\u{2192}/Tab  focus connector / EVSE\n\
-         \u{20}PgUp/PgDn    scroll logs\n\
-         \u{20}c            open command palette";
+         \u{20}c            open command palette\n\n\
+         Logs\n\
+         \u{20}PgUp/PgDn    scroll\n\
+         \u{20}g / G        jump to oldest / newest\n\
+         \u{20}/            filter (Esc clears)\n\
+         \u{20}l            cycle level threshold";
+
+    // Sized to the text rather than a hardcoded 14 rows: the popup previously clipped its own
+    // last three lines, so the bindings at the bottom of the list - now including every log
+    // binding this phase added - never rendered at all. +2 for the block's top and bottom
+    // borders, then clamped to the terminal.
+    let content_height = text.lines().count() as u16 + 2;
+    let popup = super::centered_rect(area.width.min(56), area.height.min(content_height), area);
+    frame.render_widget(Clear, popup);
 
     frame.render_widget(
-        Paragraph::new(text).style(theme::text_dim()).block(bordered_block("Help (Esc to close)")),
+        Paragraph::new(text)
+            .style(theme::text_dim())
+            .block(bordered_block("Help (Esc to close)")),
         popup,
     );
 }

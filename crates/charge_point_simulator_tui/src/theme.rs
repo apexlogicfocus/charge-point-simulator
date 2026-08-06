@@ -38,6 +38,7 @@
 //!    don't reach for `Modifier::DIM` here even though it looks tempting;
 //!    it's not the portability win it appears to be.
 
+use crate::logs::LogLevel;
 use charge_point_simulator_core::charger::{ConnectionStatus, ConnectorStatus};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -120,11 +121,20 @@ pub fn error() -> Style {
 }
 
 /// Informational, neutral-but-notable.
-///
-/// No caller yet, for the same reason as [`warn`] - see its doc comment.
-#[allow(dead_code)]
 pub fn info() -> Style {
     Style::new().fg(Color::Cyan)
+}
+
+/// The severity style for a log entry's level, so the log pane's level column reads at a
+/// glance. `Debug`/`Trace` are deliberately dim rather than colored: they are the noisiest
+/// levels, and coloring them would spend attention where "color means something" says not to.
+pub fn log_level(level: LogLevel) -> Style {
+    match level {
+        LogLevel::Error => error(),
+        LogLevel::Warn => warn(),
+        LogLevel::Info => info(),
+        LogLevel::Debug | LogLevel::Trace => text_muted(),
+    }
 }
 
 // --- selection -----------------------------------------------------------------
@@ -135,7 +145,10 @@ pub fn info() -> Style {
 /// block of color that must stay legible against its own background
 /// regardless of the terminal's theme.
 pub fn selected() -> Style {
-    Style::new().fg(Color::Black).bg(BRAND_TEAL).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(Color::Black)
+        .bg(BRAND_TEAL)
+        .add_modifier(Modifier::BOLD)
 }
 
 // --- status glyph vocabulary ---------------------------------------------------
@@ -210,7 +223,10 @@ pub fn connection_style(status: ConnectionStatus) -> Style {
 /// where the redesign gets its extra vertical room from.
 pub fn section<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
     let style = if focused { chrome_focused() } else { chrome() };
-    Block::new().borders(Borders::TOP).title(title).border_style(style)
+    Block::new()
+        .borders(Borders::TOP)
+        .title(title)
+        .border_style(style)
 }
 
 /// A block with only a bottom border and no title, the mirror image of [`section`]: the rule
@@ -443,8 +459,20 @@ mod tests {
     fn section_border_style_responds_to_focus() {
         let unfocused = section("Title", false);
         let focused = section("Title", true);
-        assert_eq!(unfocused.to_owned(), Block::new().borders(Borders::TOP).title("Title").border_style(chrome()));
-        assert_eq!(focused.to_owned(), Block::new().borders(Borders::TOP).title("Title").border_style(chrome_focused()));
+        assert_eq!(
+            unfocused.to_owned(),
+            Block::new()
+                .borders(Borders::TOP)
+                .title("Title")
+                .border_style(chrome())
+        );
+        assert_eq!(
+            focused.to_owned(),
+            Block::new()
+                .borders(Borders::TOP)
+                .title("Title")
+                .border_style(chrome_focused())
+        );
     }
 
     // --- header() primitive ---------------------------------------------------------
@@ -462,8 +490,16 @@ mod tests {
     fn header_border_style_responds_to_focus() {
         let unfocused = header(false);
         let focused = header(true);
-        assert_eq!(unfocused.to_owned(), Block::new().borders(Borders::BOTTOM).border_style(chrome()));
-        assert_eq!(focused.to_owned(), Block::new().borders(Borders::BOTTOM).border_style(chrome_focused()));
+        assert_eq!(
+            unfocused.to_owned(),
+            Block::new().borders(Borders::BOTTOM).border_style(chrome())
+        );
+        assert_eq!(
+            focused.to_owned(),
+            Block::new()
+                .borders(Borders::BOTTOM)
+                .border_style(chrome_focused())
+        );
     }
 
     #[test]
@@ -492,10 +528,7 @@ mod tests {
 
     #[test]
     fn faulted_connector_reads_as_red_and_available_as_green() {
-        assert_eq!(
-            connector_status_color(ConnectorStatus::Faulted),
-            Color::Red
-        );
+        assert_eq!(connector_status_color(ConnectorStatus::Faulted), Color::Red);
         assert_eq!(
             connector_status_color(ConnectorStatus::Available),
             Color::Green
@@ -522,7 +555,11 @@ mod tests {
             ConnectorStatus::Unavailable,
             ConnectorStatus::Reserved,
         ];
-        let colors: Vec<Color> = statuses.iter().copied().map(connector_status_color).collect();
+        let colors: Vec<Color> = statuses
+            .iter()
+            .copied()
+            .map(connector_status_color)
+            .collect();
         let mut unique = colors.clone();
         unique.sort_by_key(|c| format!("{c:?}"));
         unique.dedup();
