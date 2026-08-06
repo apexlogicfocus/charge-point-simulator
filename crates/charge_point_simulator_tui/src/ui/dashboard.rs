@@ -522,6 +522,73 @@ fn tree_focus_line_index(charger: &ChargerState, focused: FocusedConnector) -> u
     0
 }
 
+/// The reverse of [`tree_focus_line_index`]: which `(evse_index, connector_index)` pair, if any,
+/// owns line `line_index` of [`tree_lines`]'s output. Walks the same structure `tree_lines`
+/// builds (an EVSE summary line, then either a "no connectors" filler or one line per connector,
+/// plus one extra inline-detail line right after the *focused* connector's row when
+/// `inline_detail` is set) so the two stay in lockstep - a line that isn't a connector row (an
+/// EVSE summary, a filler, or an inline-detail line) yields `None`, as does a `line_index` past
+/// the end of the tree.
+pub(crate) fn tree_line_to_connector(
+    charger: &ChargerState,
+    focused: FocusedConnector,
+    inline_detail: bool,
+    line_index: usize,
+) -> Option<(usize, usize)> {
+    let mut index = 0;
+    for (evse_index, evse) in charger.evses.iter().enumerate() {
+        if index == line_index {
+            return None; // the EVSE summary line
+        }
+        index += 1;
+
+        if evse.connectors.is_empty() {
+            if index == line_index {
+                return None; // "no connectors"
+            }
+            index += 1;
+            continue;
+        }
+
+        for connector_index in 0..evse.connectors.len() {
+            if index == line_index {
+                return Some((evse_index, connector_index));
+            }
+            index += 1;
+
+            let is_focused = focused.evse == evse_index && focused.connector == connector_index;
+            if inline_detail && is_focused {
+                if index == line_index {
+                    return None; // the inline-detail line
+                }
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Which row of a rendered pane's *content* (i.e. below/inside its chrome) `mouse_row` falls on,
+/// or `None` when the click landed on the pane's border/title or outside it entirely. `area` is
+/// the pane's outer [`Rect`] as returned by [`dashboard_layout`]/[`body_layout`] - the same one
+/// handed to `theme::section`/`theme::header` - not the inner rect a block's chrome already
+/// carved out, so this is the single place that has to know a `section` spends its first row on
+/// a title rule (see the `HEADER_HEIGHT`/`section` comments above [`dashboard_layout`]).
+///
+/// Pure `Rect` + `(u16, u16)` math on purpose, so hit-testing is unit-testable without standing
+/// up a terminal - see the roadmap's Phase 7 "mouse support" note.
+pub(crate) fn content_row_at(area: Rect, mouse_col: u16, mouse_row: u16) -> Option<usize> {
+    let content = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    if !content.contains(ratatui::layout::Position::new(mouse_col, mouse_row)) {
+        return None;
+    }
+    Some((mouse_row - content.y) as usize)
+}
+
 /// How far the tree should be scrolled (lines cut from the top) so that `focus_line` stays
 /// visible within a `height`-row window over `total_lines` lines. The tree has no independent
 /// scroll key of its own - unlike the log pane - so this always tracks focus rather than
@@ -537,6 +604,20 @@ fn tree_scroll_offset(total_lines: usize, height: usize, focus_line: usize) -> u
     } else {
         (focus_line + 1 - height).min(max_offset)
     }
+}
+
+/// The tree's current scroll offset for `charger`/`focused` rendered in a `height`-row window -
+/// the same value [`render`] computes internally via [`tree_lines`]/[`tree_scroll_offset`],
+/// exposed so mouse hit-testing can reconstruct which line of [`tree_lines`]'s output a click's
+/// row corresponds to without duplicating the line-counting logic here.
+pub(crate) fn tree_scroll_offset_for(
+    charger: &ChargerState,
+    focused: FocusedConnector,
+    inline_detail: bool,
+    height: usize,
+) -> usize {
+    let total = tree_lines(charger, focused, inline_detail).len();
+    tree_scroll_offset(total, height, tree_focus_line_index(charger, focused))
 }
 
 /// Renders a scrollbar along the right edge of `area`, one row down from the top (so it doesn't
@@ -1215,6 +1296,89 @@ mod tests {
     }
 
     #[test]
+    fn tree_line_to_connector_finds_the_connector_at_a_row() {
+        let charger = charger_with_evses(vec![
+            evse_with_statuses(&[ConnectorStatus::Available, ConnectorStatus::Available]),
+            evse_with_statuses(&[ConnectorStatus::Available]),
+        ]);
+        let focused = FocusedConnector {
+            evse: 0,
+            connector: 0,
+        };
+
+        // EVSE 1 summary (0), connector 1 (1), connector 2 (2), EVSE 2 summary (3), connector 1 (4)
+        assert_eq!(
+            tree_line_to_connector(&charger, focused, false, 2),
+            Some((0, 1))
+        );
+        assert_eq!(
+            tree_line_to_connector(&charger, focused, false, 4),
+            Some((1, 0))
+        );
+    }
+
+    #[test]
+    fn tree_line_to_connector_is_none_for_evse_summary_and_filler_lines() {
+        let charger = charger_with_evses(vec![
+            evse_with_statuses(&[ConnectorStatus::Available]),
+            evse_with_statuses(&[]),
+        ]);
+        let focused = FocusedConnector::default();
+
+        assert_eq!(tree_line_to_connector(&charger, focused, false, 0), None); // EVSE 1 summary
+        assert_eq!(tree_line_to_connector(&charger, focused, false, 2), None); // EVSE 2 summary
+        assert_eq!(tree_line_to_connector(&charger, focused, false, 3), None); // "no connectors"
+    }
+
+    #[test]
+    fn tree_line_to_connector_skips_the_inline_detail_line_after_the_focused_row() {
+        let charger = charger_with_evses(vec![evse_with_statuses(&[
+            ConnectorStatus::Available,
+            ConnectorStatus::Available,
+        ])]);
+        let focused = FocusedConnector {
+            evse: 0,
+            connector: 0,
+        };
+
+        // EVSE summary (0), C1 focused (1), inline detail (2), C2 (3)
+        assert_eq!(
+            tree_line_to_connector(&charger, focused, true, 1),
+            Some((0, 0))
+        );
+        assert_eq!(tree_line_to_connector(&charger, focused, true, 2), None);
+        assert_eq!(
+            tree_line_to_connector(&charger, focused, true, 3),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn tree_line_to_connector_is_none_past_the_end() {
+        let charger = charger_with_evses(vec![evse_with_statuses(&[ConnectorStatus::Available])]);
+        let focused = FocusedConnector::default();
+
+        assert_eq!(tree_line_to_connector(&charger, focused, false, 99), None);
+    }
+
+    // --- content_row_at ------------------------------------------------------------------
+
+    #[test]
+    fn content_row_at_skips_the_top_chrome_row() {
+        let pane = area(20, 10);
+        assert_eq!(content_row_at(pane, 5, 0), None); // the title/rule row
+        assert_eq!(content_row_at(pane, 5, 1), Some(0));
+        assert_eq!(content_row_at(pane, 5, 9), Some(8));
+    }
+
+    #[test]
+    fn content_row_at_is_none_outside_the_pane() {
+        let pane = Rect::new(10, 5, 20, 10);
+        assert_eq!(content_row_at(pane, 5, 6), None); // left of the pane
+        assert_eq!(content_row_at(pane, 10, 20), None); // below the pane
+    }
+
+    #[test]
     fn tree_scroll_offset_stays_at_zero_while_focus_is_already_visible() {
         assert_eq!(tree_scroll_offset(20, 5, 0), 0);
         assert_eq!(tree_scroll_offset(20, 5, 4), 0);
@@ -1237,5 +1401,23 @@ mod tests {
     fn tree_scroll_offset_is_zero_when_everything_fits() {
         assert_eq!(tree_scroll_offset(3, 5, 2), 0);
         assert_eq!(tree_scroll_offset(0, 5, 0), 0);
+    }
+
+    #[test]
+    fn tree_scroll_offset_for_matches_a_manual_computation() {
+        let charger = charger_with_evses(vec![evse_with_statuses(&[
+            ConnectorStatus::Available,
+            ConnectorStatus::Available,
+            ConnectorStatus::Available,
+            ConnectorStatus::Available,
+        ])]);
+        let focused = FocusedConnector {
+            evse: 0,
+            connector: 3,
+        };
+
+        // 5 lines total (1 summary + 4 connectors), a 3-row window, focus on the last line (4):
+        // offset must be 4 + 1 - 3 = 2.
+        assert_eq!(tree_scroll_offset_for(&charger, focused, false, 3), 2);
     }
 }

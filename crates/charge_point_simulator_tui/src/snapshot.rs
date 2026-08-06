@@ -36,7 +36,7 @@ use ratatui::backend::TestBackend;
 /// terminal row, each right-trimmed of trailing spaces, rows joined with `\n`. Only the
 /// character content of each cell is captured - see the module doc comment for why styles
 /// are deliberately left out.
-fn render(app: &App, width: u16, height: u16) -> String {
+fn render(app: &mut App, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend::new never fails to initialize");
     terminal
@@ -213,7 +213,7 @@ fn charging_dashboard_app() -> App {
 
 #[test]
 fn picker() {
-    let app = App::new(vec![
+    let mut app = App::new(vec![
         charger_entry(
             "CP001",
             OcppVersion::V16J,
@@ -246,7 +246,7 @@ fn picker() {
         ),
     ]);
 
-    assert_snapshot("picker", &render(&app, 120, 34));
+    assert_snapshot("picker", &render(&mut app, 120, 34));
 }
 
 /// A charger loaded from a YAML file (its `Source` column names the file, not "built-in") with
@@ -292,7 +292,7 @@ fn picker_with_configured_charger_and_last_endpoint() {
 
     assert_snapshot(
         "picker_with_configured_charger_and_last_endpoint",
-        &render(&app, 120, 34),
+        &render(&mut app, 120, 34),
     );
 }
 
@@ -326,7 +326,7 @@ fn picker_filtered() {
     ]);
     app.picker_filter = TextField::new("cp0");
 
-    assert_snapshot("picker_filtered", &render(&app, 120, 34));
+    assert_snapshot("picker_filtered", &render(&mut app, 120, 34));
 }
 
 #[test]
@@ -341,7 +341,7 @@ fn picker_no_matches() {
     )]);
     app.picker_filter = TextField::new("zzz");
 
-    assert_snapshot("picker_no_matches", &render(&app, 120, 34));
+    assert_snapshot("picker_no_matches", &render(&mut app, 120, 34));
 }
 
 #[test]
@@ -361,16 +361,16 @@ fn dashboard_idle() {
         ],
         false,
     );
-    let app = dashboard_app(config);
+    let mut app = dashboard_app(config);
 
-    assert_snapshot("dashboard_idle", &render(&app, 120, 34));
+    assert_snapshot("dashboard_idle", &render(&mut app, 120, 34));
 }
 
 #[test]
 fn dashboard_charging() {
-    let app = charging_dashboard_app();
+    let mut app = charging_dashboard_app();
 
-    assert_snapshot("dashboard_charging", &render(&app, 120, 34));
+    assert_snapshot("dashboard_charging", &render(&mut app, 120, 34));
 }
 
 /// The log filter prompt open over the dashboard, with the filter already narrowing the pane
@@ -383,7 +383,7 @@ fn dashboard_log_filter_prompt() {
         app.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     }
 
-    assert_snapshot("dashboard_log_filter_prompt", &render(&app, 120, 34));
+    assert_snapshot("dashboard_log_filter_prompt", &render(&mut app, 120, 34));
 }
 
 /// A raised level threshold and a scrolled-up (paused) log pane: both states are only legible
@@ -400,7 +400,7 @@ fn dashboard_log_level_threshold_and_paused() {
 
     assert_snapshot(
         "dashboard_log_level_threshold_and_paused",
-        &render(&app, 120, 34),
+        &render(&mut app, 120, 34),
     );
 }
 
@@ -419,7 +419,7 @@ fn dashboard_with_display() {
     let state = app.charger_state.as_mut().unwrap();
     Command::SetDisplayMessage.apply_to_charger(state, "Welcome to Flowion");
 
-    assert_snapshot("dashboard_with_display", &render(&app, 120, 34));
+    assert_snapshot("dashboard_with_display", &render(&mut app, 120, 34));
 }
 
 #[test]
@@ -437,7 +437,7 @@ fn dashboard_faulted() {
     let state = app.charger_state.as_mut().unwrap();
     Command::ReportFault.apply(&mut state.evses[0], "OverCurrentFailure");
 
-    assert_snapshot("dashboard_faulted", &render(&app, 120, 34));
+    assert_snapshot("dashboard_faulted", &render(&mut app, 120, 34));
 }
 
 #[test]
@@ -446,7 +446,7 @@ fn command_palette() {
     app.command_palette_open = true;
     app.command_palette_selected = 0;
 
-    assert_snapshot("command_palette", &render(&app, 120, 34));
+    assert_snapshot("command_palette", &render(&mut app, 120, 34));
 }
 
 #[test]
@@ -455,7 +455,7 @@ fn command_palette_filtered() {
     app.command_palette_open = true;
     app.command_palette_filter = TextField::new("unplug");
 
-    assert_snapshot("command_palette_filtered", &render(&app, 120, 34));
+    assert_snapshot("command_palette_filtered", &render(&mut app, 120, 34));
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn parameter_prompt() {
     app.parameter_prompt = Some(Command::PlugInVehicle);
     app.parameter_field = TextField::new("MY-EV-1");
 
-    assert_snapshot("parameter_prompt", &render(&app, 120, 34));
+    assert_snapshot("parameter_prompt", &render(&mut app, 120, 34));
 }
 
 /// The prompt showing its placeholder (empty field) and an inline validation error, the two
@@ -494,7 +494,10 @@ fn parameter_prompt_blank_with_error() {
     app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // opens the prompt
     app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // rejected as blank
 
-    assert_snapshot("parameter_prompt_blank_with_error", &render(&app, 120, 34));
+    assert_snapshot(
+        "parameter_prompt_blank_with_error",
+        &render(&mut app, 120, 34),
+    );
 }
 
 #[test]
@@ -511,7 +514,7 @@ fn help_overlay() {
     let mut app = dashboard_app(config);
     app.help_open = true;
 
-    assert_snapshot("help_overlay", &render(&app, 120, 34));
+    assert_snapshot("help_overlay", &render(&mut app, 120, 34));
 }
 
 #[test]
@@ -528,7 +531,7 @@ fn quit_confirm() {
     let mut app = dashboard_app(config);
     app.quit_confirm_open = true;
 
-    assert_snapshot("quit_confirm", &render(&app, 120, 34));
+    assert_snapshot("quit_confirm", &render(&mut app, 120, 34));
 }
 
 /// An `App` on the connection setup screen for a real V2.1 charger (`charger_state` set, not
@@ -557,9 +560,9 @@ fn connection_setup_app() -> App {
 
 #[test]
 fn connection_setup() {
-    let app = connection_setup_app();
+    let mut app = connection_setup_app();
 
-    assert_snapshot("connection_setup", &render(&app, 120, 34));
+    assert_snapshot("connection_setup", &render(&mut app, 120, 34));
 }
 
 /// The inline error `App::confirm_connection_setup` shows for a scheme that isn't
@@ -570,7 +573,10 @@ fn connection_setup_invalid_url_error() {
     app.connection_csms_url = TextField::new("https://csms.example.com");
     app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert_snapshot("connection_setup_invalid_url_error", &render(&app, 120, 34));
+    assert_snapshot(
+        "connection_setup_invalid_url_error",
+        &render(&mut app, 120, 34),
+    );
 }
 
 /// Recent URLs from other chargers' remembered profiles, listed under the CSMS URL field.
@@ -599,7 +605,10 @@ fn connection_setup_url_suggestions() {
         },
     );
 
-    assert_snapshot("connection_setup_url_suggestions", &render(&app, 120, 34));
+    assert_snapshot(
+        "connection_setup_url_suggestions",
+        &render(&mut app, 120, 34),
+    );
 }
 
 /// `Ctrl+R` showing the password field's raw value instead of `*`s.
@@ -608,14 +617,17 @@ fn connection_setup_password_revealed() {
     let mut app = connection_setup_app();
     app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
 
-    assert_snapshot("connection_setup_password_revealed", &render(&app, 120, 34));
+    assert_snapshot(
+        "connection_setup_password_revealed",
+        &render(&mut app, 120, 34),
+    );
 }
 
 #[test]
 fn dashboard_narrow() {
-    let app = charging_dashboard_app();
+    let mut app = charging_dashboard_app();
 
-    assert_snapshot("dashboard_narrow", &render(&app, 80, 24));
+    assert_snapshot("dashboard_narrow", &render(&mut app, 80, 24));
 }
 
 /// A charger with two EVSEs whose connectors are all in different states at once: EVSE 1's
@@ -650,9 +662,12 @@ fn multi_evse_mixed_status_app() -> App {
 
 #[test]
 fn dashboard_multi_evse_mixed_status() {
-    let app = multi_evse_mixed_status_app();
+    let mut app = multi_evse_mixed_status_app();
 
-    assert_snapshot("dashboard_multi_evse_mixed_status", &render(&app, 120, 34));
+    assert_snapshot(
+        "dashboard_multi_evse_mixed_status",
+        &render(&mut app, 120, 34),
+    );
 }
 
 /// Focus on a connector belonging to the *second* EVSE - the sidebar must track it there, not
@@ -665,7 +680,7 @@ fn dashboard_focus_second_evse() {
         connector: 0,
     };
 
-    assert_snapshot("dashboard_focus_second_evse", &render(&app, 120, 34));
+    assert_snapshot("dashboard_focus_second_evse", &render(&mut app, 120, 34));
 }
 
 /// The same mixed-status, multi-EVSE charger as [`dashboard_multi_evse_mixed_status`], but at
@@ -674,9 +689,9 @@ fn dashboard_focus_second_evse() {
 /// must still be visible without anything running off the right edge.
 #[test]
 fn dashboard_narrow_multi_evse() {
-    let app = multi_evse_mixed_status_app();
+    let mut app = multi_evse_mixed_status_app();
 
-    assert_snapshot("dashboard_narrow_multi_evse", &render(&app, 80, 24));
+    assert_snapshot("dashboard_narrow_multi_evse", &render(&mut app, 80, 24));
 }
 
 /// The header's `Local` case: "local simulation" in place of a CSMS URL. Every other
@@ -694,9 +709,9 @@ fn dashboard_header_local() {
         }],
         false,
     );
-    let app = dashboard_app(config);
+    let mut app = dashboard_app(config);
 
-    assert_snapshot("dashboard_header_local", &render(&app, 120, 34));
+    assert_snapshot("dashboard_header_local", &render(&mut app, 120, 34));
 }
 
 /// The header's `LiveCsms` case: the CSMS URL takes the mode segment's place. This is the
@@ -718,7 +733,7 @@ fn dashboard_header_live_csms() {
         url: "wss://csms.example.com/CP-LIVE".to_string(),
     };
 
-    assert_snapshot("dashboard_header_live_csms", &render(&app, 120, 34));
+    assert_snapshot("dashboard_header_live_csms", &render(&mut app, 120, 34));
 }
 
 /// A connection attempt still in flight (`connect_result_receiver` is `Some`): the header
@@ -748,12 +763,12 @@ fn dashboard_header_connecting() {
     let (_result_sender, result_receiver) = tokio::sync::oneshot::channel();
     app.connect_result_receiver = Some(result_receiver);
 
-    assert_snapshot("dashboard_header_connecting", &render(&app, 120, 34));
+    assert_snapshot("dashboard_header_connecting", &render(&mut app, 120, 34));
 }
 
 #[test]
 fn terminal_too_small() {
-    let app = App::new(vec![]);
+    let mut app = App::new(vec![]);
 
-    assert_snapshot("terminal_too_small", &render(&app, 50, 10));
+    assert_snapshot("terminal_too_small", &render(&mut app, 50, 10));
 }

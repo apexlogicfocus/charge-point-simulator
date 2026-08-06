@@ -1,7 +1,7 @@
 mod connection_setup;
-mod dashboard;
+pub(crate) mod dashboard;
 mod overlays;
-mod palette;
+pub(crate) mod palette;
 mod picker;
 mod view;
 

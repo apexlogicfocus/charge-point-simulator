@@ -59,10 +59,25 @@ The guiding principles, which every remaining phase should be checked against:
   the overlay's line count past what fits at 120x34 uncompressed — `render_help` now reserves a
   one-row margin top and bottom so a full-height popup doesn't sit flush against (and visually
   merge with) the header and command bar; past that it's the existing scrollbar.
+- **Phase 7 (mouse support)** — `main.rs` enables crossterm mouse capture around `ratatui::init`/
+  `restore` (not `ratatui::run`, which offers no hook for it), disabling it again on both the
+  normal exit path and the panic path by re-chaining `ratatui::try_init`'s own panic hook.
+  `App::handle_mouse_event` hit-tests clicks/wheel events against `App::last_frame_area`, the
+  size `App::draw` stashes from the last real frame, rather than re-querying the terminal (which
+  has no size to query in tests). Clicking a connector row in the EVSE tree focuses it, via a new
+  `dashboard::tree_line_to_connector` (the reverse of the existing `tree_focus_line_index`) and
+  `dashboard::content_row_at`, both pure `Rect`/line-index math, unit-tested without a terminal.
+  The mouse wheel scrolls the log pane when the cursor is over it, reusing the Phase 4
+  `LogBuffer::scroll_up`/`scroll_down` (so it pauses/resumes exactly like `PageUp`/`PageDown`
+  already did). Clicking a command palette row moves the selection to it — the same as `↑`/`↓` —
+  without dispatching; `Enter` is still what runs a command, so a misclick on a state-mutating
+  command can't fire it. `palette.rs` gained `palette_popup_rect`/`palette_list_area`/
+  `command_index_at`, factored out of `render_command_palette`'s inline layout so rendering and
+  hit-testing can never disagree about where a row is. Pure refactor for rendering: every golden
+  is byte-identical.
 
 ## Phase 7 — polish
 
-- Mouse support: click to focus a connector, wheel-scroll the log, click palette rows.
 - Scrollbars on the tree and log panes; `Ctrl+L` to clear logs; copy the focused log line.
 - A heartbeat pulse in the header, so "alive but idle" is distinguishable from "hung".
 - **Fix the command bar hint truncation.** At 80 columns the hint is cut mid-word, losing "help"

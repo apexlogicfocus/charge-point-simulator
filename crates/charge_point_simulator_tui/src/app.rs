@@ -7,7 +7,11 @@ use charge_point_simulator_core::charger::{
     apply_ocpp_state, build_ocpp_event_for_connector, connect_charger, meter_sample_events,
 };
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -135,6 +139,11 @@ pub struct App {
     /// When a `MeterValueSampled` event was last sent to a connected CSMS, throttling
     /// against [`METER_VALUE_INTERVAL`].
     pub last_meter_value_sent: Option<Instant>,
+    /// The terminal area the last frame was drawn into, stashed by [`Self::draw`] so
+    /// [`Self::handle_mouse_event`] can hit-test clicks against the exact layout that frame
+    /// used, without an extra `crossterm::terminal::size()` call (and the "no real terminal in
+    /// tests" problem that would bring).
+    pub last_frame_area: Rect,
     pub exit: bool,
 }
 
@@ -172,6 +181,12 @@ fn validate_csms_url(value: &str) -> Option<&'static str> {
     Some("must start with ws:// or wss://")
 }
 
+/// Whether `(col, row)` falls within `area` - used to gate log pane wheel-scrolling on the
+/// mouse actually being over the log pane, rather than scrolling it from anywhere on screen.
+fn rect_contains(area: Rect, col: u16, row: u16) -> bool {
+    area.contains(ratatui::layout::Position::new(col, row))
+}
+
 fn resolve_simulation_mode(csms_url: &str) -> SimulationMode {
     if csms_url.trim().is_empty() {
         SimulationMode::Local
@@ -207,7 +222,12 @@ impl App {
         Ok(())
     }
 
-    pub(crate) fn draw(&self, frame: &mut Frame) {
+    pub(crate) fn draw(&mut self, frame: &mut Frame) {
+        // Stashed so `handle_mouse_event` can hit-test against the same layout this frame was
+        // actually drawn with, instead of re-querying the terminal's current size - which would
+        // both add an extra syscall per click and, in tests, have no real terminal to query at
+        // all (see `handle_mouse_event`'s tests, which set this field directly).
+        self.last_frame_area = frame.area();
         crate::ui::draw(frame, self);
     }
 
@@ -262,6 +282,18 @@ impl App {
             Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
                 self.handle_key_event(key_event)
             }
+            // Only the mouse events this app actually acts on are forwarded - in particular
+            // not `MouseEventKind::Moved`/`Drag`, which fire continuously while mouse capture
+            // is on (see `main.rs`) and would otherwise force a redraw on every pixel of mouse
+            // movement for no visible effect.
+            Event::Mouse(mouse_event)
+                if matches!(
+                    mouse_event.kind,
+                    MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                self.handle_mouse_event(mouse_event)
+            }
             _ => {}
         };
         Ok(())
@@ -315,6 +347,119 @@ impl App {
             Screen::PickCharger => self.handle_pick_charger_key(key_event),
             Screen::ConnectionSetup => self.handle_connection_setup_key(key_event),
             Screen::Dashboard => self.handle_dashboard_key(key_event),
+        }
+    }
+
+    /// `pub(crate)` for the same reason as [`Self::handle_key_event`]: tests drive it directly.
+    ///
+    /// Follows the same modal-then-screen gating `handle_key_event` uses, but narrower: the
+    /// modals mouse support was actually asked for (Phase 7: tree focus, log wheel-scroll,
+    /// palette row clicks) are the command palette and the dashboard, so every other modal
+    /// (quit confirm, the parameter prompt, help, the log filter prompt) simply ignores mouse
+    /// input for now rather than guessing what a click there should do.
+    pub(crate) fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
+        if self.quit_confirm_open
+            || self.parameter_prompt.is_some()
+            || self.help_open
+            || self.log_filter_open
+        {
+            return;
+        }
+        if self.command_palette_open {
+            self.handle_command_palette_mouse(mouse_event);
+            return;
+        }
+        if self.screen == Screen::Dashboard {
+            self.handle_dashboard_mouse(mouse_event);
+        }
+    }
+
+    /// Click-to-focus on the EVSE/connector tree, and wheel-scroll on the log pane - both
+    /// hit-tested against the same layout `crate::ui::dashboard::render` computes from the
+    /// current terminal size, since neither `App` nor the render path stashes the rects a frame
+    /// last used (see the roadmap's "the view model is thin" note for why: everything here is
+    /// recomputed fresh, the same way a redraw is).
+    fn handle_dashboard_mouse(&mut self, mouse_event: MouseEvent) {
+        use crate::ui::dashboard;
+
+        let area = self.last_frame_area;
+        if dashboard::is_terminal_too_small(area) {
+            return;
+        }
+        let layout = dashboard::dashboard_layout(area);
+
+        match mouse_event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let has_display = self
+                    .charger_state
+                    .as_ref()
+                    .is_some_and(|state| state.config.has_display);
+                let body = dashboard::body_layout(layout.body, has_display);
+                self.handle_tree_click(body.tree, body.sidebar.is_none(), mouse_event);
+            }
+            MouseEventKind::ScrollUp
+                if rect_contains(layout.log, mouse_event.column, mouse_event.row) =>
+            {
+                self.logs.scroll_up();
+            }
+            MouseEventKind::ScrollDown
+                if rect_contains(layout.log, mouse_event.column, mouse_event.row) =>
+            {
+                self.logs.scroll_down();
+            }
+            _ => {}
+        }
+    }
+
+    /// Focuses the connector, if any, that `mouse_event` landed on within the tree's `tree_area`,
+    /// via the reverse of `dashboard::tree_focus_line_index`:
+    /// [`dashboard::tree_line_to_connector`](crate::ui::dashboard::tree_line_to_connector).
+    /// Clicking an EVSE summary row, a "no connectors"/inline-detail filler line, or outside the
+    /// tree entirely does nothing - there's no connector there to focus.
+    fn handle_tree_click(&mut self, tree_area: Rect, inline_detail: bool, mouse_event: MouseEvent) {
+        use crate::ui::dashboard;
+
+        let Some(state) = &self.charger_state else {
+            return;
+        };
+        let Some(content_row) =
+            dashboard::content_row_at(tree_area, mouse_event.column, mouse_event.row)
+        else {
+            return;
+        };
+        let tree_height = tree_area.height.saturating_sub(1) as usize;
+        let offset =
+            dashboard::tree_scroll_offset_for(state, self.focused, inline_detail, tree_height);
+        let line_index = content_row + offset;
+
+        if let Some((evse, connector)) =
+            dashboard::tree_line_to_connector(state, self.focused, inline_detail, line_index)
+        {
+            self.focused = FocusedConnector { evse, connector };
+        }
+    }
+
+    /// Clicking a command palette row selects it, the same as arrow-keying to it - it does
+    /// *not* dispatch immediately. Consistent with `↑`/`↓` (which only move the selection;
+    /// `Enter` is what actually runs a command) and deliberately safer than click-to-activate:
+    /// several palette commands mutate simulated state (plug in a vehicle, report a fault), and
+    /// a misclick shouldn't be able to fire one with no chance to see the target line first.
+    fn handle_command_palette_mouse(&mut self, mouse_event: MouseEvent) {
+        if !matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        let area = self.last_frame_area;
+        let commands = self.palette_commands();
+        let popup = crate::ui::palette::palette_popup_rect(area, commands.len());
+        let list_area = crate::ui::palette::palette_list_area(popup);
+
+        if let Some(index) = crate::ui::palette::command_index_at(
+            list_area,
+            mouse_event.column,
+            mouse_event.row,
+            commands.len(),
+        ) {
+            self.command_palette_selected = index;
         }
     }
 
@@ -3021,5 +3166,163 @@ mod tests {
         assert!(app.ocpp_state_receiver.is_none());
         assert!(app.ocpp_event_sender.is_none());
         assert!(app.live_ocpp_state.is_none());
+    }
+
+    // --- mouse support (Phase 7) ----------------------------------------------------------
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    /// A dashboard app with a charger with two EVSEs (2 connectors, then 1), on a wide-enough
+    /// `last_frame_area` for the sidebar to appear - matching `handle_mouse_event`'s assumption
+    /// that it's always hit-testing against the layout the last real frame used.
+    fn app_with_tree(width: u16, height: u16) -> App {
+        let mut app = App::new(vec![charger_with_evses(
+            "CP001",
+            vec![
+                EvseConfig {
+                    id: 1,
+                    connectors: 2,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
+            ],
+        )]);
+        app.confirm_charger_selection();
+        app.last_frame_area = Rect::new(0, 0, width, height);
+        app
+    }
+
+    #[test]
+    fn clicking_a_connector_row_in_the_tree_focuses_it() {
+        let mut app = app_with_tree(120, 40);
+        // header (2) + tree section's top rule (1): EVSE 1 summary is the tree's first content
+        // row, connector 2 (evse 0, connector 1) is the row right after it.
+        let tree_top = crate::ui::dashboard::dashboard_layout(app.last_frame_area)
+            .body
+            .y;
+        let click_row = tree_top + 1 /* section top rule */ + 2 /* EVSE summary, C1 */;
+
+        app.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 5, click_row));
+
+        assert_eq!(
+            app.focused,
+            FocusedConnector {
+                evse: 0,
+                connector: 1
+            }
+        );
+    }
+
+    #[test]
+    fn clicking_an_evse_summary_row_does_not_change_focus() {
+        let mut app = app_with_tree(120, 40);
+        app.focused = FocusedConnector {
+            evse: 0,
+            connector: 1,
+        };
+        let tree_top = crate::ui::dashboard::dashboard_layout(app.last_frame_area)
+            .body
+            .y;
+        let click_row = tree_top + 1; // the EVSE 1 summary row itself
+
+        app.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 5, click_row));
+
+        assert_eq!(
+            app.focused,
+            FocusedConnector {
+                evse: 0,
+                connector: 1
+            }
+        );
+    }
+
+    #[test]
+    fn clicking_outside_the_tree_does_nothing() {
+        let mut app = app_with_tree(120, 40);
+        let original = app.focused;
+
+        app.handle_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+
+        assert_eq!(app.focused, original);
+    }
+
+    #[test]
+    fn scrolling_the_wheel_over_the_log_pane_pauses_and_moves_the_view() {
+        let mut app = app_with_logs(20);
+        app.last_frame_area = Rect::new(0, 0, 120, 40);
+        let log_area = crate::ui::dashboard::dashboard_layout(app.last_frame_area).log;
+
+        assert!(!app.logs.is_paused());
+        app.handle_mouse_event(mouse(MouseEventKind::ScrollUp, 5, log_area.y + 1));
+        assert!(app.logs.is_paused());
+        let offset_after_up = app.logs.scroll_offset();
+        assert!(offset_after_up > 0);
+
+        app.handle_mouse_event(mouse(MouseEventKind::ScrollDown, 5, log_area.y + 1));
+        assert_eq!(app.logs.scroll_offset(), offset_after_up - 1);
+    }
+
+    #[test]
+    fn scrolling_the_wheel_outside_the_log_pane_does_not_scroll_it() {
+        let mut app = app_with_logs(20);
+        app.last_frame_area = Rect::new(0, 0, 120, 40);
+
+        app.handle_mouse_event(mouse(MouseEventKind::ScrollUp, 5, 0));
+
+        assert!(!app.logs.is_paused());
+    }
+
+    #[test]
+    fn clicking_a_palette_row_selects_it_without_dispatching() {
+        let mut app = app_with_logs(0);
+        app.last_frame_area = Rect::new(0, 0, 120, 40);
+        app.open_command_palette();
+        let commands = app.palette_commands();
+        assert!(
+            commands.len() >= 2,
+            "need at least two commands to click the second one: {commands:?}"
+        );
+
+        let popup = crate::ui::palette::palette_popup_rect(app.last_frame_area, commands.len());
+        let list_area = crate::ui::palette::palette_list_area(popup);
+        let second_row = (list_area.x + 1, list_area.y + 2);
+
+        app.handle_mouse_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second_row.0,
+            second_row.1,
+        ));
+
+        assert_eq!(app.command_palette_selected, 1);
+        // Still open - a click only moves the selection, the same as ↑/↓; Enter is what
+        // actually dispatches (see `handle_command_palette_mouse`'s doc comment).
+        assert!(app.command_palette_open);
+    }
+
+    #[test]
+    fn mouse_events_are_ignored_while_the_quit_confirm_is_open() {
+        let mut app = app_with_tree(120, 40);
+        app.quit_confirm_open = true;
+        let original = app.focused;
+
+        let tree_top = crate::ui::dashboard::dashboard_layout(app.last_frame_area)
+            .body
+            .y;
+        app.handle_mouse_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            5,
+            tree_top + 1 + 2,
+        ));
+
+        assert_eq!(app.focused, original);
     }
 }
