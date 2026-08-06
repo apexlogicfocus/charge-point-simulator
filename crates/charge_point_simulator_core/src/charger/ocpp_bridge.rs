@@ -117,35 +117,14 @@ pub fn command_to_connector_event(
     }
 }
 
-/// Finds the first connector in `evse_id`'s live OCPP state eligible for `command` (mirroring
-/// [`Command::apply`]'s "first eligible connector" rule) and builds the full event to send to
-/// the runtime. Returns `None` if `evse_id` doesn't exist or no connector is eligible yet (e.g.
-/// the connector hasn't finished a hardware handshake the coarse local status already shows as
-/// done - a real connector reports "occupied" for `Connected` through `Unlocking` alike, so a
-/// command needing a more specific fine-grained state can briefly appear available before it
-/// actually is).
-///
-/// This is [`build_ocpp_event_for_connector`] aimed at whichever connector comes first; callers
-/// that already know which connector they mean should call that directly instead of relying on
-/// this "first eligible" search picking the right one.
-pub fn build_ocpp_event(
-    ocpp_state: &ChargePointState,
-    evse_id: usize,
-    command: Command,
-    input: &str,
-) -> Option<ChargePointEvent> {
-    let evse = ocpp_state.evses.get(evse_id)?;
-    (0..evse.connectors.len()).find_map(|connector_id| {
-        build_ocpp_event_for_connector(ocpp_state, evse_id, connector_id, command, input)
-    })
-}
-
 /// Builds the full event to send to the runtime for dispatching `command` against one specific
 /// connector (`evse_id`/`connector_id`) in `ocpp_state`, mirroring [`Command::apply_to`]'s
 /// single-connector semantics against the protocol's actual, more fine-grained connector
 /// lifecycle. Returns `None` if `evse_id`/`connector_id` doesn't exist or that connector isn't
-/// eligible for `command` yet - see [`build_ocpp_event`]'s doc comment for why a connector that
-/// looks eligible at the simulator's coarse status can briefly not be, underneath.
+/// eligible for `command` yet - e.g. the connector hasn't finished a hardware handshake the
+/// coarse local status already shows as done. A real connector reports "occupied" for
+/// `Connected` through `Unlocking` alike, so a command needing a more specific fine-grained
+/// state can briefly appear available before it actually is.
 pub fn build_ocpp_event_for_connector(
     ocpp_state: &ChargePointState,
     evse_id: usize,
@@ -477,42 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn build_ocpp_event_targets_the_first_eligible_connector() {
-        let ocpp = ocpp_state_with(vec![
-            OcppConnectorState::Locked,
-            OcppConnectorState::Available,
-        ]);
-
-        let event = build_ocpp_event(&ocpp, 0, Command::PlugInVehicle, "").unwrap();
-
-        assert_eq!(
-            event,
-            ChargePointEvent::Evse {
-                evse_id: 0,
-                event: EvseEvent::Connector {
-                    connector_id: 1,
-                    event: ConnectorEvent::CableConnected,
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn build_ocpp_event_returns_none_when_no_connector_is_eligible() {
-        let ocpp = ocpp_state_with(vec![
-            OcppConnectorState::Locked,
-            OcppConnectorState::Charging,
-        ]);
-        assert_eq!(build_ocpp_event(&ocpp, 0, Command::PlugInVehicle, ""), None);
-    }
-
-    #[test]
-    fn build_ocpp_event_returns_none_for_an_unknown_evse_id() {
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Available]);
-        assert_eq!(build_ocpp_event(&ocpp, 5, Command::PlugInVehicle, ""), None);
-    }
-
-    #[test]
     fn build_ocpp_event_for_connector_targets_the_given_connector_even_when_an_earlier_one_would_also_be_eligible()
      {
         let ocpp = ocpp_state_with(vec![
@@ -558,19 +501,6 @@ mod tests {
             build_ocpp_event_for_connector(&ocpp, 0, 5, Command::PlugInVehicle, ""),
             None
         );
-    }
-
-    #[test]
-    fn build_ocpp_event_and_build_ocpp_event_for_connector_agree_on_the_first_eligible_connector() {
-        let ocpp = ocpp_state_with(vec![
-            OcppConnectorState::Locked,
-            OcppConnectorState::Available,
-        ]);
-
-        let via_first_eligible = build_ocpp_event(&ocpp, 0, Command::PlugInVehicle, "");
-        let via_targeted = build_ocpp_event_for_connector(&ocpp, 0, 1, Command::PlugInVehicle, "");
-
-        assert_eq!(via_first_eligible, via_targeted);
     }
 
     #[test]

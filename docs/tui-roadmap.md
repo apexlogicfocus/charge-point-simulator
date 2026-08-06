@@ -98,24 +98,33 @@ The guiding principles, which every remaining phase should be checked against:
 ## Phase 7 — polish
 
 All four items have landed; see the Done section above. Nothing is scheduled after this — the
-next move is one of the open decisions below, or the unscheduled gaps after them.
+open decisions below are all settled, so the next move is one of the unscheduled gaps after them,
+or the REST API crate that `CLAUDE.md` describes as planned.
 
-## Open decisions
+## Settled decisions
 
-These need a human call and are deliberately not settled:
+All four former open decisions have had their human call:
 
-1. **EVSE summary status priority.** An EVSE row shows one status, but core models status only
-   per connector. It is currently derived as
-   `faulted > charging > occupied > reserved > unavailable > available`. Whether `reserved` should
-   outrank `occupied` is a domain judgement.
-2. **Power sparkline ownership.** A sparkline needs rolling metrics history. Belongs in core
-   (where a future REST API could also consume it) or TUI-side as pure presentation?
-3. **Deprecating the first-eligible command API.** `Command::apply`/`is_available` and
-   `build_ocpp_event` are still `pub` and tested, but nothing calls them now that the TUI targets
-   a specific connector. Keep as library surface, or remove?
-4. **Charging behavior at 100% SoC.** A full vehicle keeps drawing full simulated power
-   indefinitely. Tapering or stopping is charging-strategy behavior and belongs with the planned
-   scenario work, not the meter tick.
+1. **EVSE summary status priority** — `occupied` outranks `reserved`. A car physically present is
+   the more actionable fact than a booking against a connector that may still be empty. The
+   existing `faulted > charging > occupied > reserved > unavailable > available` order in
+   `dashboard.rs::evse_summary_status` already matched, so nothing changed but the doc comment,
+   which now says this is deliberate.
+2. **Power sparkline ownership** — rolling metrics history belongs in `core`, not the TUI. A
+   sparkline is then pure presentation over data the planned REST API can serve too. Not yet
+   implemented; when it is, the history lives beside `EvseMetrics` and is driven by
+   `EvseState::tick`'s existing injected `elapsed`, never a wall clock.
+3. **Deprecating the first-eligible command API** — removed. `Command::apply`/`Command::is_available`
+   and `ocpp_bridge::build_ocpp_event` are gone, along with `build_ocpp_event`'s re-export from
+   `charger/mod.rs`. Every caller already targeted a specific connector; keeping a second
+   "whichever connector comes first" entry point was an invitation to act on a connector the user
+   isn't looking at. The tests that covered them were rewritten against
+   `is_available_for_connector`/`apply_to` rather than deleted, so per-command eligibility and
+   mutation coverage is unchanged; the two tests that only asserted the two APIs agreed with each
+   other were dropped. Goldens are byte-identical.
+4. **Charging behavior at 100% SoC** — accepted as-is for now. A full vehicle continuing to draw
+   simulated power is a known inaccuracy, deliberately left to the planned advanced vehicle
+   capabilities (tapering, V2G, charging strategies) rather than patched into the meter tick.
 
 ## Known gaps not yet scheduled
 

@@ -17,9 +17,7 @@ pub use connect::{connect_charger, websocket_url};
 pub use connection::{ConnectionProfile, PasswordTooLong, SecurityProfile};
 pub use connection_store::ConnectionStore;
 pub use hardware::{FakeChargePoint, FakeConnector, FakeEvse};
-pub use ocpp_bridge::{
-    apply_ocpp_state, build_ocpp_event, build_ocpp_event_for_connector, meter_sample_events,
-};
+pub use ocpp_bridge::{apply_ocpp_state, build_ocpp_event_for_connector, meter_sample_events};
 pub use ocpp_charge_point::state::{ChargePointEvent, ChargePointState};
 pub use ocpp_charge_point::{ChargePointRuntime, ConnectAndSetupError};
 pub use state::{

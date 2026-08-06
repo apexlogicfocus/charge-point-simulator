@@ -171,8 +171,8 @@ fn charging_dashboard_app() -> App {
     );
     let mut app = dashboard_app(config);
     let state = app.charger_state.as_mut().unwrap();
-    Command::PlugInVehicle.apply(&mut state.evses[0], "MY-EV-1");
-    Command::PresentRfid.apply(&mut state.evses[0], "TAG-42");
+    Command::PlugInVehicle.apply_to(&mut state.evses[0], 0, "MY-EV-1");
+    Command::PresentRfid.apply_to(&mut state.evses[0], 0, "TAG-42");
     // A fixed, non-wall-clock elapsed time - this mirrors what `App::tick_metrics_with` does to
     // `charger_state` (`state.tick(elapsed)`); `tick_metrics_with` itself is private to the
     // `app` module and out of reach from here, but the rest of what it does
@@ -435,7 +435,7 @@ fn dashboard_faulted() {
     );
     let mut app = dashboard_app(config);
     let state = app.charger_state.as_mut().unwrap();
-    Command::ReportFault.apply(&mut state.evses[0], "OverCurrentFailure");
+    Command::ReportFault.apply_to(&mut state.evses[0], 0, "OverCurrentFailure");
 
     assert_snapshot("dashboard_faulted", &render(&mut app, 120, 34));
 }
