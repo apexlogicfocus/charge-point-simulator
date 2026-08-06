@@ -1,5 +1,7 @@
 mod screen;
 mod app;
+mod fuzzy;
+mod keybindings;
 mod logs;
 #[cfg(test)]
 mod snapshot;

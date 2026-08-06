@@ -47,7 +47,7 @@ impl<'a> DashboardView<'a> {
             status_message: app
                 .status_message
                 .as_ref()
-                .map(|(severity, message)| (*severity, message.as_str())),
+                .map(|toast| (toast.severity, toast.message.as_str())),
         }
     }
 }
@@ -62,11 +62,16 @@ pub struct PaletteView<'a> {
     pub cursor: usize,
     pub commands: Vec<Command>,
     pub selected: usize,
+    /// The connector every listed command would act on, e.g. `"EVSE 1 / C1"`, so the
+    /// consequence of pressing Enter is visible before it's pressed. `None` when the focus
+    /// doesn't resolve to a real connector.
+    pub target: Option<String>,
 }
 
 impl<'a> PaletteView<'a> {
     pub fn from_app(app: &'a App) -> Self {
         Self {
+            target: app.focused_connector_label(),
             filter: app.command_palette_filter.value(),
             cursor: app.command_palette_filter.cursor(),
             commands: app.palette_commands(),
@@ -80,6 +85,12 @@ pub struct ParameterPromptView<'a> {
     pub command: Command,
     pub value: &'a str,
     pub cursor: usize,
+    /// Why the current value was rejected, rendered under the field - see
+    /// `App::parameter_error`.
+    pub error: Option<&'static str>,
+    /// The connector the command will act on, mirrored from the palette so the prompt doesn't
+    /// lose the context the palette had.
+    pub target: Option<String>,
 }
 
 impl<'a> ParameterPromptView<'a> {
@@ -88,6 +99,8 @@ impl<'a> ParameterPromptView<'a> {
             command,
             value: app.parameter_field.value(),
             cursor: app.parameter_field.cursor(),
+            error: app.parameter_error,
+            target: app.focused_connector_label(),
         }
     }
 }
@@ -166,7 +179,7 @@ mod tests {
     #[test]
     fn dashboard_view_carries_the_status_message() {
         let mut app = app_with_charger();
-        app.status_message = Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string()));
+        app.set_status(StatusSeverity::Ok, "✓ Plug in vehicle".to_string());
 
         let view = DashboardView::from_app(&app);
 

@@ -32,7 +32,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
     }
 
     if app.help_open {
-        overlays::render_help(frame);
+        overlays::render_help(frame, app.help_scroll);
     }
     if app.quit_confirm_open {
         overlays::render_quit_confirm(frame);

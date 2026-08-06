@@ -1,6 +1,6 @@
 # TUI redesign roadmap
 
-A staged plan for making the dashboard legible and modern. Phases 0–4 have landed on
+A staged plan for making the dashboard legible and modern. Phases 0–5 have landed on
 `tui-redesign-phase-0-1`; what follows them is described here in enough detail to pick up cold.
 
 The guiding principles, which every remaining phase should be checked against:
@@ -34,22 +34,14 @@ The guiding principles, which every remaining phase should be checked against:
   bindings to the bottom of a popup that was clipping its own last three lines, so they would
   have been documented somewhere the user could never see. `render_help` now sizes to its
   content. The rest of Phase 5 is untouched.
-
-## Phase 5 — command palette, feedback, and help
-
-- Rebind the palette to `Ctrl+K`, keeping `c` as an alias. Fuzzy subsequence matching rather than
-  the current plain substring match on the label, plus per-command descriptions.
-- Show the resolved target connector in each palette row before the command is committed, and
-  allow retargeting from inside the palette.
-- Parameter prompt: label, placeholder, per-parameter history (last vehicle id, last RFID tag),
-  and inline validation.
-- **Toasts must expire.** `status_message` currently persists indefinitely, permanently hiding the
-  keybinding hint line. Give it a timestamp and clear it after a few seconds. Use an injectable
-  clock, following the pattern already established by `tick_metrics_with`.
-- ~~Fix the help overlay's sizing~~ — done in Phase 4, which needed it to document its own new
-  bindings. Still outstanding: making the overlay *scrollable*, for a terminal too short to fit
-  the content even at its natural size.
-- Derive the help text from a single keybinding table, so help cannot drift from behavior again.
+- **Phase 5** — `Ctrl+K` opens the palette (`c` kept as an alias), matched by fuzzy subsequence
+  (`src/fuzzy.rs`) with per-command descriptions and the resolved target connector shown on
+  every row, retargetable in place with `Tab`. The parameter prompt gained an example
+  placeholder, per-parameter history (prefilled, so repeating a command is just Enter), and
+  inline validation. Status messages expire after 4s via `expire_status_message`, following
+  `tick_metrics_with`'s injectable-clock pattern — they had been hiding the keybinding hint
+  permanently. The help overlay is scrollable and, with the dashboard's hint line, derived from
+  a single `src/keybindings.rs` table.
 
 ## Phase 6 — picker and connection setup
 

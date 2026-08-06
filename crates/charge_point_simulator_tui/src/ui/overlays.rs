@@ -1,8 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::Alignment;
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use super::dashboard::{MIN_HEIGHT, MIN_WIDTH};
+use crate::keybindings;
 use crate::theme::{self, bordered_block};
 
 pub(super) fn render_too_small(frame: &mut Frame) {
@@ -18,44 +20,65 @@ pub(super) fn render_too_small(frame: &mut Frame) {
     );
 }
 
-pub(super) fn render_help(frame: &mut Frame) {
+pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     let area = frame.area();
-    // The "Dashboard" section's focus line packs both `↑`/`↓` (connector-level, flows across
-    // EVSE boundaries) and `Tab`/`←`/`→` (EVSE-level jumps) onto one line rather than two, even
-    // though they're meaningfully different - see `App::select_next_connector`/
-    // `App::select_next_evse`.
-    let text = "Global\n\
-         \u{20}q            quit (confirm)\n\
-         \u{20}?            toggle this help\n\n\
-         Charger picker\n\
-         \u{20}\u{2191}/\u{2193}        move selection\n\
-         \u{20}type         filter by charger id\n\
-         \u{20}Enter        select charger\n\
-         \u{20}Esc          clear filter (or quit)\n\n\
-         Dashboard\n\
-         \u{20}Esc          back to picker\n\
-         \u{20}\u{2191}/\u{2193} \u{2190}/\u{2192}/Tab  focus connector / EVSE\n\
-         \u{20}c            open command palette\n\n\
-         Logs\n\
-         \u{20}PgUp/PgDn    scroll\n\
-         \u{20}g / G        jump to oldest / newest\n\
-         \u{20}/            filter (Esc clears)\n\
-         \u{20}l            cycle level threshold";
+    // The text is derived from `keybindings::SECTIONS` so it can't drift from what
+    // `App::handle_key_event` and friends actually do - see `keybindings.rs`.
+    let lines = keybindings::help_lines();
 
-    // Sized to the text rather than a hardcoded 14 rows: the popup previously clipped its own
-    // last three lines, so the bindings at the bottom of the list - now including every log
-    // binding this phase added - never rendered at all. +2 for the block's top and bottom
-    // borders, then clamped to the terminal.
-    let content_height = text.lines().count() as u16 + 2;
+    // Sized to the text rather than a hardcoded row count: the popup previously clipped its
+    // own last three lines, so bindings at the bottom of the list never rendered at all. +2
+    // for the block's top and bottom borders, then clamped to the terminal.
+    let content_height = lines.len() as u16 + 2;
     let popup = super::centered_rect(area.width.min(56), area.height.min(content_height), area);
     frame.render_widget(Clear, popup);
 
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(theme::text_dim())
-            .block(bordered_block("Help (Esc to close)")),
-        popup,
-    );
+    // A `section` (see `theme::bordered_block`) only spends 2 rows on chrome (top + bottom
+    // borders), so all but 2 rows of the popup are available for content.
+    let visible_height = popup.height.saturating_sub(2) as usize;
+    let total = lines.len();
+    let needs_scrollbar = total > visible_height && visible_height > 0;
+
+    let title = if needs_scrollbar {
+        "Help (\u{2191}/\u{2193} scroll, Esc to close)"
+    } else {
+        "Help (Esc to close)"
+    };
+
+    let block = bordered_block(title);
+    let mut text_area = block.inner(popup);
+    if needs_scrollbar {
+        text_area.width = text_area.width.saturating_sub(1);
+    }
+    frame.render_widget(block, popup);
+
+    // Clamp so scrolling can never run past the last line and show a blank popup.
+    let max_scroll = total.saturating_sub(visible_height);
+    let scroll = scroll.min(max_scroll);
+
+    let visible: Vec<Line> = lines
+        .iter()
+        .skip(scroll)
+        .take(visible_height.max(1))
+        .map(|line| Line::from(line.as_str()))
+        .collect();
+    frame.render_widget(Paragraph::new(visible).style(theme::text_dim()), text_area);
+
+    if needs_scrollbar {
+        let mut state = ScrollbarState::new(max_scroll).position(scroll);
+        let track = ratatui::layout::Rect {
+            y: popup.y + 1,
+            height: popup.height.saturating_sub(2),
+            ..popup
+        };
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            track,
+            &mut state,
+        );
+    }
 }
 
 pub(super) fn render_quit_confirm(frame: &mut Frame) {

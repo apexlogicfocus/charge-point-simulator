@@ -570,10 +570,9 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
                 };
                 Line::styled(message, style)
             }
-            None => Line::styled(
-                "q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help",
-                theme::text_dim(),
-            ),
+            // Derived from the keybinding table rather than spelled out here, so the hint
+            // can't drift from what the keys actually do - see `crate::keybindings`.
+            None => Line::styled(crate::keybindings::dashboard_hint(), theme::text_dim()),
         },
     };
     frame.render_widget(Paragraph::new(command_bar_line), layout.command_bar);

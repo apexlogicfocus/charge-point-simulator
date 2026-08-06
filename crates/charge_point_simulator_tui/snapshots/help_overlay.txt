@@ -1,33 +1,33 @@
 ● connected  |  CP001  |  OCPP 1.6J  |  local simulation  |  up 0s
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 EVSEs (1/1)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
-EVSE 1  ○ available   0.00 kW  0.0 A  0.000 kWh                                         EVSE 1 / C1
-  ▸ C1  ○ available                                                                     ○ available
-                                                                                        no vehicle
-                                ┌Help (Esc to close)───────────────────────────────────┐session  0s
-                                │Global                                                │
-                                │ q            quit (confirm)                          │0.00 kW  0.0 A  0.000 kWh
-                                │ ?            toggle this help                        │
+EVSE 1  ○ available   0.00 kW  0┌Help (Esc to close)───────────────────────────────────┐EVSE 1 / C1
+  ▸ C1  ○ available             │Global                                                │○ available
+                                │ q           quit (confirm)                           │no vehicle
+                                │ ?           toggle this help                         │session  0s
                                 │                                                      │
-                                │Charger picker                                        │
-                                │ ↑/↓        move selection                            │
-                                │ type         filter by charger id                    │
-                                │ Enter        select charger                          │
-                                │ Esc          clear filter (or quit)                  │
+                                │Charger picker                                        │0.00 kW  0.0 A  0.000 kWh
+                                │ ↑/↓         move selection                           │
+                                │ type        filter by charger id                     │
+                                │ Enter       select charger                           │
+                                │ Esc         clear filter (or quit)                   │
                                 │                                                      │
                                 │Dashboard                                             │
-                                │ Esc          back to picker                          │
-                                │ ↑/↓ ←/→/Tab  focus connector / EVSE                  │
-                                │ c            open command palette                    │
+                                │ Esc         back to picker                           │
+                                │ ↑/↓         focus connector                          │
+                                │ Tab/←/→     focus EVSE                               │
+                                │ Ctrl+K / c  open command palette                     │
                                 │                                                      │
-Logs────────────────────────────│Logs                                                  │────────────────────────────────
-                                │ PgUp/PgDn    scroll                                  │
-                                │ g / G        jump to oldest / newest                 │
-                                │ /            filter (Esc clears)                     │
-                                │ l            cycle level threshold                   │
+                                │Logs                                                  │
+                                │ PgUp/PgDn   scroll                                   │
+Logs────────────────────────────│ g / G       jump to oldest / newest                  │────────────────────────────────
+                                │ /           filter (Esc clears)                      │
+                                │ l           cycle level threshold                    │
+                                │                                                      │
+                                │Help                                                  │
+                                │ ↑/↓         scroll                                   │
+                                │ Esc         close                                    │
                                 └──────────────────────────────────────────────────────┘
-
-
 
 
 

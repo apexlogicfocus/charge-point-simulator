@@ -25,7 +25,7 @@ pub enum Command {
 
 /// A single free-text value a [`Command`] needs before it can be applied,
 /// collected from the user via a parameter prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandParameter {
     VehicleId,
     RfidTag,
@@ -41,6 +41,19 @@ impl CommandParameter {
             CommandParameter::RfidTag => "RFID tag",
             CommandParameter::FaultCode => "Fault code",
             CommandParameter::DisplayMessage => "Display message",
+        }
+    }
+
+    /// An example value, shown as a placeholder in an empty prompt field. Deliberately a real
+    /// example rather than a restatement of [`Self::label`], which the prompt's title already
+    /// carries - a placeholder that repeats the title tells the user nothing.
+    pub fn placeholder(&self) -> &'static str {
+        match self {
+            CommandParameter::VehicleId => "e.g. MY-EV-1",
+            CommandParameter::RfidTag => "e.g. TAG-42",
+            // `SuspendedEV` and friends are the OCPP-defined vocabulary a CSMS expects here.
+            CommandParameter::FaultCode => "e.g. GroundFailure",
+            CommandParameter::DisplayMessage => "e.g. Charging - 80% complete",
         }
     }
 }
@@ -65,6 +78,19 @@ impl Command {
             Command::ClearFault => "Clear fault",
             Command::SetDisplayMessage => "Set display message",
             Command::ClearDisplayMessage => "Clear display message",
+        }
+    }
+
+    /// One short sentence saying what this command does to the targeted connector.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Command::PlugInVehicle => "Occupies a free connector with a vehicle",
+            Command::PresentRfid => "Authorizes charging on an occupied connector",
+            Command::UnplugVehicle => "Removes the vehicle and frees the connector",
+            Command::ReportFault => "Marks the connector as faulted",
+            Command::ClearFault => "Restores a faulted connector to available",
+            Command::SetDisplayMessage => "Shows text on the charger's display",
+            Command::ClearDisplayMessage => "Blanks the charger's display",
         }
     }
 
@@ -515,6 +541,40 @@ mod tests {
 
         assert_eq!(result, None);
         assert_eq!(evse, before);
+    }
+
+    #[test]
+    fn every_parameter_placeholder_is_an_example_not_a_restatement_of_the_label() {
+        for parameter in [
+            CommandParameter::VehicleId,
+            CommandParameter::RfidTag,
+            CommandParameter::FaultCode,
+            CommandParameter::DisplayMessage,
+        ] {
+            let placeholder = parameter.placeholder();
+            assert!(!placeholder.is_empty(), "{parameter:?}");
+            assert_ne!(placeholder, parameter.label(), "{parameter:?}");
+        }
+    }
+
+    #[test]
+    fn every_command_has_a_non_empty_description_distinct_from_its_label() {
+        for command in Command::ALL {
+            let description = command.description();
+            assert!(!description.is_empty(), "{:?} has an empty description", command);
+            assert!(
+                description.len() <= 50,
+                "{:?} description is too long for a palette row: {:?}",
+                command,
+                description
+            );
+            assert_ne!(
+                description,
+                command.label(),
+                "{:?} description just repeats its label",
+                command
+            );
+        }
     }
 
     #[test]

@@ -2,13 +2,14 @@ use crate::logs::{LogBuffer, LogEntry};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
-    ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, ConnectionProfile,
-    ConnectionStore, OcppVersion, SecurityProfile, SimulationMode, apply_ocpp_state,
+    ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, CommandParameter,
+    ConnectionProfile, ConnectionStore, OcppVersion, SecurityProfile, SimulationMode, apply_ocpp_state,
     build_ocpp_event_for_connector, connect_charger, meter_sample_events,
 };
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{DefaultTerminal, Frame};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -33,6 +34,23 @@ const METER_VALUE_INTERVAL: Duration = Duration::from_secs(5);
 pub enum StatusSeverity {
     Ok,
     Error,
+}
+
+/// How long a status message stays in the command bar before expiring. Until Phase 5 these
+/// persisted forever, which permanently hid the keybinding hint line that shares the bar -
+/// the very line telling a new user how to do anything else.
+const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(4);
+
+/// A transient message in the command bar, carrying when it was shown so it can expire (see
+/// [`STATUS_MESSAGE_TTL`]). Expiry is evaluated in `App::tick_metrics_with`, which is handed
+/// `now` by its caller rather than reading the clock itself - the same injectable-clock
+/// pattern the metrics tick already uses, so tests drive expiry with a chosen instant instead
+/// of sleeping.
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub severity: StatusSeverity,
+    pub message: String,
+    pub shown_at: Instant,
 }
 
 /// Identifies one connector within the currently loaded charger: which EVSE, and which
@@ -68,9 +86,19 @@ pub struct App {
     pub command_palette_filter: TextField,
     pub parameter_prompt: Option<Command>,
     pub parameter_field: TextField,
+    /// The last value accepted for each parameter, prefilled the next time that same parameter
+    /// is prompted for. Keyed by [`CommandParameter`] rather than by [`Command`] so commands
+    /// sharing a parameter share its history.
+    pub parameter_history: HashMap<CommandParameter, String>,
+    /// Why the current parameter value was rejected, shown inline under the prompt. Cleared as
+    /// soon as the value changes, so a stale complaint never outlives what it was about.
+    pub parameter_error: Option<&'static str>,
     pub help_open: bool,
+    /// How many lines the help overlay is scrolled down by, for terminals too short to show
+    /// the whole keybinding table at once.
+    pub help_scroll: usize,
     pub quit_confirm_open: bool,
-    pub status_message: Option<(StatusSeverity, String)>,
+    pub status_message: Option<Toast>,
     pub connection_store: ConnectionStore,
     pub connection_store_path: Option<PathBuf>,
     pub connection_csms_url: TextField,
@@ -104,6 +132,20 @@ pub struct App {
 /// Kept as a free function, separate from `App::confirm_connection_setup`, specifically so it
 /// can be unit tested as a plain, synchronous decision - without going anywhere near the
 /// background thread `confirm_connection_setup` spawns to actually perform the connection.
+/// Validates a parameter value, returning the reason it's unacceptable or `None` if it's fine.
+///
+/// Kept a free function, like [`resolve_simulation_mode`], so the rule can be tested as a plain
+/// decision without standing up an `App` and a prompt around it. Every parameter the app has
+/// today (vehicle id, RFID tag, fault code, display message) is free text whose only real
+/// requirement is being present, so this is deliberately one rule rather than a per-parameter
+/// table - add that when a parameter actually needs a different rule.
+fn validate_parameter(value: &str) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        return Some("cannot be blank");
+    }
+    None
+}
+
 fn resolve_simulation_mode(csms_url: &str) -> SimulationMode {
     if csms_url.trim().is_empty() {
         SimulationMode::Local
@@ -167,15 +209,24 @@ impl App {
             .collect()
     }
 
-    /// [`available_commands`](Self::available_commands) further narrowed by
-    /// the command palette's filter text (case-insensitive substring match
-    /// on the command's label).
+    /// [`available_commands`](Self::available_commands) further narrowed by the command
+    /// palette's filter text, matched as a fuzzy subsequence (see [`crate::fuzzy::score`])
+    /// rather than a plain substring: `"pv"` finds "Plug in vehicle".
+    ///
+    /// Results are ordered best-match first, with ties broken by the order in `Command::ALL`
+    /// so a given filter always produces the same list - `sort_by_key` is stable, which is
+    /// what makes that guarantee hold.
     pub(crate) fn palette_commands(&self) -> Vec<Command> {
-        let filter = self.command_palette_filter.value().to_lowercase();
-        self.available_commands()
+        let filter = self.command_palette_filter.value();
+        let mut scored: Vec<(Command, u32)> = self
+            .available_commands()
             .into_iter()
-            .filter(|command| command.label().to_lowercase().contains(&filter))
-            .collect()
+            .filter_map(|command| {
+                crate::fuzzy::score(command.label(), filter).map(|score| (command, score))
+            })
+            .collect();
+        scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+        scored.into_iter().map(|(command, _)| command).collect()
     }
 
     fn handle_events(&mut self) -> Result<()> {
@@ -302,7 +353,12 @@ impl App {
 
     fn handle_help_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('?') => self.help_open = false,
+            KeyCode::Esc | KeyCode::Char('?') => {
+                self.help_open = false;
+                self.help_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::PageDown => self.help_scroll += 1,
+            KeyCode::Up | KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(1),
             _ => {}
         }
     }
@@ -367,6 +423,11 @@ impl App {
             KeyCode::Up => self.select_previous_connector(),
             KeyCode::Right | KeyCode::Tab => self.select_next_evse(),
             KeyCode::Left | KeyCode::BackTab => self.select_previous_evse(),
+            // Ctrl+K is the modern convention for a command palette; 'c' stays as an alias
+            // rather than being removed, since it's what this app has always used.
+            KeyCode::Char('k') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_command_palette()
+            }
             KeyCode::Char('c') => self.open_command_palette(),
             _ => {}
         }
@@ -377,6 +438,11 @@ impl App {
             KeyCode::Esc => self.close_command_palette(),
             KeyCode::Down => self.select_next_command(),
             KeyCode::Up => self.select_previous_command(),
+            // Retarget without leaving the palette: the target is shown on every row, so
+            // noticing it's wrong shouldn't cost an Esc and a re-open. Tab moves the target,
+            // not the selection, because the palette's list already moves with ↑/↓.
+            KeyCode::Tab => self.retarget_palette(true),
+            KeyCode::BackTab => self.retarget_palette(false),
             KeyCode::Enter => self.dispatch_selected_command(),
             KeyCode::Backspace => {
                 self.command_palette_filter.backspace();
@@ -394,13 +460,23 @@ impl App {
         match key_event.code {
             KeyCode::Esc => self.cancel_parameter_prompt(),
             KeyCode::Enter => self.submit_parameter_prompt(),
-            KeyCode::Backspace => self.parameter_field.backspace(),
-            KeyCode::Delete => self.parameter_field.delete(),
+            // Editing the value clears any complaint about the previous one.
+            KeyCode::Backspace => {
+                self.parameter_field.backspace();
+                self.parameter_error = None;
+            }
+            KeyCode::Delete => {
+                self.parameter_field.delete();
+                self.parameter_error = None;
+            }
             KeyCode::Left => self.parameter_field.move_left(),
             KeyCode::Right => self.parameter_field.move_right(),
             KeyCode::Home => self.parameter_field.move_home(),
             KeyCode::End => self.parameter_field.move_end(),
-            KeyCode::Char(c) => self.parameter_field.insert_char(c),
+            KeyCode::Char(c) => {
+                self.parameter_field.insert_char(c);
+                self.parameter_error = None;
+            }
             _ => {}
         }
     }
@@ -534,6 +610,30 @@ impl App {
         self.command_palette_open = false;
     }
 
+    /// Moves the focused connector while the palette is open, so a command about to be
+    /// dispatched can be pointed at a different connector in place.
+    ///
+    /// The selection is reset because the newly targeted connector may not be eligible for the
+    /// same commands - keeping the index would silently land on a different command than the
+    /// one the user was looking at.
+    fn retarget_palette(&mut self, forward: bool) {
+        if forward {
+            self.select_next_connector();
+        } else {
+            self.select_previous_connector();
+        }
+        self.command_palette_selected = 0;
+    }
+
+    /// How the focused connector reads in the palette, e.g. `"EVSE 1 / C1"`. `None` when no
+    /// charger is loaded or the focus doesn't point at a real connector.
+    pub(crate) fn focused_connector_label(&self) -> Option<String> {
+        let state = self.charger_state.as_ref()?;
+        let evse = state.evses.get(self.focused.evse)?;
+        let connector = evse.connectors.get(self.focused.connector)?;
+        Some(format!("EVSE {} / C{}", evse.id, connector.id))
+    }
+
     fn select_next_command(&mut self) {
         let count = self.palette_commands().len();
         if count == 0 {
@@ -561,24 +661,48 @@ impl App {
             return;
         };
 
-        if command.parameter().is_some() {
-            self.parameter_field = TextField::default();
-            self.parameter_prompt = Some(command);
+        if let Some(parameter) = command.parameter() {
+            self.open_parameter_prompt(command, parameter);
             return;
         }
 
         self.apply_command(command, "");
     }
 
-    fn cancel_parameter_prompt(&mut self) {
-        self.parameter_prompt = None;
+    /// Opens the prompt for `command`, prefilled with the last value accepted for the same
+    /// parameter. Prefilling rather than merely suggesting means the common case - plugging the
+    /// same test vehicle in again - is Enter, not retyping an id.
+    fn open_parameter_prompt(&mut self, command: Command, parameter: CommandParameter) {
+        let remembered = self.parameter_history.get(&parameter).cloned().unwrap_or_default();
+        self.parameter_field = TextField::new(remembered);
+        self.parameter_error = None;
+        self.parameter_prompt = Some(command);
     }
 
+    fn cancel_parameter_prompt(&mut self) {
+        self.parameter_prompt = None;
+        self.parameter_error = None;
+    }
+
+    /// Validates the typed value and, if it passes, applies the command and remembers the
+    /// value for next time. A rejected value leaves the prompt open with an inline reason
+    /// rather than closing and silently doing nothing.
     fn submit_parameter_prompt(&mut self) {
-        let Some(command) = self.parameter_prompt.take() else {
+        let Some(command) = self.parameter_prompt else {
             return;
         };
-        let input = self.parameter_field.value().to_string();
+        let input = self.parameter_field.value().trim().to_string();
+
+        if let Some(error) = validate_parameter(input.as_str()) {
+            self.parameter_error = Some(error);
+            return;
+        }
+
+        if let Some(parameter) = command.parameter() {
+            self.parameter_history.insert(parameter, input.clone());
+        }
+        self.parameter_prompt = None;
+        self.parameter_error = None;
         self.apply_command(command, &input);
     }
 
@@ -598,7 +722,7 @@ impl App {
                 && let Some(log_line) = command.apply_to_charger(state, input)
             {
                 self.logs.push(log_line);
-                self.status_message = Some((StatusSeverity::Ok, format!("✓ {}", command.label())));
+                self.set_status(StatusSeverity::Ok, format!("✓ {}", command.label()));
             }
             return;
         }
@@ -614,14 +738,13 @@ impl App {
                 Some(event) => {
                     let _ = sender.send(event);
                     self.logs.push(format!("{} sent to CSMS", command.label()));
-                    self.status_message =
-                        Some((StatusSeverity::Ok, format!("→ {}", command.label())));
+                    self.set_status(StatusSeverity::Ok, format!("→ {}", command.label()));
                 }
                 None => {
-                    self.status_message = Some((
+                    self.set_status(
                         StatusSeverity::Error,
                         format!("✗ {} not ready yet", command.label()),
-                    ));
+                    );
                 }
             }
             return;
@@ -635,7 +758,7 @@ impl App {
         };
         if let Some(log_line) = command.apply_to(evse, self.focused.connector, input) {
             self.logs.push(log_line);
-            self.status_message = Some((StatusSeverity::Ok, format!("✓ {}", command.label())));
+            self.set_status(StatusSeverity::Ok, format!("✓ {}", command.label()));
         }
     }
 
@@ -797,14 +920,14 @@ impl App {
         };
         match receiver.try_recv() {
             Ok(Ok(())) => {
-                self.status_message = Some((StatusSeverity::Ok, "✓ connected to CSMS".to_string()));
+                self.set_status(StatusSeverity::Ok, "✓ connected to CSMS".to_string());
                 self.connect_result_receiver = None;
             }
             Ok(Err(error)) => {
-                self.status_message = Some((
+                self.set_status(
                     StatusSeverity::Error,
                     format!("✗ CSMS connection failed: {error}"),
-                ));
+                );
                 self.connect_result_receiver = None;
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
@@ -876,7 +999,23 @@ impl App {
         if let Some(state) = &mut self.charger_state {
             state.tick(elapsed);
         }
+        self.expire_status_message(now);
         self.maybe_send_meter_values(now);
+    }
+
+    /// Shows `message` in the command bar, stamped so it expires. Always go through this
+    /// rather than assigning `status_message` directly - an un-stamped toast would never
+    /// expire, which is the bug this replaced.
+    pub(crate) fn set_status(&mut self, severity: StatusSeverity, message: String) {
+        self.status_message = Some(Toast { severity, message, shown_at: Instant::now() });
+    }
+
+    fn expire_status_message(&mut self, now: Instant) {
+        if let Some(toast) = &self.status_message
+            && now.duration_since(toast.shown_at) >= STATUS_MESSAGE_TTL
+        {
+            self.status_message = None;
+        }
     }
 
     fn maybe_send_meter_values(&mut self, now: Instant) {
@@ -914,6 +1053,12 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    /// The command bar's current message, without the `Instant` a `Toast` also carries -
+    /// assertions care about severity and text, never when it was shown.
+    fn status(app: &App) -> Option<(StatusSeverity, String)> {
+        app.status_message.as_ref().map(|toast| (toast.severity, toast.message.clone()))
     }
 
     /// The visible log pane as plain strings. Most assertions here care about *which* lines
@@ -1562,10 +1707,7 @@ mod tests {
             app.charger_state.as_ref().unwrap().display_message,
             Some("Welcome to Flowion".to_string())
         );
-        assert_eq!(
-            app.status_message,
-            Some((StatusSeverity::Ok, "✓ Set display message".to_string()))
-        );
+        assert_eq!(status(&app), Some((StatusSeverity::Ok, "✓ Set display message".to_string())));
         let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
         assert!(labels.contains(&"Clear display message"));
     }
@@ -1725,7 +1867,8 @@ mod tests {
         app.confirm_charger_selection();
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter)); // opens the "Vehicle ID" parameter prompt
-        app.handle_key_event(key(KeyCode::Enter)); // submits it blank, applying the command
+        app.handle_key_event(key(KeyCode::Char('E')));
+        app.handle_key_event(key(KeyCode::Enter)); // submits it, applying the command
 
         assert!(!app.command_palette_open);
         assert!(app.parameter_prompt.is_none());
@@ -1748,7 +1891,8 @@ mod tests {
         app.confirm_charger_selection();
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter)); // opens the parameter prompt
-        app.handle_key_event(key(KeyCode::Enter)); // submits it blank: plug in vehicle
+        app.handle_key_event(key(KeyCode::Char('E')));
+        app.handle_key_event(key(KeyCode::Enter)); // submits it: plug in vehicle
 
         app.handle_key_event(key(KeyCode::Char('c')));
         let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
@@ -1761,26 +1905,24 @@ mod tests {
     fn dispatching_a_command_shows_a_confirmation_status_message() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        assert_eq!(app.status_message, None);
+        assert_eq!(status(&app), None);
 
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter)); // opens the parameter prompt
-        app.handle_key_event(key(KeyCode::Enter)); // submits it blank
+        app.handle_key_event(key(KeyCode::Char('E')));
+        app.handle_key_event(key(KeyCode::Enter)); // submits it
 
-        assert_eq!(
-            app.status_message,
-            Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string()))
-        );
+        assert_eq!(status(&app), Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string())));
     }
 
     #[test]
     fn returning_to_the_picker_clears_any_status_message() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.status_message = Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string()));
+        app.set_status(StatusSeverity::Ok, "✓ Plug in vehicle".to_string());
 
         app.handle_key_event(key(KeyCode::Esc));
-        assert_eq!(app.status_message, None);
+        assert_eq!(status(&app), None);
     }
 
     #[test]
@@ -1921,6 +2063,131 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::Char('l')));
         assert_eq!(app.logs.level_threshold(), LogLevel::Debug);
+    }
+
+    #[test]
+    fn ctrl_k_opens_the_command_palette_and_c_still_works_as_an_alias() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(app.command_palette_open);
+
+        app.handle_key_event(key(KeyCode::Esc));
+        app.handle_key_event(key(KeyCode::Char('c')));
+        assert!(app.command_palette_open);
+    }
+
+    #[test]
+    fn a_bare_k_does_not_open_the_palette() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert!(!app.command_palette_open);
+    }
+
+    #[test]
+    fn the_palette_matches_commands_as_a_fuzzy_subsequence() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+        for c in "pv".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+
+        // "pv" is not a substring of any label - the old matcher found nothing here.
+        let labels: Vec<&str> = app.palette_commands().iter().map(|c| c.label()).collect();
+        assert_eq!(labels.first(), Some(&"Plug in vehicle"));
+    }
+
+    #[test]
+    fn tab_retargets_the_palette_to_the_next_connector() {
+        let mut app = App::new(vec![charger_with_evses("CP-2C", vec![EvseConfig { id: 1, connectors: 2 }])]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+        assert_eq!(app.focused_connector_label().as_deref(), Some("EVSE 1 / C1"));
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.focused_connector_label().as_deref(), Some("EVSE 1 / C2"));
+        // Still open: retargeting happens in place, without a round trip through the dashboard.
+        assert!(app.command_palette_open);
+        assert_eq!(app.command_palette_selected, 0);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.focused_connector_label().as_deref(), Some("EVSE 1 / C1"));
+    }
+
+    #[test]
+    fn a_blank_parameter_is_rejected_inline_and_leaves_the_prompt_open() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+        app.handle_key_event(key(KeyCode::Enter));
+
+        app.handle_key_event(key(KeyCode::Enter)); // submit blank
+
+        assert!(app.parameter_prompt.is_some());
+        assert_eq!(app.parameter_error, Some("cannot be blank"));
+        assert_eq!(status(&app), None);
+
+        // Typing clears the complaint about the value that's no longer there.
+        app.handle_key_event(key(KeyCode::Char('E')));
+        assert_eq!(app.parameter_error, None);
+    }
+
+    #[test]
+    fn whitespace_only_counts_as_blank() {
+        assert_eq!(validate_parameter("   "), Some("cannot be blank"));
+        assert_eq!(validate_parameter("EV-1"), None);
+    }
+
+    #[test]
+    fn a_parameter_prompt_is_prefilled_with_the_last_accepted_value() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Char('c')));
+        app.handle_key_event(key(KeyCode::Enter));
+        for c in "MY-EV".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        app.handle_key_event(key(KeyCode::Enter));
+
+        // Unplug, then plug in again: the vehicle id is remembered.
+        app.apply_command(Command::UnplugVehicle, "");
+        app.handle_key_event(key(KeyCode::Char('c')));
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(app.parameter_field.value(), "MY-EV");
+        // Prefilled, not merely suggested: Enter alone submits it.
+        assert_eq!(app.parameter_field.cursor(), "MY-EV".chars().count());
+    }
+
+    #[test]
+    fn a_rejected_parameter_is_not_remembered() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('c')));
+        app.handle_key_event(key(KeyCode::Enter));
+        app.handle_key_event(key(KeyCode::Enter)); // blank, rejected
+
+        assert!(app.parameter_history.is_empty());
+    }
+
+    #[test]
+    fn a_status_message_expires_after_its_ttl() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.set_status(StatusSeverity::Ok, "✓ Plug in vehicle".to_string());
+        let shown_at = app.status_message.as_ref().unwrap().shown_at;
+
+        // Just short of the TTL: still there, so the message is actually readable.
+        app.tick_metrics_with(Duration::ZERO, shown_at + STATUS_MESSAGE_TTL - Duration::from_millis(1));
+        assert!(app.status_message.is_some());
+
+        app.tick_metrics_with(Duration::ZERO, shown_at + STATUS_MESSAGE_TTL);
+        assert_eq!(status(&app), None);
     }
 
     #[test]
@@ -2138,10 +2405,7 @@ mod tests {
 
         app.poll_connect_result();
 
-        assert_eq!(
-            app.status_message,
-            Some((StatusSeverity::Ok, "✓ connected to CSMS".to_string()))
-        );
+        assert_eq!(status(&app), Some((StatusSeverity::Ok, "✓ connected to CSMS".to_string())));
         assert!(app.connect_result_receiver.is_none());
     }
 
@@ -2155,11 +2419,8 @@ mod tests {
         app.poll_connect_result();
 
         assert_eq!(
-            app.status_message,
-            Some((
-                StatusSeverity::Error,
-                "✗ CSMS connection failed: boom".to_string()
-            ))
+            status(&app),
+            Some((StatusSeverity::Error, "✗ CSMS connection failed: boom".to_string()))
         );
         assert!(app.connect_result_receiver.is_none());
     }
@@ -2172,7 +2433,7 @@ mod tests {
 
         app.poll_connect_result();
 
-        assert_eq!(app.status_message, None);
+        assert_eq!(status(&app), None);
         assert!(app.connect_result_receiver.is_some());
     }
 
@@ -2317,11 +2578,8 @@ mod tests {
 
         assert!(receiver.try_recv().is_err());
         assert_eq!(
-            app.status_message,
-            Some((
-                StatusSeverity::Error,
-                "✗ Plug in vehicle not ready yet".to_string()
-            ))
+            status(&app),
+            Some((StatusSeverity::Error, "✗ Plug in vehicle not ready yet".to_string()))
         );
     }
 

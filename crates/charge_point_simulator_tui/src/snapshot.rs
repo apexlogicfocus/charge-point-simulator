@@ -429,6 +429,27 @@ fn parameter_prompt() {
     assert_snapshot("parameter_prompt", &render(&app, 120, 34));
 }
 
+/// The prompt showing its placeholder (empty field) and an inline validation error, the two
+/// states Phase 5 added to it.
+#[test]
+fn parameter_prompt_blank_with_error() {
+    let config = charger_config(
+        "CP001",
+        OcppVersion::V16J,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
+    let mut app = dashboard_app(config);
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // opens the prompt
+    app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // rejected as blank
+
+    assert_snapshot("parameter_prompt_blank_with_error", &render(&app, 120, 34));
+}
+
 #[test]
 fn help_overlay() {
     let config = charger_config(
