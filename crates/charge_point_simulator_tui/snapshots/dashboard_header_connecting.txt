@@ -1,4 +1,4 @@
-- connecting...  |  CP-CONNECTING  |  OCPP 2.1  |  wss://csms.example.com/CP-CONNECTING  |  up 0s
+- connecting...  |  CP-CONNECTING  |  OCPP 2.1  |  wss://csms.example.com/CP-CONNECTING  |  up 0s  ○
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 EVSEs (1/1)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
 EVSE 1  ○ available   0.00 kW  0.0 A  0.000 kWh                                         EVSE 1 / C1

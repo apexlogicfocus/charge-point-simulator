@@ -1,4 +1,4 @@
-● connected  |  CP001  |  OCPP 1.6J  |  local simulation  |  up 0s
+● connected  |  CP001  |  OCPP 1.6J  |  local simulation  |  up 0s  ·
 ────────────────────────────────┌Help (↑/↓ scroll, Esc to close)───────────────────────┐────────────────────────────────
 EVSEs (1/1)─────────────────────│Global                                                █Detail──────────────────────────
 EVSE 1  ○ available   0.00 kW  0│ q           quit (confirm)                           █EVSE 1 / C1

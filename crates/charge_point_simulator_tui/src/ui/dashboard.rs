@@ -135,6 +135,33 @@ fn connecting_spinner_frame(uptime: Duration) -> &'static str {
     SPINNER_FRAMES[index]
 }
 
+/// Animation frames for the header's heartbeat pulse - see [`heartbeat_pulse_frame`]. A dim
+/// dot growing to a bright, filled circle and back, distinct from [`SPINNER_FRAMES`] both in
+/// shape (breathing, not rotating) and cadence, so the two are never mistaken for each other
+/// when a connect attempt happens to start right as the pulse is mid-cycle.
+const HEARTBEAT_FRAMES: [&str; 4] = ["·", "○", "●", "○"];
+
+/// How long each heartbeat frame is shown, in milliseconds. Slower than the connecting spinner
+/// (a full breathe takes 1.2s) because this runs *all the time* the dashboard is on screen,
+/// not just during a brief connect attempt - a faster cadence would be distracting rather than
+/// reassuring.
+const HEARTBEAT_FRAME_MS: u128 = 300;
+
+/// Picks the header's "alive and ticking" pulse frame for `uptime`.
+///
+/// This deliberately does not claim to reflect real OCPP Heartbeat traffic:
+/// `ChargerState` exposes no sent/received message counts (see the roadmap's "No OCPP message
+/// counters" gap), so a pulse tied to protocol heartbeats would either be fake or need upstream
+/// plumbing that doesn't exist yet. What *is* honestly available is `uptime` itself, which only
+/// advances when [`ChargerState::tick`] actually runs - so a pulse driven by it proves the
+/// simulation loop is alive, which is exactly what distinguishes "idle" from "hung". Same
+/// determinism rule as [`connecting_spinner_frame`]: simulated `uptime`, never a wall clock, so
+/// goldens built from a fixed `elapsed` stay reproducible.
+fn heartbeat_pulse_frame(uptime: Duration) -> &'static str {
+    let index = (uptime.as_millis() / HEARTBEAT_FRAME_MS) as usize % HEARTBEAT_FRAMES.len();
+    HEARTBEAT_FRAMES[index]
+}
+
 /// Compact uptime/duration formatting: `"0s"` while brand new, `"42s"` under a minute,
 /// `"4m 12s"` under an hour, `"1h 04m"` from there on. Each tier only carries the units a user
 /// actually needs at that scale - nobody needs "0h" prefixed on "4m 12s", or seconds once a
@@ -213,9 +240,17 @@ fn header_segments(state: &ChargerState, connecting: bool, width: usize) -> Vec<
         (mode_text(state), theme::text()),
     ];
 
+    // The heartbeat pulse rides along with uptime rather than getting its own priority tier:
+    // it has no meaning on its own (it's just a moving dot) and only earns a place in the
+    // header as proof that the uptime figure next to it is actually live, not frozen.
     let uptime_segment = vec![
         ("  |  up ".to_string(), theme::text_dim()),
         (format_uptime(state.uptime), theme::text_dim()),
+        ("  ".to_string(), theme::text_dim()),
+        (
+            theme::glyph_field(heartbeat_pulse_frame(state.uptime)),
+            theme::text_dim(),
+        ),
     ];
 
     // Widths are counted in `char`s, not bytes, matching `theme::glyph_field`'s convention -
@@ -857,6 +892,53 @@ mod tests {
         assert_eq!(connecting_spinner_frame(Duration::from_millis(1000)), "|");
     }
 
+    // --- heartbeat_pulse_frame -----------------------------------------------------------
+
+    #[test]
+    fn heartbeat_pulse_frame_cycles_through_frames_as_simulated_uptime_advances() {
+        assert_eq!(heartbeat_pulse_frame(Duration::ZERO), "\u{b7}");
+        assert_eq!(
+            heartbeat_pulse_frame(Duration::from_millis(300)),
+            "\u{25cb}"
+        );
+        assert_eq!(
+            heartbeat_pulse_frame(Duration::from_millis(600)),
+            "\u{25cf}"
+        );
+        assert_eq!(
+            heartbeat_pulse_frame(Duration::from_millis(900)),
+            "\u{25cb}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_pulse_frame_wraps_around_after_the_last_frame() {
+        assert_eq!(heartbeat_pulse_frame(Duration::from_millis(1200)), "\u{b7}");
+    }
+
+    #[test]
+    fn heartbeat_pulse_frame_changes_when_accumulated_at_the_apps_real_100ms_tick_cadence() {
+        // Regression guard for the roadmap's "accumulators coarser than their increment"
+        // trap: drive `uptime` forward in the same 100ms steps `App`'s input-poll loop
+        // actually uses (see `INPUT_POLL_INTERVAL`), rather than jumping straight to
+        // hand-picked totals, so a bug that only shows up when frames accumulate one small
+        // step at a time can't hide behind a test that skips straight to the answer.
+        const TICK: Duration = Duration::from_millis(100);
+        let mut uptime = Duration::ZERO;
+        let mut frames = Vec::new();
+        for _ in 0..12 {
+            let frame = heartbeat_pulse_frame(uptime);
+            if frames.last() != Some(&frame) {
+                frames.push(frame);
+            }
+            uptime += TICK;
+        }
+        // Over 1.2s (12 ticks of 100ms) at a 300ms frame period, the pulse must actually
+        // change - a coarse accumulator that rounded 100ms increments away would show a
+        // single static frame here even though `uptime` is visibly advancing.
+        assert_eq!(frames, vec!["\u{b7}", "\u{25cb}", "\u{25cf}", "\u{25cb}"]);
+    }
+
     // --- header_segments ---------------------------------------------------------------
 
     use charge_point_simulator_core::charger::{ChargerConfig, OcppVersion};
@@ -907,6 +989,16 @@ mod tests {
     }
 
     #[test]
+    fn header_segments_show_the_heartbeat_pulse_alongside_uptime_when_there_is_room() {
+        let mut state = charger_state_for_header("CP-CHARGE");
+        state.uptime = Duration::from_millis(600);
+        let text = segments_text(&header_segments(&state, false, 120));
+
+        assert!(text.contains("up 0s"));
+        assert!(text.contains(heartbeat_pulse_frame(state.uptime)));
+    }
+
+    #[test]
     fn header_segments_drop_uptime_before_mode_and_mode_before_the_floor_as_width_shrinks() {
         // Priority (see `header_segments`'s doc comment): uptime drops first, then mode; the
         // status/id/version floor is never dropped. Derive the exact boundary widths from the
@@ -923,7 +1015,11 @@ mod tests {
             base_width + "  |  ".chars().count() + mode_text(&state).chars().count();
         let with_uptime_width = mode_only_width
             + "  |  up ".chars().count()
-            + format_uptime(state.uptime).chars().count();
+            + format_uptime(state.uptime).chars().count()
+            + "  ".chars().count()
+            + theme::glyph_field(heartbeat_pulse_frame(state.uptime))
+                .chars()
+                .count();
 
         let everything = segments_text(&header_segments(&state, false, with_uptime_width));
         assert!(everything.contains("local simulation"));
