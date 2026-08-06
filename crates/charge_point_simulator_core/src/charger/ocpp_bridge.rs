@@ -82,9 +82,15 @@ pub fn command_to_connector_event(
 ) -> Option<ConnectorEvent> {
     let input = input.trim();
     match (command, state) {
-        (Command::PlugInVehicle, OcppConnectorState::Available) => Some(ConnectorEvent::CableConnected),
+        (Command::PlugInVehicle, OcppConnectorState::Available) => {
+            Some(ConnectorEvent::CableConnected)
+        }
         (Command::PresentRfid, OcppConnectorState::Locked) => {
-            let value = if input.is_empty() { "UNKNOWN".to_string() } else { input.to_string() };
+            let value = if input.is_empty() {
+                "UNKNOWN".to_string()
+            } else {
+                input.to_string()
+            };
             Some(ConnectorEvent::IdTokenPresented(IdToken {
                 value,
                 kind: IdTokenKind::ISO14443,
@@ -97,7 +103,10 @@ pub fn command_to_connector_event(
             Some(ConnectorEvent::CableDisconnected)
         }
         (Command::ReportFault, state)
-            if !matches!(state, OcppConnectorState::Faulted | OcppConnectorState::FaultedSafe) =>
+            if !matches!(
+                state,
+                OcppConnectorState::Faulted | OcppConnectorState::FaultedSafe
+            ) =>
         {
             Some(ConnectorEvent::FaultDetected)
         }
@@ -126,8 +135,9 @@ pub fn build_ocpp_event(
     input: &str,
 ) -> Option<ChargePointEvent> {
     let evse = ocpp_state.evses.get(evse_id)?;
-    (0..evse.connectors.len())
-        .find_map(|connector_id| build_ocpp_event_for_connector(ocpp_state, evse_id, connector_id, command, input))
+    (0..evse.connectors.len()).find_map(|connector_id| {
+        build_ocpp_event_for_connector(ocpp_state, evse_id, connector_id, command, input)
+    })
 }
 
 /// Builds the full event to send to the runtime for dispatching `command` against one specific
@@ -149,7 +159,10 @@ pub fn build_ocpp_event_for_connector(
 
     Some(ChargePointEvent::Evse {
         evse_id,
-        event: EvseEvent::Connector { connector_id, event },
+        event: EvseEvent::Connector {
+            connector_id,
+            event,
+        },
     })
 }
 
@@ -192,7 +205,10 @@ mod tests {
         ChargerState::from_config(ChargerConfig {
             id: "CP001".into(),
             ocpp_version: OcppVersion::V21,
-            evses: vec![EvseConfig { id: 1, connectors: 2 }],
+            evses: vec![EvseConfig {
+                id: 1,
+                connectors: 2,
+            }],
             has_display: false,
         })
     }
@@ -212,18 +228,54 @@ mod tests {
 
     #[test]
     fn maps_every_connector_state_to_a_coarse_status() {
-        assert_eq!(map_connector_status(OcppConnectorState::Available), ConnectorStatus::Available);
-        assert_eq!(map_connector_status(OcppConnectorState::Connected), ConnectorStatus::Occupied);
-        assert_eq!(map_connector_status(OcppConnectorState::Locked), ConnectorStatus::Occupied);
-        assert_eq!(map_connector_status(OcppConnectorState::Authorizing), ConnectorStatus::Occupied);
-        assert_eq!(map_connector_status(OcppConnectorState::Starting), ConnectorStatus::Charging);
-        assert_eq!(map_connector_status(OcppConnectorState::Charging), ConnectorStatus::Charging);
-        assert_eq!(map_connector_status(OcppConnectorState::Stopping), ConnectorStatus::Occupied);
-        assert_eq!(map_connector_status(OcppConnectorState::Finishing), ConnectorStatus::Occupied);
-        assert_eq!(map_connector_status(OcppConnectorState::Unlocking), ConnectorStatus::Occupied);
-        assert_eq!(map_connector_status(OcppConnectorState::Unavailable), ConnectorStatus::Unavailable);
-        assert_eq!(map_connector_status(OcppConnectorState::Faulted), ConnectorStatus::Faulted);
-        assert_eq!(map_connector_status(OcppConnectorState::FaultedSafe), ConnectorStatus::Faulted);
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Available),
+            ConnectorStatus::Available
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Connected),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Locked),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Authorizing),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Starting),
+            ConnectorStatus::Charging
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Charging),
+            ConnectorStatus::Charging
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Stopping),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Finishing),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Unlocking),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Unavailable),
+            ConnectorStatus::Unavailable
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Faulted),
+            ConnectorStatus::Faulted
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::FaultedSafe),
+            ConnectorStatus::Faulted
+        );
     }
 
     #[test]
@@ -250,13 +302,18 @@ mod tests {
             url: "ws://csms.example/CP001".into(),
         };
         charger.uptime = std::time::Duration::from_secs(42);
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Locked, OcppConnectorState::Available]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Locked,
+            OcppConnectorState::Available,
+        ]);
 
         apply_ocpp_state(&mut charger, &ocpp);
 
         assert_eq!(
             charger.mode,
-            SimulationMode::LiveCsms { url: "ws://csms.example/CP001".into() }
+            SimulationMode::LiveCsms {
+                url: "ws://csms.example/CP001".into()
+            }
         );
         assert_eq!(charger.uptime, std::time::Duration::from_secs(42));
     }
@@ -273,7 +330,10 @@ mod tests {
         assert_eq!(charger.connection_status, ConnectionStatus::Booting);
 
         // Only the bridge, mirroring the real CSMS registration outcome, may advance it.
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Available, OcppConnectorState::Available]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Available,
+            OcppConnectorState::Available,
+        ]);
         apply_ocpp_state(&mut charger, &ocpp);
         assert_eq!(charger.connection_status, ConnectionStatus::Connected);
     }
@@ -281,19 +341,31 @@ mod tests {
     #[test]
     fn apply_ocpp_state_updates_connection_and_connector_status() {
         let mut charger = charger_state();
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Locked, OcppConnectorState::Available]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Locked,
+            OcppConnectorState::Available,
+        ]);
 
         apply_ocpp_state(&mut charger, &ocpp);
 
         assert_eq!(charger.connection_status, ConnectionStatus::Connected);
-        assert_eq!(charger.evses[0].connectors[0].status, ConnectorStatus::Occupied);
-        assert_eq!(charger.evses[0].connectors[1].status, ConnectorStatus::Available);
+        assert_eq!(
+            charger.evses[0].connectors[0].status,
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            charger.evses[0].connectors[1].status,
+            ConnectorStatus::Available
+        );
     }
 
     #[test]
     fn apply_ocpp_state_synthesizes_a_vehicle_the_first_time_a_connector_becomes_occupied() {
         let mut charger = charger_state();
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Connected, OcppConnectorState::Available]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Connected,
+            OcppConnectorState::Available,
+        ]);
 
         apply_ocpp_state(&mut charger, &ocpp);
 
@@ -308,7 +380,10 @@ mod tests {
             id: "MY-EV".into(),
             state_of_charge: Some(55.0),
         });
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Charging, OcppConnectorState::Available]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Charging,
+            OcppConnectorState::Available,
+        ]);
 
         apply_ocpp_state(&mut charger, &ocpp);
 
@@ -324,7 +399,10 @@ mod tests {
             id: "MY-EV".into(),
             state_of_charge: None,
         });
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Available, OcppConnectorState::Available]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Available,
+            OcppConnectorState::Available,
+        ]);
 
         apply_ocpp_state(&mut charger, &ocpp);
 
@@ -353,7 +431,11 @@ mod tests {
             }))
         );
         assert_eq!(
-            command_to_connector_event(Command::PresentRfid, OcppConnectorState::Connected, "TAG-1"),
+            command_to_connector_event(
+                Command::PresentRfid,
+                OcppConnectorState::Connected,
+                "TAG-1"
+            ),
             None
         );
     }
@@ -396,7 +478,10 @@ mod tests {
 
     #[test]
     fn build_ocpp_event_targets_the_first_eligible_connector() {
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Locked, OcppConnectorState::Available]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Locked,
+            OcppConnectorState::Available,
+        ]);
 
         let event = build_ocpp_event(&ocpp, 0, Command::PlugInVehicle, "").unwrap();
 
@@ -414,7 +499,10 @@ mod tests {
 
     #[test]
     fn build_ocpp_event_returns_none_when_no_connector_is_eligible() {
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Locked, OcppConnectorState::Charging]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Locked,
+            OcppConnectorState::Charging,
+        ]);
         assert_eq!(build_ocpp_event(&ocpp, 0, Command::PlugInVehicle, ""), None);
     }
 
@@ -426,10 +514,14 @@ mod tests {
 
     #[test]
     fn build_ocpp_event_for_connector_targets_the_given_connector_even_when_an_earlier_one_would_also_be_eligible()
-    {
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Available, OcppConnectorState::Available]);
+     {
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Available,
+            OcppConnectorState::Available,
+        ]);
 
-        let event = build_ocpp_event_for_connector(&ocpp, 0, 1, Command::PlugInVehicle, "").unwrap();
+        let event =
+            build_ocpp_event_for_connector(&ocpp, 0, 1, Command::PlugInVehicle, "").unwrap();
 
         assert_eq!(
             event,
@@ -445,7 +537,10 @@ mod tests {
 
     #[test]
     fn build_ocpp_event_for_connector_returns_none_when_that_connector_is_not_eligible() {
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Available, OcppConnectorState::Charging]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Available,
+            OcppConnectorState::Charging,
+        ]);
         assert_eq!(
             build_ocpp_event_for_connector(&ocpp, 0, 1, Command::PlugInVehicle, ""),
             None
@@ -467,7 +562,10 @@ mod tests {
 
     #[test]
     fn build_ocpp_event_and_build_ocpp_event_for_connector_agree_on_the_first_eligible_connector() {
-        let ocpp = ocpp_state_with(vec![OcppConnectorState::Locked, OcppConnectorState::Available]);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Locked,
+            OcppConnectorState::Available,
+        ]);
 
         let via_first_eligible = build_ocpp_event(&ocpp, 0, Command::PlugInVehicle, "");
         let via_targeted = build_ocpp_event_for_connector(&ocpp, 0, 1, Command::PlugInVehicle, "");

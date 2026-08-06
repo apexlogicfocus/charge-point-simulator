@@ -28,8 +28,7 @@ pub fn score(haystack: &str, needle: &str) -> Option<u32> {
             .map(|offset| haystack_index + offset)?;
 
         let is_contiguous = previous_match_index == Some(match_index.wrapping_sub(1));
-        let is_word_start = match_index == 0
-            || !haystack_chars[match_index - 1].is_alphanumeric();
+        let is_word_start = match_index == 0 || !haystack_chars[match_index - 1].is_alphanumeric();
 
         let mut char_score = 1;
         if is_contiguous {
@@ -46,7 +45,9 @@ pub fn score(haystack: &str, needle: &str) -> Option<u32> {
 
     // An exact prefix match (needle matches the start of haystack character-for-character)
     // scores highest of all - reward it on top of the per-character scoring above.
-    if haystack_chars.len() >= needle_chars.len() && haystack_chars[..needle_chars.len()] == needle_chars[..] {
+    if haystack_chars.len() >= needle_chars.len()
+        && haystack_chars[..needle_chars.len()] == needle_chars[..]
+    {
         total += 100;
     }
 
@@ -80,7 +81,10 @@ mod tests {
     fn contiguous_runs_beat_scattered_matches() {
         let contiguous = score("Plug in vehicle", "plug").unwrap();
         let scattered = score("Plug in vehicle", "pgin").unwrap();
-        assert!(contiguous > scattered, "{contiguous} should be > {scattered}");
+        assert!(
+            contiguous > scattered,
+            "{contiguous} should be > {scattered}"
+        );
     }
 
     #[test]

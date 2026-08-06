@@ -3,8 +3,8 @@ use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, CommandParameter,
-    ConnectionProfile, ConnectionStore, OcppVersion, SecurityProfile, SimulationMode, apply_ocpp_state,
-    build_ocpp_event_for_connector, connect_charger, meter_sample_events,
+    ConnectionProfile, ConnectionStore, OcppVersion, SecurityProfile, SimulationMode,
+    apply_ocpp_state, build_ocpp_event_for_connector, connect_charger, meter_sample_events,
 };
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -673,7 +673,11 @@ impl App {
     /// parameter. Prefilling rather than merely suggesting means the common case - plugging the
     /// same test vehicle in again - is Enter, not retyping an id.
     fn open_parameter_prompt(&mut self, command: Command, parameter: CommandParameter) {
-        let remembered = self.parameter_history.get(&parameter).cloned().unwrap_or_default();
+        let remembered = self
+            .parameter_history
+            .get(&parameter)
+            .cloned()
+            .unwrap_or_default();
         self.parameter_field = TextField::new(remembered);
         self.parameter_error = None;
         self.parameter_prompt = Some(command);
@@ -1007,7 +1011,11 @@ impl App {
     /// rather than assigning `status_message` directly - an un-stamped toast would never
     /// expire, which is the bug this replaced.
     pub(crate) fn set_status(&mut self, severity: StatusSeverity, message: String) {
-        self.status_message = Some(Toast { severity, message, shown_at: Instant::now() });
+        self.status_message = Some(Toast {
+            severity,
+            message,
+            shown_at: Instant::now(),
+        });
     }
 
     fn expire_status_message(&mut self, now: Instant) {
@@ -1058,7 +1066,9 @@ mod tests {
     /// The command bar's current message, without the `Instant` a `Toast` also carries -
     /// assertions care about severity and text, never when it was shown.
     fn status(app: &App) -> Option<(StatusSeverity, String)> {
-        app.status_message.as_ref().map(|toast| (toast.severity, toast.message.clone()))
+        app.status_message
+            .as_ref()
+            .map(|toast| (toast.severity, toast.message.clone()))
     }
 
     /// The visible log pane as plain strings. Most assertions here care about *which* lines
@@ -1707,7 +1717,10 @@ mod tests {
             app.charger_state.as_ref().unwrap().display_message,
             Some("Welcome to Flowion".to_string())
         );
-        assert_eq!(status(&app), Some((StatusSeverity::Ok, "✓ Set display message".to_string())));
+        assert_eq!(
+            status(&app),
+            Some((StatusSeverity::Ok, "✓ Set display message".to_string()))
+        );
         let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
         assert!(labels.contains(&"Clear display message"));
     }
@@ -1912,7 +1925,10 @@ mod tests {
         app.handle_key_event(key(KeyCode::Char('E')));
         app.handle_key_event(key(KeyCode::Enter)); // submits it
 
-        assert_eq!(status(&app), Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string())));
+        assert_eq!(
+            status(&app),
+            Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string()))
+        );
     }
 
     #[test]
@@ -2103,19 +2119,34 @@ mod tests {
 
     #[test]
     fn tab_retargets_the_palette_to_the_next_connector() {
-        let mut app = App::new(vec![charger_with_evses("CP-2C", vec![EvseConfig { id: 1, connectors: 2 }])]);
+        let mut app = App::new(vec![charger_with_evses(
+            "CP-2C",
+            vec![EvseConfig {
+                id: 1,
+                connectors: 2,
+            }],
+        )]);
         app.confirm_charger_selection();
         app.handle_key_event(key(KeyCode::Char('c')));
-        assert_eq!(app.focused_connector_label().as_deref(), Some("EVSE 1 / C1"));
+        assert_eq!(
+            app.focused_connector_label().as_deref(),
+            Some("EVSE 1 / C1")
+        );
 
         app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.focused_connector_label().as_deref(), Some("EVSE 1 / C2"));
+        assert_eq!(
+            app.focused_connector_label().as_deref(),
+            Some("EVSE 1 / C2")
+        );
         // Still open: retargeting happens in place, without a round trip through the dashboard.
         assert!(app.command_palette_open);
         assert_eq!(app.command_palette_selected, 0);
 
         app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.focused_connector_label().as_deref(), Some("EVSE 1 / C1"));
+        assert_eq!(
+            app.focused_connector_label().as_deref(),
+            Some("EVSE 1 / C1")
+        );
     }
 
     #[test]
@@ -2183,7 +2214,10 @@ mod tests {
         let shown_at = app.status_message.as_ref().unwrap().shown_at;
 
         // Just short of the TTL: still there, so the message is actually readable.
-        app.tick_metrics_with(Duration::ZERO, shown_at + STATUS_MESSAGE_TTL - Duration::from_millis(1));
+        app.tick_metrics_with(
+            Duration::ZERO,
+            shown_at + STATUS_MESSAGE_TTL - Duration::from_millis(1),
+        );
         assert!(app.status_message.is_some());
 
         app.tick_metrics_with(Duration::ZERO, shown_at + STATUS_MESSAGE_TTL);
@@ -2405,7 +2439,10 @@ mod tests {
 
         app.poll_connect_result();
 
-        assert_eq!(status(&app), Some((StatusSeverity::Ok, "✓ connected to CSMS".to_string())));
+        assert_eq!(
+            status(&app),
+            Some((StatusSeverity::Ok, "✓ connected to CSMS".to_string()))
+        );
         assert!(app.connect_result_receiver.is_none());
     }
 
@@ -2420,7 +2457,10 @@ mod tests {
 
         assert_eq!(
             status(&app),
-            Some((StatusSeverity::Error, "✗ CSMS connection failed: boom".to_string()))
+            Some((
+                StatusSeverity::Error,
+                "✗ CSMS connection failed: boom".to_string()
+            ))
         );
         assert!(app.connect_result_receiver.is_none());
     }
@@ -2579,7 +2619,10 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         assert_eq!(
             status(&app),
-            Some((StatusSeverity::Error, "✗ Plug in vehicle not ready yet".to_string()))
+            Some((
+                StatusSeverity::Error,
+                "✗ Plug in vehicle not ready yet".to_string()
+            ))
         );
     }
 

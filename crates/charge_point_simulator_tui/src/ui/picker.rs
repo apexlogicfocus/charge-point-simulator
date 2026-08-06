@@ -81,7 +81,10 @@ fn render_charger_list(frame: &mut Frame, app: &App, area: Rect) {
     ));
 
     let items: Vec<ListItem> = if chargers.is_empty() {
-        vec![ListItem::new(Line::styled("no chargers match", theme::text_muted()))]
+        vec![ListItem::new(Line::styled(
+            "no chargers match",
+            theme::text_muted(),
+        ))]
     } else {
         chargers
             .iter()

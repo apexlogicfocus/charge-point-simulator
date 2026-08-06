@@ -9,7 +9,7 @@ use crate::app::App;
 use crate::screen::Screen;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use view::{DashboardView, ParameterPromptView, PaletteView};
+use view::{DashboardView, PaletteView, ParameterPromptView};
 
 pub(crate) fn draw(frame: &mut Frame, app: &App) {
     if dashboard::is_terminal_too_small(frame.area()) {
@@ -26,7 +26,10 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
                 palette::render_command_palette(frame, &PaletteView::from_app(app));
             }
             if let Some(command) = app.parameter_prompt {
-                palette::render_parameter_prompt(frame, &ParameterPromptView::from_app(app, command));
+                palette::render_parameter_prompt(
+                    frame,
+                    &ParameterPromptView::from_app(app, command),
+                );
             }
         }
     }

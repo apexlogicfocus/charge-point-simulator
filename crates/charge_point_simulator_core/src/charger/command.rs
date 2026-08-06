@@ -110,7 +110,10 @@ impl Command {
     /// [`Self::is_available_for_charger`]/[`Self::apply_to_charger`] instead of the EVSE-scoped
     /// [`Self::is_available`]/[`Self::apply`].
     pub fn is_display_command(&self) -> bool {
-        matches!(self, Command::SetDisplayMessage | Command::ClearDisplayMessage)
+        matches!(
+            self,
+            Command::SetDisplayMessage | Command::ClearDisplayMessage
+        )
     }
 
     /// Whether `charger` is eligible for this display command: it needs a display, and
@@ -159,7 +162,10 @@ impl Command {
             Command::PlugInVehicle => status == ConnectorStatus::Available,
             Command::PresentRfid => status == ConnectorStatus::Occupied,
             Command::UnplugVehicle => {
-                matches!(status, ConnectorStatus::Occupied | ConnectorStatus::Charging)
+                matches!(
+                    status,
+                    ConnectorStatus::Occupied | ConnectorStatus::Charging
+                )
             }
             Command::ReportFault => status != ConnectorStatus::Faulted,
             Command::ClearFault => status == ConnectorStatus::Faulted,
@@ -203,7 +209,12 @@ impl Command {
     /// `input` is the value collected for this command's [`parameter`](Self::parameter),
     /// or blank for commands that don't have one. A blank value falls back to a
     /// generated default rather than rejecting the command.
-    pub fn apply_to(&self, evse: &mut EvseState, connector_index: usize, input: &str) -> Option<String> {
+    pub fn apply_to(
+        &self,
+        evse: &mut EvseState,
+        connector_index: usize,
+        input: &str,
+    ) -> Option<String> {
         let evse_id = evse.id;
         let connector = evse.connectors.get_mut(connector_index)?;
         if !self.applies_to(connector.status) {
@@ -249,7 +260,11 @@ impl Command {
                 )
             }
             Command::ReportFault => {
-                let code = if input.is_empty() { "GenericError" } else { input };
+                let code = if input.is_empty() {
+                    "GenericError"
+                } else {
+                    input
+                };
                 connector.status = ConnectorStatus::Faulted;
                 format!(
                     "EVSE {} connector {}: fault reported ({})",
@@ -262,9 +277,9 @@ impl Command {
             }
             // `applies_to` always returns `false` for these, so the check above already
             // returned before this point could ever be reached for one.
-            Command::SetDisplayMessage | Command::ClearDisplayMessage => unreachable!(
-                "display commands never match a connector via applies_to"
-            ),
+            Command::SetDisplayMessage | Command::ClearDisplayMessage => {
+                unreachable!("display commands never match a connector via applies_to")
+            }
         };
 
         Some(message)
@@ -376,9 +391,16 @@ mod tests {
 
     #[test]
     fn unplug_vehicle_is_available_for_occupied_or_charging_connectors() {
-        assert!(Command::UnplugVehicle.is_available(&evse_with_statuses(&[ConnectorStatus::Occupied])));
-        assert!(Command::UnplugVehicle.is_available(&evse_with_statuses(&[ConnectorStatus::Charging])));
-        assert!(!Command::UnplugVehicle.is_available(&evse_with_statuses(&[ConnectorStatus::Available])));
+        assert!(
+            Command::UnplugVehicle.is_available(&evse_with_statuses(&[ConnectorStatus::Occupied]))
+        );
+        assert!(
+            Command::UnplugVehicle.is_available(&evse_with_statuses(&[ConnectorStatus::Charging]))
+        );
+        assert!(
+            !Command::UnplugVehicle
+                .is_available(&evse_with_statuses(&[ConnectorStatus::Available]))
+        );
     }
 
     #[test]
@@ -391,7 +413,9 @@ mod tests {
     #[test]
     fn report_fault_includes_the_given_fault_code_in_the_log_line() {
         let mut evse = evse_with_statuses(&[ConnectorStatus::Available]);
-        let message = Command::ReportFault.apply(&mut evse, "OverCurrentFailure").unwrap();
+        let message = Command::ReportFault
+            .apply(&mut evse, "OverCurrentFailure")
+            .unwrap();
         assert!(message.contains("OverCurrentFailure"));
     }
 
@@ -427,9 +451,18 @@ mod tests {
 
     #[test]
     fn only_commands_that_need_extra_input_report_a_parameter() {
-        assert_eq!(Command::PlugInVehicle.parameter(), Some(CommandParameter::VehicleId));
-        assert_eq!(Command::PresentRfid.parameter(), Some(CommandParameter::RfidTag));
-        assert_eq!(Command::ReportFault.parameter(), Some(CommandParameter::FaultCode));
+        assert_eq!(
+            Command::PlugInVehicle.parameter(),
+            Some(CommandParameter::VehicleId)
+        );
+        assert_eq!(
+            Command::PresentRfid.parameter(),
+            Some(CommandParameter::RfidTag)
+        );
+        assert_eq!(
+            Command::ReportFault.parameter(),
+            Some(CommandParameter::FaultCode)
+        );
         assert_eq!(Command::UnplugVehicle.parameter(), None);
         assert_eq!(Command::ClearFault.parameter(), None);
         assert_eq!(
@@ -465,16 +498,23 @@ mod tests {
     #[test]
     fn set_display_message_stores_the_given_text() {
         let mut charger = charger_with_display(true);
-        let message = Command::SetDisplayMessage.apply_to_charger(&mut charger, "Welcome to Flowion").unwrap();
+        let message = Command::SetDisplayMessage
+            .apply_to_charger(&mut charger, "Welcome to Flowion")
+            .unwrap();
 
-        assert_eq!(charger.display_message, Some("Welcome to Flowion".to_string()));
+        assert_eq!(
+            charger.display_message,
+            Some("Welcome to Flowion".to_string())
+        );
         assert!(message.contains("Welcome to Flowion"));
     }
 
     #[test]
     fn set_display_message_falls_back_to_a_default_when_left_blank() {
         let mut charger = charger_with_display(true);
-        Command::SetDisplayMessage.apply_to_charger(&mut charger, "  ").unwrap();
+        Command::SetDisplayMessage
+            .apply_to_charger(&mut charger, "  ")
+            .unwrap();
 
         assert_eq!(charger.display_message, Some("Welcome".to_string()));
     }
@@ -484,7 +524,9 @@ mod tests {
         let mut charger = charger_with_display(true);
         charger.display_message = Some("hello".to_string());
 
-        Command::ClearDisplayMessage.apply_to_charger(&mut charger, "").unwrap();
+        Command::ClearDisplayMessage
+            .apply_to_charger(&mut charger, "")
+            .unwrap();
 
         assert_eq!(charger.display_message, None);
     }
@@ -510,9 +552,12 @@ mod tests {
 
     #[test]
     fn apply_to_acts_on_the_given_connector_even_when_an_earlier_one_would_also_be_eligible() {
-        let mut evse = evse_with_statuses(&[ConnectorStatus::Available, ConnectorStatus::Available]);
+        let mut evse =
+            evse_with_statuses(&[ConnectorStatus::Available, ConnectorStatus::Available]);
 
-        let message = Command::PlugInVehicle.apply_to(&mut evse, 1, "MY-EV").unwrap();
+        let message = Command::PlugInVehicle
+            .apply_to(&mut evse, 1, "MY-EV")
+            .unwrap();
 
         assert_eq!(evse.connectors[0].status, ConnectorStatus::Available);
         assert!(evse.connectors[0].vehicle.is_none());
@@ -561,7 +606,11 @@ mod tests {
     fn every_command_has_a_non_empty_description_distinct_from_its_label() {
         for command in Command::ALL {
             let description = command.description();
-            assert!(!description.is_empty(), "{:?} has an empty description", command);
+            assert!(
+                !description.is_empty(),
+                "{:?} has an empty description",
+                command
+            );
             assert!(
                 description.len() <= 50,
                 "{:?} description is too long for a palette row: {:?}",
@@ -579,11 +628,16 @@ mod tests {
 
     #[test]
     fn apply_and_apply_to_agree_on_the_first_eligible_connector() {
-        let mut via_apply = evse_with_statuses(&[ConnectorStatus::Occupied, ConnectorStatus::Available]);
+        let mut via_apply =
+            evse_with_statuses(&[ConnectorStatus::Occupied, ConnectorStatus::Available]);
         let mut via_apply_to = via_apply.clone();
 
-        let message_apply = Command::PlugInVehicle.apply(&mut via_apply, "SAME-EV").unwrap();
-        let message_apply_to = Command::PlugInVehicle.apply_to(&mut via_apply_to, 1, "SAME-EV").unwrap();
+        let message_apply = Command::PlugInVehicle
+            .apply(&mut via_apply, "SAME-EV")
+            .unwrap();
+        let message_apply_to = Command::PlugInVehicle
+            .apply_to(&mut via_apply_to, 1, "SAME-EV")
+            .unwrap();
 
         assert_eq!(via_apply, via_apply_to);
         assert_eq!(message_apply, message_apply_to);

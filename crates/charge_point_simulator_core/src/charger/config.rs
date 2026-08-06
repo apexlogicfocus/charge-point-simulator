@@ -126,10 +126,8 @@ mod tests {
             ("2.0.1", OcppVersion::V201),
             ("2.1", OcppVersion::V21),
         ] {
-            let config = ChargerConfig::from_yaml(&format!(
-                "id: CP\nocpp_version: \"{raw}\"\n"
-            ))
-            .unwrap();
+            let config =
+                ChargerConfig::from_yaml(&format!("id: CP\nocpp_version: \"{raw}\"\n")).unwrap();
             assert_eq!(config.ocpp_version, expected);
         }
     }

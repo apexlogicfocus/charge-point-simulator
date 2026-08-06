@@ -45,25 +45,41 @@ impl Connector for FakeConnector {
 
     async fn lock(&self) -> Result<(), Self::Error> {
         self.locked.store(true, Ordering::Relaxed);
-        tracing::info!(evse = self.evse_id, connector = self.connector_id, "connector locked");
+        tracing::info!(
+            evse = self.evse_id,
+            connector = self.connector_id,
+            "connector locked"
+        );
         Ok(())
     }
 
     async fn unlock(&self) -> Result<(), Self::Error> {
         self.locked.store(false, Ordering::Relaxed);
-        tracing::info!(evse = self.evse_id, connector = self.connector_id, "connector unlocked");
+        tracing::info!(
+            evse = self.evse_id,
+            connector = self.connector_id,
+            "connector unlocked"
+        );
         Ok(())
     }
 
     async fn close_contactor(&self) -> Result<(), Self::Error> {
         self.contactor_closed.store(true, Ordering::Relaxed);
-        tracing::info!(evse = self.evse_id, connector = self.connector_id, "contactor closed");
+        tracing::info!(
+            evse = self.evse_id,
+            connector = self.connector_id,
+            "contactor closed"
+        );
         Ok(())
     }
 
     async fn open_contactor(&self) -> Result<(), Self::Error> {
         self.contactor_closed.store(false, Ordering::Relaxed);
-        tracing::info!(evse = self.evse_id, connector = self.connector_id, "contactor opened");
+        tracing::info!(
+            evse = self.evse_id,
+            connector = self.connector_id,
+            "contactor opened"
+        );
         Ok(())
     }
 }
@@ -161,22 +177,26 @@ mod tests {
         let config = ChargerConfig {
             id: "CP001".into(),
             ocpp_version: OcppVersion::V21,
-            evses: vec![EvseConfig { id: 1, connectors: 1 }],
+            evses: vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
             has_display: false,
         };
 
         // A throwaway runtime, just to mint real event/command channel handles - `start` is
         // called directly below, not through this runtime.
-        let channel_source = ChargePointRuntime::new(
-            FakeChargePoint::from_config(&config),
-            [1],
-            &TokioExecutor,
-        );
+        let channel_source =
+            ChargePointRuntime::new(FakeChargePoint::from_config(&config), [1], &TokioExecutor);
         let events = channel_source.hardware_events();
         let commands = channel_source.hardware_commands();
 
         let charge_point = FakeChargePoint::from_config(&config);
-        let result = tokio::time::timeout(Duration::from_millis(200), charge_point.start(events, commands)).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            charge_point.start(events, commands),
+        )
+        .await;
 
         assert!(result.is_ok(), "start() did not return within the timeout");
         assert!(result.unwrap().is_ok());
@@ -212,8 +232,14 @@ mod tests {
             id: "CP001".into(),
             ocpp_version: OcppVersion::V21,
             evses: vec![
-                EvseConfig { id: 1, connectors: 2 },
-                EvseConfig { id: 2, connectors: 1 },
+                EvseConfig {
+                    id: 1,
+                    connectors: 2,
+                },
+                EvseConfig {
+                    id: 2,
+                    connectors: 1,
+                },
             ],
             has_display: false,
         };

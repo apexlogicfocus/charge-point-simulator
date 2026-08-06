@@ -179,7 +179,12 @@ mod tests {
         for section in SECTIONS {
             idx += 1; // title line
             for binding in section.bindings {
-                let expected = format!(" {:width$}  {}", binding.keys, binding.description, width = width);
+                let expected = format!(
+                    " {:width$}  {}",
+                    binding.keys,
+                    binding.description,
+                    width = width
+                );
                 assert_eq!(
                     lines[idx], expected,
                     "binding line for {:?} is not aligned to the computed width",
@@ -204,7 +209,11 @@ mod tests {
     fn help_lines_mention_every_binding() {
         let lines = help_lines().join("\n");
         for section in SECTIONS {
-            assert!(lines.contains(section.title), "missing section title {:?}", section.title);
+            assert!(
+                lines.contains(section.title),
+                "missing section title {:?}",
+                section.title
+            );
             for binding in section.bindings {
                 assert!(
                     lines.contains(binding.keys),

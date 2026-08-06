@@ -83,7 +83,8 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         // (`connection_focused_field`), so `focused` here is real, not a placeholder - the
         // focused field's section rule lights up in `chrome_focused()`'s brand teal.
         frame.render_widget(
-            Paragraph::new(Line::styled(display_value, theme::text())).block(theme::section(title, focused)),
+            Paragraph::new(Line::styled(display_value, theme::text()))
+                .block(theme::section(title, focused)),
             area,
         );
         if focused {

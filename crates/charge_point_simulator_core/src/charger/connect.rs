@@ -76,7 +76,8 @@ mod tests {
         let profile = ConnectionProfile {
             csms_url: std::env::var("OCPP_TEST_URL")
                 .unwrap_or_else(|_| "http://localhost:8082/flowion/dev".into()),
-            ocpp_identity: std::env::var("OCPP_TEST_IDENTITY").unwrap_or_else(|_| "sim-test".into()),
+            ocpp_identity: std::env::var("OCPP_TEST_IDENTITY")
+                .unwrap_or_else(|_| "sim-test".into()),
             security: SecurityProfile::basic(
                 std::env::var("OCPP_TEST_PASSWORD").unwrap_or_default(),
             )

@@ -87,7 +87,10 @@ mod tests {
         store.save(&path).unwrap();
 
         let loaded = ConnectionStore::load(&path);
-        assert_eq!(loaded.get("CP001"), Some(&profile("wss://csms.example.com/dev")));
+        assert_eq!(
+            loaded.get("CP001"),
+            Some(&profile("wss://csms.example.com/dev"))
+        );
     }
 
     #[test]
@@ -114,9 +117,6 @@ mod tests {
         store.remember("CP001", profile("wss://old.example.com"));
         store.remember("CP001", profile("wss://new.example.com"));
 
-        assert_eq!(
-            store.get("CP001"),
-            Some(&profile("wss://new.example.com"))
-        );
+        assert_eq!(store.get("CP001"), Some(&profile("wss://new.example.com")));
     }
 }

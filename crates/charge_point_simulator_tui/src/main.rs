@@ -1,8 +1,8 @@
-mod screen;
 mod app;
 mod fuzzy;
 mod keybindings;
 mod logs;
+mod screen;
 #[cfg(test)]
 mod snapshot;
 mod text_field;
@@ -12,9 +12,9 @@ mod ui;
 
 use std::path::PathBuf;
 
+use crate::app::App;
 use charge_point_simulator_core::charger::{ConnectionStore, all_chargers};
 use color_eyre::Result;
-use crate::app::App;
 
 fn config_dir() -> PathBuf {
     std::env::var("FLOWION_CONFIG_DIR")

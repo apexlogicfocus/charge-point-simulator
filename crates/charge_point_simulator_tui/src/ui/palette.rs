@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
-use super::view::{ParameterPromptView, PaletteView};
+use super::view::{PaletteView, ParameterPromptView};
 use crate::theme::{self, bordered_block};
 
 /// Wider than the old 50 columns: each row now carries a label *and* a description, and the
@@ -44,7 +44,10 @@ pub(super) fn render_command_palette(frame: &mut Frame, view: &PaletteView) {
     frame.set_cursor_position((filter_area.x + 1 + view.cursor as u16, filter_area.y + 1));
 
     let items: Vec<ListItem> = if view.commands.is_empty() {
-        vec![ListItem::new(Line::styled("no commands match", theme::text_muted()))]
+        vec![ListItem::new(Line::styled(
+            "no commands match",
+            theme::text_muted(),
+        ))]
     } else {
         // The label column is sized from the widest label actually listed, so descriptions
         // line up without a hardcoded width that a renamed command could silently break.
@@ -58,7 +61,10 @@ pub(super) fn render_command_palette(frame: &mut Frame, view: &PaletteView) {
             .iter()
             .map(|command| {
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<label_width$}  ", command.label()), theme::text()),
+                    Span::styled(
+                        format!("{:<label_width$}  ", command.label()),
+                        theme::text(),
+                    ),
                     Span::styled(command.description(), theme::text_dim()),
                 ]))
             })
