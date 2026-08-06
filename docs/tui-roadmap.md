@@ -98,8 +98,9 @@ The guiding principles, which every remaining phase should be checked against:
 ## Phase 7 — polish
 
 All four items have landed; see the Done section above. Nothing is scheduled after this — the
-open decisions below are all settled, so the next move is one of the unscheduled gaps after them,
-or the REST API crate that `CLAUDE.md` describes as planned.
+open decisions below are all settled, so the next move is one of the unscheduled gaps after them.
+(No REST API crate is coming here — `core` is published to crates.io and any REST API lives in a
+separate downstream repo. See `CLAUDE.md`.)
 
 ## Settled decisions
 
@@ -111,7 +112,8 @@ All four former open decisions have had their human call:
    `dashboard.rs::evse_summary_status` already matched, so nothing changed but the doc comment,
    which now says this is deliberate.
 2. **Power sparkline ownership** — rolling metrics history belongs in `core`, not the TUI. A
-   sparkline is then pure presentation over data the planned REST API can serve too. Not yet
+   sparkline is then pure presentation over data downstream consumers of the published `core`
+   crate can serve too. Not yet
    implemented; when it is, the history lives beside `EvseMetrics` and is driven by
    `EvseState::tick`'s existing injected `elapsed`, never a wall clock.
 3. **Deprecating the first-eligible command API** — removed. `Command::apply`/`Command::is_available`
@@ -137,7 +139,8 @@ All four former open decisions have had their human call:
   plumbing.
 - **The view model is thin.** `DashboardView` borrows `&ChargerState` wholesale rather than
   reshaping it, so render functions still walk nested state. Adequate for one frontend; worth
-  revisiting when the planned REST API becomes a second consumer.
+  revisiting if a second frontend appears — though as an out-of-repo consumer of the published
+  `core` crate, that frontend would build its own view model anyway.
 
 ## Working agreements
 

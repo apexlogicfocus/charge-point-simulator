@@ -24,8 +24,11 @@ Cargo workspace with members under `crates/*`:
   particular UI or API belongs here.
 - `charge_point_simulator_tui` — interactive `ratatui` dashboard (`crossterm` + `color-eyre`) for monitoring
   and controlling simulated charge points. Depends on `core`; should contain no simulation logic itself.
-- A proprietary REST API crate for driving the simulator programmatically is planned but not yet present.
-  When it's added, it should follow the same pattern: thin interface layer over `core`.
+- A REST API for driving the simulator programmatically will **not** be built in this repository.
+  Instead, `charge_point_simulator_core` is published to crates.io, and any REST API is a separate
+  downstream consumer of that crate. This means `core`'s public API is a supported, versioned
+  surface for external users — treat breaking changes to it accordingly, and keep simulator logic
+  in `core` rather than in the TUI so downstream consumers get it too.
 
 Both crates currently share `tokio` via `workspace.dependencies` in the root `Cargo.toml`.
 
