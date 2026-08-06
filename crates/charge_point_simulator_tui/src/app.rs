@@ -105,6 +105,19 @@ pub struct App {
     pub connection_ocpp_identity: TextField,
     pub connection_password: TextField,
     pub connection_focused_field: usize,
+    /// Why the typed CSMS URL was rejected, shown inline under the field - cleared as soon as
+    /// the URL field is edited, the same rule [`Self::parameter_error`] follows.
+    pub connection_url_error: Option<&'static str>,
+    /// Whether the password field shows its raw value instead of `*`s. Starts (and resets to)
+    /// `false` every time the connection setup screen is entered - a revealed password
+    /// shouldn't survive to the *next* charger's setup screen just because this one was
+    /// toggled.
+    pub connection_password_revealed: bool,
+    /// Which entry of [`Self::connection_url_suggestions`] `PageUp`/`PageDown` last landed the
+    /// URL field on, so cycling continues from there instead of always restarting at the first
+    /// suggestion. Reset whenever the URL field is edited, since the previous index may no
+    /// longer point at the same suggestion once the (filtered) list changes.
+    pub connection_url_suggestion: Option<usize>,
     pub connect_result_receiver: Option<oneshot::Receiver<Result<(), String>>>,
     /// Live protocol state snapshots forwarded from a connected OCPP 2.1 charger's
     /// background connection thread, drained each frame by [`Self::drain_ocpp_state_receiver`].
@@ -144,6 +157,19 @@ fn validate_parameter(value: &str) -> Option<&'static str> {
         return Some("cannot be blank");
     }
     None
+}
+
+/// Validates the CSMS URL field on the connection setup screen. Blank is fine - that's "run
+/// locally," see [`resolve_simulation_mode`] - but a non-blank value must be a WebSocket URL,
+/// since that's the only scheme OCPP ever dials a CSMS over; anything else is almost certainly
+/// a typo (a pasted `https://` dashboard link, most often) worth catching before a connection
+/// attempt fails on it.
+fn validate_csms_url(value: &str) -> Option<&'static str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        return None;
+    }
+    Some("must start with ws:// or wss://")
 }
 
 fn resolve_simulation_mode(csms_url: &str) -> SimulationMode {
@@ -396,15 +422,84 @@ impl App {
             KeyCode::Tab | KeyCode::Down => self.connection_focus_next(),
             KeyCode::BackTab | KeyCode::Up => self.connection_focus_previous(),
             KeyCode::Enter => self.confirm_connection_setup(),
-            KeyCode::Backspace => self.focused_connection_field_mut().backspace(),
-            KeyCode::Delete => self.focused_connection_field_mut().delete(),
+            KeyCode::Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.connection_password_revealed = !self.connection_password_revealed;
+            }
+            // Only meaningful on the URL field - there's nothing to cycle from the identity or
+            // password fields, so this is a no-op there rather than cycling suggestions out
+            // from under a field the user isn't looking at.
+            KeyCode::PageDown if self.connection_focused_field == 0 => {
+                self.cycle_url_suggestion(true)
+            }
+            KeyCode::PageUp if self.connection_focused_field == 0 => {
+                self.cycle_url_suggestion(false)
+            }
+            KeyCode::Backspace => {
+                self.focused_connection_field_mut().backspace();
+                self.note_connection_url_field_edited();
+            }
+            KeyCode::Delete => {
+                self.focused_connection_field_mut().delete();
+                self.note_connection_url_field_edited();
+            }
             KeyCode::Left => self.focused_connection_field_mut().move_left(),
             KeyCode::Right => self.focused_connection_field_mut().move_right(),
             KeyCode::Home => self.focused_connection_field_mut().move_home(),
             KeyCode::End => self.focused_connection_field_mut().move_end(),
-            KeyCode::Char(c) => self.focused_connection_field_mut().insert_char(c),
+            KeyCode::Char(c) => {
+                self.focused_connection_field_mut().insert_char(c);
+                self.note_connection_url_field_edited();
+            }
             _ => {}
         }
+    }
+
+    /// Clears the URL field's error and suggestion-cycle position once it's edited - mirrors
+    /// [`Self::cancel_parameter_prompt`]'s "editing clears the complaint" rule. A no-op unless
+    /// the URL field (index 0) is the one actually focused, since neither piece of state means
+    /// anything for the identity or password fields.
+    fn note_connection_url_field_edited(&mut self) {
+        if self.connection_focused_field == 0 {
+            self.connection_url_error = None;
+            self.connection_url_suggestion = None;
+        }
+    }
+
+    /// The remembered CSMS URLs (see [`ConnectionStore::recent_urls`]) that match what's
+    /// currently typed in the URL field, case-insensitively by prefix - the same "typing
+    /// narrows the list" rule the picker's charger filter and the command palette's filter
+    /// both already follow.
+    pub(crate) fn connection_url_suggestions(&self) -> Vec<String> {
+        let typed = self.connection_csms_url.value().to_lowercase();
+        self.connection_store
+            .recent_urls()
+            .into_iter()
+            .filter(|url| url.to_lowercase().starts_with(&typed))
+            .collect()
+    }
+
+    /// `PageDown`/`PageUp` on the URL field: moves to the next/previous remembered URL,
+    /// wrapping at either end, and fills the field with it. Does nothing if nothing is
+    /// remembered yet.
+    ///
+    /// Deliberately cycles the *full* list from [`ConnectionStore::recent_urls`] rather than
+    /// [`Self::connection_url_suggestions`]'s prefix-filtered one: since filling the field with
+    /// a suggestion is exactly what this does, using the filtered list would mean the very
+    /// first cycle narrows the field's own prefix down to just itself, and every subsequent
+    /// press would have nothing left to cycle to.
+    fn cycle_url_suggestion(&mut self, forward: bool) {
+        let suggestions = self.connection_store.recent_urls();
+        if suggestions.is_empty() {
+            return;
+        }
+        let next_index = match self.connection_url_suggestion {
+            Some(index) if forward => (index + 1) % suggestions.len(),
+            Some(index) => (index + suggestions.len() - 1) % suggestions.len(),
+            None if forward => 0,
+            None => suggestions.len() - 1,
+        };
+        self.connection_url_suggestion = Some(next_index);
+        self.connection_csms_url = TextField::new(suggestions[next_index].clone());
     }
 
     fn handle_dashboard_key(&mut self, key_event: KeyEvent) {
@@ -811,6 +906,9 @@ impl App {
             }
         }
         self.connection_focused_field = 0;
+        self.connection_url_error = None;
+        self.connection_password_revealed = false;
+        self.connection_url_suggestion = None;
     }
 
     fn connection_focus_next(&mut self) {
@@ -832,6 +930,12 @@ impl App {
     }
 
     fn confirm_connection_setup(&mut self) {
+        if let Some(error) = validate_csms_url(self.connection_csms_url.value()) {
+            self.connection_url_error = Some(error);
+            return;
+        }
+        self.connection_url_error = None;
+
         let Some(state) = &self.charger_state else {
             return;
         };
@@ -2378,6 +2482,202 @@ mod tests {
         app.handle_key_event(key(KeyCode::Enter));
 
         assert_eq!(app.charger_state.unwrap().mode, SimulationMode::Local);
+    }
+
+    #[test]
+    fn validate_csms_url_accepts_blank_ws_and_wss() {
+        assert_eq!(validate_csms_url(""), None);
+        assert_eq!(validate_csms_url("   "), None);
+        assert_eq!(validate_csms_url("ws://host"), None);
+        assert_eq!(validate_csms_url("wss://host"), None);
+    }
+
+    #[test]
+    fn validate_csms_url_rejects_any_other_scheme() {
+        assert_eq!(
+            validate_csms_url("http://host"),
+            Some("must start with ws:// or wss://")
+        );
+        assert_eq!(
+            validate_csms_url("host.example.com"),
+            Some("must start with ws:// or wss://")
+        );
+    }
+
+    #[test]
+    fn confirming_with_an_invalid_url_scheme_shows_an_inline_error_and_stays_put() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+
+        for c in "http://host".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert_eq!(app.screen, Screen::ConnectionSetup);
+        assert_eq!(
+            app.connection_url_error,
+            Some("must start with ws:// or wss://")
+        );
+        assert!(app.connect_result_receiver.is_none());
+    }
+
+    #[test]
+    fn editing_the_url_field_clears_its_error() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        for c in "http://host".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.connection_url_error.is_some());
+
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.connection_url_error, None);
+    }
+
+    #[test]
+    fn password_reveal_starts_off_and_ctrl_r_toggles_it() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        assert!(!app.connection_password_revealed);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(app.connection_password_revealed);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(!app.connection_password_revealed);
+    }
+
+    #[test]
+    fn plain_r_is_still_typed_into_the_focused_field() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Char('r')));
+
+        assert_eq!(app.connection_csms_url.value(), "r");
+        assert!(!app.connection_password_revealed);
+    }
+
+    #[test]
+    fn page_down_cycles_forward_through_recent_url_suggestions_on_the_url_field() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.connection_store.remember(
+            "CP-OTHER-A",
+            ConnectionProfile {
+                csms_url: "wss://a.example.com".into(),
+                ocpp_identity: "x".into(),
+                security: SecurityProfile::Basic {
+                    password: String::new(),
+                },
+            },
+        );
+        app.connection_store.remember(
+            "CP-OTHER-B",
+            ConnectionProfile {
+                csms_url: "wss://b.example.com".into(),
+                ocpp_identity: "x".into(),
+                security: SecurityProfile::Basic {
+                    password: String::new(),
+                },
+            },
+        );
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::PageDown));
+        assert_eq!(app.connection_csms_url.value(), "wss://a.example.com");
+
+        app.handle_key_event(key(KeyCode::PageDown));
+        assert_eq!(app.connection_csms_url.value(), "wss://b.example.com");
+
+        // Wraps back around to the first suggestion.
+        app.handle_key_event(key(KeyCode::PageDown));
+        assert_eq!(app.connection_csms_url.value(), "wss://a.example.com");
+    }
+
+    #[test]
+    fn page_up_cycles_backward_through_recent_url_suggestions() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.connection_store.remember(
+            "CP-OTHER-A",
+            ConnectionProfile {
+                csms_url: "wss://a.example.com".into(),
+                ocpp_identity: "x".into(),
+                security: SecurityProfile::Basic {
+                    password: String::new(),
+                },
+            },
+        );
+        app.connection_store.remember(
+            "CP-OTHER-B",
+            ConnectionProfile {
+                csms_url: "wss://b.example.com".into(),
+                ocpp_identity: "x".into(),
+                security: SecurityProfile::Basic {
+                    password: String::new(),
+                },
+            },
+        );
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::PageUp));
+        assert_eq!(app.connection_csms_url.value(), "wss://b.example.com");
+    }
+
+    #[test]
+    fn typing_narrows_recent_url_suggestions_by_prefix() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.connection_store.remember(
+            "CP-OTHER-A",
+            ConnectionProfile {
+                csms_url: "wss://a.example.com".into(),
+                ocpp_identity: "x".into(),
+                security: SecurityProfile::Basic {
+                    password: String::new(),
+                },
+            },
+        );
+        app.connection_store.remember(
+            "CP-OTHER-B",
+            ConnectionProfile {
+                csms_url: "wss://b.example.com".into(),
+                ocpp_identity: "x".into(),
+                security: SecurityProfile::Basic {
+                    password: String::new(),
+                },
+            },
+        );
+        app.confirm_charger_selection();
+
+        for c in "wss://a".chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+
+        assert_eq!(
+            app.connection_url_suggestions(),
+            vec!["wss://a.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn page_down_on_a_field_other_than_the_url_does_nothing() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.connection_store.remember(
+            "CP-OTHER-A",
+            ConnectionProfile {
+                csms_url: "wss://a.example.com".into(),
+                ocpp_identity: "x".into(),
+                security: SecurityProfile::Basic {
+                    password: String::new(),
+                },
+            },
+        );
+        app.confirm_charger_selection();
+        app.handle_key_event(key(KeyCode::Tab)); // focus OCPP identity
+
+        app.handle_key_event(key(KeyCode::PageDown));
+
+        assert_eq!(app.connection_csms_url.value(), "");
     }
 
     #[test]

@@ -25,8 +25,8 @@ use crate::logs::{Direction, LogEntry, LogLevel};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
-    ChargerConfig, ChargerEntry, ChargerSource, ChargerState, Command, ConnectionStatus,
-    EvseConfig, OcppVersion, SimulationMode,
+    ChargerConfig, ChargerEntry, ChargerSource, ChargerState, Command, ConnectionProfile,
+    ConnectionStatus, EvseConfig, OcppVersion, SecurityProfile, SimulationMode,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
@@ -247,6 +247,53 @@ fn picker() {
     ]);
 
     assert_snapshot("picker", &render(&app, 120, 34));
+}
+
+/// A charger loaded from a YAML file (its `Source` column names the file, not "built-in") with
+/// a remembered CSMS endpoint (its `Last endpoint` column shows the URL, not "—") - the two
+/// picker columns Phase 6 added, next to a plain built-in/never-connected charger so both states
+/// of each column are visible in the same golden.
+#[test]
+fn picker_with_configured_charger_and_last_endpoint() {
+    let mut app = App::new(vec![
+        charger_entry(
+            "CP001",
+            OcppVersion::V16J,
+            vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }],
+        ),
+        ChargerEntry {
+            config: charger_config(
+                "CP-CUSTOM",
+                OcppVersion::V21,
+                vec![EvseConfig {
+                    id: 1,
+                    connectors: 1,
+                }],
+                false,
+            ),
+            source: ChargerSource::Configured {
+                file_name: "cp-custom.yaml".to_string(),
+            },
+        },
+    ]);
+    app.connection_store.remember(
+        "CP-CUSTOM",
+        ConnectionProfile {
+            csms_url: "wss://csms.example.com/CP-CUSTOM".into(),
+            ocpp_identity: "CP-CUSTOM".into(),
+            security: SecurityProfile::Basic {
+                password: String::new(),
+            },
+        },
+    );
+
+    assert_snapshot(
+        "picker_with_configured_charger_and_last_endpoint",
+        &render(&app, 120, 34),
+    );
 }
 
 #[test]
@@ -484,16 +531,84 @@ fn quit_confirm() {
     assert_snapshot("quit_confirm", &render(&app, 120, 34));
 }
 
-#[test]
-fn connection_setup() {
+/// An `App` on the connection setup screen for a real V2.1 charger (`charger_state` set, not
+/// just the screen enum) so the titled card has an actual charger id to name - the card's whole
+/// point is answering "which charger is this," so a scenario that left it `None` would only
+/// pin the "charger" placeholder, never the real feature.
+fn connection_setup_app() -> App {
+    let config = charger_config(
+        "CP-2.1",
+        OcppVersion::V21,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
     let mut app = App::new(vec![]);
     app.screen = Screen::ConnectionSetup;
+    app.charger_state = Some(ChargerState::from_config(config));
     app.connection_csms_url = TextField::new("wss://csms.example.com");
     app.connection_ocpp_identity = TextField::new("CP-2.1");
     app.connection_password = TextField::new("secret");
     app.connection_focused_field = 0;
+    app
+}
+
+#[test]
+fn connection_setup() {
+    let app = connection_setup_app();
 
     assert_snapshot("connection_setup", &render(&app, 120, 34));
+}
+
+/// The inline error `App::confirm_connection_setup` shows for a scheme that isn't
+/// `ws://`/`wss://`, rather than silently attempting (and failing) a connection.
+#[test]
+fn connection_setup_invalid_url_error() {
+    let mut app = connection_setup_app();
+    app.connection_csms_url = TextField::new("https://csms.example.com");
+    app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_snapshot("connection_setup_invalid_url_error", &render(&app, 120, 34));
+}
+
+/// Recent URLs from other chargers' remembered profiles, listed under the CSMS URL field.
+#[test]
+fn connection_setup_url_suggestions() {
+    let mut app = connection_setup_app();
+    app.connection_csms_url = TextField::default();
+    app.connection_store.remember(
+        "CP-OTHER-A",
+        ConnectionProfile {
+            csms_url: "wss://a.example.com".into(),
+            ocpp_identity: "CP-OTHER-A".into(),
+            security: SecurityProfile::Basic {
+                password: String::new(),
+            },
+        },
+    );
+    app.connection_store.remember(
+        "CP-OTHER-B",
+        ConnectionProfile {
+            csms_url: "wss://b.example.com".into(),
+            ocpp_identity: "CP-OTHER-B".into(),
+            security: SecurityProfile::Basic {
+                password: String::new(),
+            },
+        },
+    );
+
+    assert_snapshot("connection_setup_url_suggestions", &render(&app, 120, 34));
+}
+
+/// `Ctrl+R` showing the password field's raw value instead of `*`s.
+#[test]
+fn connection_setup_password_revealed() {
+    let mut app = connection_setup_app();
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+    assert_snapshot("connection_setup_password_revealed", &render(&app, 120, 34));
 }
 
 #[test]

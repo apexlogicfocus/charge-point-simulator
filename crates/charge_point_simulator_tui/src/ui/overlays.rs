@@ -29,8 +29,20 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     // Sized to the text rather than a hardcoded row count: the popup previously clipped its
     // own last three lines, so bindings at the bottom of the list never rendered at all. +2
     // for the block's top and bottom borders, then clamped to the terminal.
+    //
+    // Clamped to `area.height - 2`, not `area.height`: a popup that exactly fills the terminal
+    // sits flush against row 0 and the last row, so the dashboard's header and command bar -
+    // which the `Clear` widget only erases *inside* the popup's own columns - show through
+    // right up against the popup's border on both sides. Reserving a one-row margin (as long
+    // as there's height to spare) keeps the popup visually separate from what's behind it;
+    // below that, cramped is unavoidable and the scrollbar (via `needs_scrollbar`) takes over.
     let content_height = lines.len() as u16 + 2;
-    let popup = super::centered_rect(area.width.min(56), area.height.min(content_height), area);
+    let max_popup_height = area.height.saturating_sub(2).max(1);
+    let popup = super::centered_rect(
+        area.width.min(56),
+        max_popup_height.min(content_height),
+        area,
+    );
     frame.render_widget(Clear, popup);
 
     // A `section` (see `theme::bordered_block`) only spends 2 rows on chrome (top + bottom

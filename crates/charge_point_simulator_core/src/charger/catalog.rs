@@ -10,10 +10,16 @@ pub struct ChargerEntry {
     pub source: ChargerSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChargerSource {
     BuiltIn,
-    Configured,
+    /// Loaded from a YAML file discovered in the config directory - `file_name` is that file's
+    /// bare name (e.g. `"my-charger.yaml"`, not the full path) so callers like the TUI picker
+    /// can show which file a charger came from without leaking the config directory's absolute
+    /// path onto screen.
+    Configured {
+        file_name: String,
+    },
 }
 
 /// The small set of presets shipped with the simulator, usable without any YAML.
@@ -72,6 +78,7 @@ pub fn discover_configured_chargers(dir: &Path) -> Vec<ChargerEntry> {
         })
         .filter_map(|entry| {
             let path = entry.path();
+            let file_name = path.file_name()?.to_string_lossy().into_owned();
             let contents = match std::fs::read_to_string(&path) {
                 Ok(contents) => contents,
                 Err(error) => {
@@ -80,16 +87,16 @@ pub fn discover_configured_chargers(dir: &Path) -> Vec<ChargerEntry> {
                 }
             };
             match ChargerConfig::from_yaml(&contents) {
-                Ok(config) => Some(config),
+                Ok(config) => Some((config, file_name)),
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "skipping invalid charger config");
                     None
                 }
             }
         })
-        .map(|config| ChargerEntry {
+        .map(|(config, file_name)| ChargerEntry {
             config,
-            source: ChargerSource::Configured,
+            source: ChargerSource::Configured { file_name },
         })
         .collect();
 
@@ -149,7 +156,26 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .all(|entry| entry.source == ChargerSource::Configured)
+                .all(|entry| matches!(entry.source, ChargerSource::Configured { .. }))
+        );
+    }
+
+    #[test]
+    fn a_configured_charger_remembers_which_file_it_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("cp-a.yaml"),
+            "id: CP-A\nocpp_version: \"1.6j\"\n",
+        )
+        .unwrap();
+
+        let entries = discover_configured_chargers(dir.path());
+
+        assert_eq!(
+            entries[0].source,
+            ChargerSource::Configured {
+                file_name: "cp-a.yaml".to_string()
+            }
         );
     }
 
@@ -172,5 +198,11 @@ mod tests {
                 .all(|e| e.source == ChargerSource::BuiltIn)
         );
         assert_eq!(entries[built_in_count].config.id, "custom-charger");
+        assert_eq!(
+            entries[built_in_count].source,
+            ChargerSource::Configured {
+                file_name: "custom.yaml".to_string()
+            }
+        );
     }
 }

@@ -1,6 +1,6 @@
 # TUI redesign roadmap
 
-A staged plan for making the dashboard legible and modern. Phases 0–5 have landed on
+A staged plan for making the dashboard legible and modern. Phases 0–6 have landed on
 `tui-redesign-phase-0-1`; what follows them is described here in enough detail to pick up cold.
 
 The guiding principles, which every remaining phase should be checked against:
@@ -42,14 +42,23 @@ The guiding principles, which every remaining phase should be checked against:
   `tick_metrics_with`'s injectable-clock pattern — they had been hiding the keybinding hint
   permanently. The help overlay is scrollable and, with the dashboard's hint line, derived from
   a single `src/keybindings.rs` table.
+- **Phase 6** — the picker is a `ratatui::widgets::Table` with Charger/OCPP/EVSEs/Source/Last
+  endpoint columns; `ChargerSource::Configured` now carries the YAML file's bare name for the
+  Source column, and `ConnectionStore::recent_urls` backs the Last endpoint column (and the
+  connection setup screen's suggestions, below). Column text is truncated with a trailing `…` at
+  each column's real rendered width (`picker.rs::column_widths` replicates
+  `Table::get_column_widths` exactly) rather than left for `Table` to clip silently mid-word.
 
-## Phase 6 — picker and connection setup
-
-- Picker as an aligned table with columns, surfacing `ChargerSource` (built-in vs which YAML file)
-  and the last-used endpoint from `ConnectionStore`, so Enter's consequences are visible.
-- Connection setup: a titled card naming the charger, URL scheme validation (`ws://`/`wss://`),
-  a password reveal toggle, recent-URL suggestions, and inline errors rather than a bare status
-  line.
+  Connection setup gained a titled card (`Connect <charger id> to a CSMS`, via
+  `theme::bordered_block`) around the three fields; a CSMS URL scheme check
+  (`app.rs::validate_csms_url`) that blocks `Enter` with an inline error under the field, on
+  the same "always-allotted row, cleared when edited" pattern as the parameter prompt's error;
+  `Ctrl+R` to reveal the password field's raw value; and `PageUp`/`PageDown` to cycle the URL
+  field through every remembered CSMS URL (not just the current charger's), narrowing as you
+  type. The help overlay gained a "Connection setup" section it never had before, and pushed
+  the overlay's line count past what fits at 120x34 uncompressed — `render_help` now reserves a
+  one-row margin top and bottom so a full-height popup doesn't sit flush against (and visually
+  merge with) the header and command bar; past that it's the existing scrollbar.
 
 ## Phase 7 — polish
 

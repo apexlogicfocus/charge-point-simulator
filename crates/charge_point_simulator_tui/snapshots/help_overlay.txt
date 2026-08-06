@@ -1,34 +1,34 @@
 ● connected  |  CP001  |  OCPP 1.6J  |  local simulation  |  up 0s
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-EVSEs (1/1)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
-EVSE 1  ○ available   0.00 kW  0┌Help (Esc to close)───────────────────────────────────┐EVSE 1 / C1
-  ▸ C1  ○ available             │Global                                                │○ available
-                                │ q           quit (confirm)                           │no vehicle
-                                │ ?           toggle this help                         │session  0s
-                                │                                                      │
-                                │Charger picker                                        │0.00 kW  0.0 A  0.000 kWh
-                                │ ↑/↓         move selection                           │
-                                │ type        filter by charger id                     │
-                                │ Enter       select charger                           │
-                                │ Esc         clear filter (or quit)                   │
-                                │                                                      │
-                                │Dashboard                                             │
-                                │ Esc         back to picker                           │
-                                │ ↑/↓         focus connector                          │
-                                │ Tab/←/→     focus EVSE                               │
-                                │ Ctrl+K / c  open command palette                     │
-                                │                                                      │
-                                │Logs                                                  │
-                                │ PgUp/PgDn   scroll                                   │
-Logs────────────────────────────│ g / G       jump to oldest / newest                  │────────────────────────────────
-                                │ /           filter (Esc clears)                      │
-                                │ l           cycle level threshold                    │
-                                │                                                      │
-                                │Help                                                  │
-                                │ ↑/↓         scroll                                   │
-                                │ Esc         close                                    │
+────────────────────────────────┌Help (↑/↓ scroll, Esc to close)───────────────────────┐────────────────────────────────
+EVSEs (1/1)─────────────────────│Global                                                █Detail──────────────────────────
+EVSE 1  ○ available   0.00 kW  0│ q           quit (confirm)                           █EVSE 1 / C1
+  ▸ C1  ○ available             │ ?           toggle this help                         █○ available
+                                │                                                      █no vehicle
+                                │Charger picker                                        █session  0s
+                                │ ↑/↓         move selection                           █
+                                │ type        filter by charger id                     █0.00 kW  0.0 A  0.000 kWh
+                                │ Enter       select charger                           █
+                                │ Esc         clear filter (or quit)                   █
+                                │                                                      █
+                                │Connection setup                                      █
+                                │ Tab/↑/↓     move between fields                      █
+                                │ Ctrl+R      reveal/hide password                     █
+                                │ PgUp/PgDn   cycle recent URLs                        █
+                                │ Enter       connect                                  █
+                                │ Esc         cancel                                   █
+                                │                                                      █
+                                │Dashboard                                             █
+                                │ Esc         back to picker                           █
+                                │ ↑/↓         focus connector                          █
+Logs────────────────────────────│ Tab/←/→     focus EVSE                               █────────────────────────────────
+                                │ Ctrl+K / c  open command palette                     █
+                                │                                                      █
+                                │Logs                                                  █
+                                │ PgUp/PgDn   scroll                                   █
+                                │ g / G       jump to oldest / newest                  █
+                                │ /           filter (Esc clears)                      █
+                                │ l           cycle level threshold                    █
+                                │                                                      █
+                                │Help                                                  ║
                                 └──────────────────────────────────────────────────────┘
-
-
-
 q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help

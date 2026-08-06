@@ -45,6 +45,22 @@ impl ConnectionStore {
     pub fn remember(&mut self, charger_id: impl Into<String>, profile: ConnectionProfile) {
         self.chargers.insert(charger_id.into(), profile);
     }
+
+    /// The distinct, non-blank CSMS URLs remembered across every charger, sorted
+    /// alphabetically for a stable order to render as suggestions on the connection setup
+    /// screen. The store has no notion of *when* a profile was last used - only *that* it was
+    /// remembered - so this is "every URL seen before," not a true most-recent-first history.
+    pub fn recent_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = self
+            .chargers
+            .values()
+            .map(|profile| profile.csms_url.clone())
+            .filter(|url| !url.trim().is_empty())
+            .collect();
+        urls.sort();
+        urls.dedup();
+        urls
+    }
 }
 
 #[cfg(test)]
@@ -118,5 +134,37 @@ mod tests {
         store.remember("CP001", profile("wss://new.example.com"));
 
         assert_eq!(store.get("CP001"), Some(&profile("wss://new.example.com")));
+    }
+
+    #[test]
+    fn recent_urls_on_an_empty_store_is_empty() {
+        let store = ConnectionStore::default();
+        assert_eq!(store.recent_urls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn recent_urls_lists_distinct_urls_sorted_alphabetically() {
+        let mut store = ConnectionStore::default();
+        store.remember("CP001", profile("wss://b.example.com"));
+        store.remember("CP002", profile("wss://a.example.com"));
+        // Same URL as CP001, reused by a different charger - must not appear twice.
+        store.remember("CP003", profile("wss://b.example.com"));
+
+        assert_eq!(
+            store.recent_urls(),
+            vec![
+                "wss://a.example.com".to_string(),
+                "wss://b.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_urls_excludes_blank_urls() {
+        let mut store = ConnectionStore::default();
+        store.remember("CP001", profile(""));
+        store.remember("CP002", profile("wss://a.example.com"));
+
+        assert_eq!(store.recent_urls(), vec!["wss://a.example.com".to_string()]);
     }
 }

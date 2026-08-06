@@ -54,6 +54,31 @@ pub const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: "Connection setup",
+        bindings: &[
+            Binding {
+                keys: "Tab/\u{2191}/\u{2193}",
+                description: "move between fields",
+            },
+            Binding {
+                keys: "Ctrl+R",
+                description: "reveal/hide password",
+            },
+            Binding {
+                keys: "PgUp/PgDn",
+                description: "cycle recent URLs",
+            },
+            Binding {
+                keys: "Enter",
+                description: "connect",
+            },
+            Binding {
+                keys: "Esc",
+                description: "cancel",
+            },
+        ],
+    },
+    Section {
         title: "Dashboard",
         bindings: &[
             Binding {
