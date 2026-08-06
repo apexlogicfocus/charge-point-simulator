@@ -280,6 +280,10 @@ fn header_segments(state: &ChargerState, connecting: bool, width: usize) -> Vec<
 /// to notice at a glance wins: a fault anywhere on the EVSE outranks everything else, then an
 /// active charging session, then merely occupied/reserved/unavailable, with a fully idle EVSE
 /// (or one with no connectors at all) reading as `Available`.
+///
+/// `Occupied` deliberately outranks `Reserved`: a car physically present is the more actionable
+/// fact than a booking against a connector that may still be empty. Settled decision, not an
+/// oversight - see `docs/tui-roadmap.md`.
 fn evse_summary_status(evse: &EvseState) -> ConnectorStatus {
     const PRIORITY: [ConnectorStatus; 5] = [
         ConnectorStatus::Faulted,
