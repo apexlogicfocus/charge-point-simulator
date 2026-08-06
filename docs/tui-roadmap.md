@@ -59,6 +59,25 @@ The guiding principles, which every remaining phase should be checked against:
   the overlay's line count past what fits at 120x34 uncompressed — `render_help` now reserves a
   one-row margin top and bottom so a full-height popup doesn't sit flush against (and visually
   merge with) the header and command bar; past that it's the existing scrollbar.
+- **Phase 7 (hint truncation)** — `keybindings::dashboard_hint_for_width` replaces the fixed hint
+  string with a priority table, widening tiers until the joined line fits. At 80 columns the bar
+  no longer cuts mid-word, and `?: help` — priority 3, never dropped — survives on the very line
+  that advertises it. Same tiered-fallback shape as `dashboard.rs::header_segments`.
+- **Phase 7 (heartbeat pulse)** — `dashboard::heartbeat_pulse_frame` breathes a dot (`· ○ ● ○`)
+  every 300ms of simulated `uptime`, so a live-but-idle simulator reads differently from a hung
+  one. Driven by `uptime` (which only advances via `ChargerState::tick`) rather than wall clock,
+  keeping snapshots deterministic; visually distinct from the connecting spinner. It rides in the
+  same header tier as uptime and is dropped with it — a moving dot means nothing without the
+  uptime it vouches for. There is deliberately no OCPP-heartbeat claim here: `ChargerState`
+  exposes no heartbeat traffic (see "No OCPP message counters" below), and showing invented
+  protocol data would violate truth in the status bar.
+- **Phase 7 (tree scrollbar, clear, copy)** — a shared `render_scrollbar` helper now serves both
+  the log pane and the EVSE tree, whose scroll offset keeps the focused connector visible.
+  `Ctrl+L` clears the log buffer (`LogBuffer::clear`); `y` copies the focused entry via
+  `LogEntry::to_plain_text` and the new `clipboard.rs` (backed by `arboard` — the app already
+  assumes a real terminal, so OSC 52's remote-friendliness bought nothing). Copy failures surface
+  as a status message, never a panic. Both bindings sit at the lowest hint priority, so they are
+  the first to drop on a narrow terminal.
 - **Phase 7 (mouse support)** — `main.rs` enables crossterm mouse capture around `ratatui::init`/
   `restore` (not `ratatui::run`, which offers no hook for it), disabling it again on both the
   normal exit path and the panic path by re-chaining `ratatui::try_init`'s own panic hook.
@@ -78,11 +97,8 @@ The guiding principles, which every remaining phase should be checked against:
 
 ## Phase 7 — polish
 
-- Scrollbars on the tree and log panes; `Ctrl+L` to clear logs; copy the focused log line.
-- A heartbeat pulse in the header, so "alive but idle" is distinguishable from "hung".
-- **Fix the command bar hint truncation.** At 80 columns the hint is cut mid-word, losing "help"
-  from the very line that advertises it. It needs to wrap or shorten by priority, the way the
-  header's segments already do.
+All four items have landed; see the Done section above. Nothing is scheduled after this — the
+next move is one of the open decisions below, or the unscheduled gaps after them.
 
 ## Open decisions
 
