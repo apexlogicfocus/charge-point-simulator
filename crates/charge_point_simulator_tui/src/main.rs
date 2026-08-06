@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod fuzzy;
 mod keybindings;
 mod logs;

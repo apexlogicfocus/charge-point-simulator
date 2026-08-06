@@ -20,6 +20,7 @@ crossterm = "0.29.0"
 color-eyre = "0.6.5"
 tui-big-text = "0.8.8"
 dirs = "6"
+arboard = "3.6.1"
 
 [dev-dependencies]
 # Only for constructing ChargePointState/ConnectorState test fixtures directly - production

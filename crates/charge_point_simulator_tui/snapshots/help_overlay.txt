@@ -27,8 +27,8 @@ Logs─────────────────────────�
                                 │ PgUp/PgDn   scroll                                   █
                                 │ g / G       jump to oldest / newest                  █
                                 │ /           filter (Esc clears)                      █
-                                │ l           cycle level threshold                    █
-                                │                                                      █
-                                │Help                                                  ║
+                                │ l           cycle level threshold                    ║
+                                │ Ctrl+L      clear logs                               ║
+                                │ y           copy focused log line                    ║
                                 └──────────────────────────────────────────────────────┘
 q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help

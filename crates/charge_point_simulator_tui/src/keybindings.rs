@@ -118,6 +118,14 @@ pub const SECTIONS: &[Section] = &[
                 keys: "l",
                 description: "cycle level threshold",
             },
+            Binding {
+                keys: "Ctrl+L",
+                description: "clear logs",
+            },
+            Binding {
+                keys: "y",
+                description: "copy focused log line",
+            },
         ],
     },
     Section {
@@ -183,6 +191,10 @@ const HINT_ENTRIES: &[(&str, u8)] = &[
     ("Tab/\u{2190}/\u{2192}: EVSE", 1),
     ("/: filter", 2),
     ("l: level", 1),
+    // Lower priority than the rest: these are the first to go when the terminal is narrow,
+    // below even the navigation hints - useful, but the least essential entries here.
+    ("Ctrl+L: clear logs", 0),
+    ("y: copy log", 0),
     ("c: command", 2),
     ("?: help", 3),
 ];
@@ -265,7 +277,7 @@ mod tests {
         assert_eq!(
             dashboard_hint_for_width(200),
             "q: quit  Esc: back  \u{2191}/\u{2193}: connector  Tab/\u{2190}/\u{2192}: EVSE  \
-             /: filter  l: level  c: command  ?: help"
+             /: filter  l: level  Ctrl+L: clear logs  y: copy log  c: command  ?: help"
         );
     }
 

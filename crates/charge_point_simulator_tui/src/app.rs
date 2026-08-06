@@ -336,6 +336,25 @@ impl App {
         self.log_filter_open = true;
     }
 
+    /// Copies the log line the pane is currently anchored on (see
+    /// [`LogBuffer::focused_entry`]) to the system clipboard, reporting the outcome as a status
+    /// message either way - a clipboard failure is routine (no display server, a locked
+    /// clipboard) and must never crash the app.
+    fn copy_focused_log_line(&mut self) {
+        match self.logs.focused_entry() {
+            Some(entry) => {
+                let text = entry.to_plain_text();
+                match crate::clipboard::copy_to_clipboard(&text) {
+                    Ok(()) => self.set_status(StatusSeverity::Ok, "✓ copied log line".to_string()),
+                    Err(err) => {
+                        self.set_status(StatusSeverity::Error, format!("✗ copy failed: {err}"))
+                    }
+                }
+            }
+            None => self.set_status(StatusSeverity::Error, "✗ no log line to copy".to_string()),
+        }
+    }
+
     /// The filter applies as it is typed - the log pane narrows live rather than only on
     /// Enter, so a filter that matches nothing is visibly wrong before it's committed.
     fn handle_log_filter_key(&mut self, key_event: KeyEvent) {
@@ -513,7 +532,12 @@ impl App {
             KeyCode::Char('/') => self.open_log_filter(),
             KeyCode::Char('g') => self.logs.scroll_to_top(),
             KeyCode::Char('G') => self.logs.scroll_to_bottom(),
+            KeyCode::Char('l') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.logs.clear();
+                self.set_status(StatusSeverity::Ok, "✓ cleared logs".to_string());
+            }
             KeyCode::Char('l') => self.logs.cycle_level_threshold(),
+            KeyCode::Char('y') => self.copy_focused_log_line(),
             KeyCode::Down => self.select_next_connector(),
             KeyCode::Up => self.select_previous_connector(),
             KeyCode::Right | KeyCode::Tab => self.select_next_evse(),
@@ -2183,6 +2207,62 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::Char('l')));
         assert_eq!(app.logs.level_threshold(), LogLevel::Debug);
+    }
+
+    #[test]
+    fn ctrl_l_clears_the_log_buffer() {
+        let mut app = app_with_logs(3);
+        assert_eq!(app.logs.filtered_len(), 3);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.logs.filtered_len(), 0);
+        assert_eq!(
+            status(&app),
+            Some((StatusSeverity::Ok, "✓ cleared logs".to_string()))
+        );
+    }
+
+    #[test]
+    fn plain_l_still_cycles_the_level_threshold_and_is_not_shadowed_by_ctrl_l() {
+        let mut app = app_with_logs(0);
+        assert_eq!(app.logs.level_threshold(), LogLevel::Info);
+
+        app.handle_key_event(key(KeyCode::Char('l')));
+
+        assert_eq!(app.logs.level_threshold(), LogLevel::Debug);
+    }
+
+    #[test]
+    fn y_copies_the_focused_log_line_and_reports_success() {
+        // Touches the real system clipboard (see `copy_focused_log_line`), which is shared,
+        // mutable, process-wide state - serialize against `clipboard`'s own tests so they don't
+        // race on it.
+        let _guard = crate::clipboard::CLIPBOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut app = app_with_logs(0);
+        app.logs.push("connector faulted");
+
+        app.handle_key_event(key(KeyCode::Char('y')));
+
+        match status(&app) {
+            Some((StatusSeverity::Ok, message)) => assert!(message.contains("copied")),
+            other => panic!("expected a success status message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn y_with_no_log_lines_reports_an_error_instead_of_copying_nothing() {
+        let mut app = app_with_logs(0);
+
+        app.handle_key_event(key(KeyCode::Char('y')));
+
+        assert_eq!(
+            status(&app),
+            Some((StatusSeverity::Error, "✗ no log line to copy".to_string()))
+        );
     }
 
     #[test]

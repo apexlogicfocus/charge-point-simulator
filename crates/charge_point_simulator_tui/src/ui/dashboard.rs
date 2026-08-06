@@ -501,6 +501,63 @@ fn tree_lines(
     lines
 }
 
+/// The index, within [`tree_lines`]'s output, of the connector row `focused` points at (i.e.
+/// the row the tree should keep scrolled into view). Ignores inline-detail lines, since those
+/// only ever appear *after* the focused row and so never affect how far it is from the top.
+fn tree_focus_line_index(charger: &ChargerState, focused: FocusedConnector) -> usize {
+    let mut index = 0;
+    for (evse_index, evse) in charger.evses.iter().enumerate() {
+        index += 1; // the EVSE summary line
+        if evse.connectors.is_empty() {
+            index += 1; // "no connectors"
+            continue;
+        }
+        for connector_index in 0..evse.connectors.len() {
+            if evse_index == focused.evse && connector_index == focused.connector {
+                return index;
+            }
+            index += 1;
+        }
+    }
+    0
+}
+
+/// How far the tree should be scrolled (lines cut from the top) so that `focus_line` stays
+/// visible within a `height`-row window over `total_lines` lines. The tree has no independent
+/// scroll key of its own - unlike the log pane - so this always tracks focus rather than
+/// following a user-driven offset: it holds still while the focused row is already on screen,
+/// and moves the minimum amount needed to bring it back into view when focus moves off-screen.
+fn tree_scroll_offset(total_lines: usize, height: usize, focus_line: usize) -> usize {
+    if height == 0 || total_lines <= height {
+        return 0;
+    }
+    let max_offset = total_lines - height;
+    if focus_line < height {
+        0
+    } else {
+        (focus_line + 1 - height).min(max_offset)
+    }
+}
+
+/// Renders a scrollbar along the right edge of `area`, one row down from the top (so it doesn't
+/// overwrite a section's top-rule title). Shared by the tree and log panes so both scroll the
+/// same way and look the same doing it.
+fn render_scrollbar(frame: &mut Frame, area: Rect, max_offset: usize, position: usize) {
+    let mut state = ScrollbarState::new(max_offset).position(position);
+    let track = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        track,
+        &mut state,
+    );
+}
+
 /// The EVSE/connector pair `focused` points at, if it identifies a real connector in `charger`.
 fn focused_connector(
     charger: &ChargerState,
@@ -562,15 +619,41 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
         Some(state) => tree_lines(state, view.focused, body.sidebar.is_none()),
         None => vec![Line::styled("no charger selected", theme::text_muted())],
     };
+    // A `section` only spends 1 row on chrome (the top rule), matching `render_log_pane`.
+    let tree_height = body.tree.height.saturating_sub(1) as usize;
+    let tree_total = tree.len();
+    let tree_needs_scrollbar = tree_total > tree_height && tree_height > 0;
+    let tree_offset = view
+        .charger
+        .map(|state| {
+            tree_scroll_offset(
+                tree_total,
+                tree_height,
+                tree_focus_line_index(state, view.focused),
+            )
+        })
+        .unwrap_or(0);
+
+    let tree_block = theme::section(tree_title, focused);
+    let mut tree_area = tree_block.inner(body.tree);
+    if tree_needs_scrollbar {
+        tree_area.width = tree_area.width.saturating_sub(1);
+    }
+    frame.render_widget(tree_block, body.tree);
     // Deliberately no `.wrap(...)`: `Wrap { trim: true }` strips leading whitespace from every
     // line, which would eat the tree's indentation (the connector rows' leading spaces, the
     // focus marker). A line that doesn't fit `body.tree`'s width is simply clipped at the
     // right edge instead of wrapping - the same trade `evse_detail` made before this panel
     // existed.
-    frame.render_widget(
-        Paragraph::new(tree).block(theme::section(tree_title, focused)),
-        body.tree,
-    );
+    let visible_tree: Vec<Line> = tree
+        .into_iter()
+        .skip(tree_offset)
+        .take(tree_height.max(1))
+        .collect();
+    frame.render_widget(Paragraph::new(visible_tree), tree_area);
+    if tree_needs_scrollbar {
+        render_scrollbar(frame, body.tree, tree_total - tree_height, tree_offset);
+    }
 
     if let Some(sidebar_area) = body.sidebar {
         let sidebar = match view
@@ -662,22 +745,13 @@ fn render_log_pane(frame: &mut Frame, view: &DashboardView, area: Rect, focused:
     frame.render_widget(Paragraph::new(lines), text_area);
 
     if needs_scrollbar {
-        let mut state = ScrollbarState::new(total.saturating_sub(log_height)).position(
+        render_scrollbar(
+            frame,
+            area,
+            total.saturating_sub(log_height),
             total
                 .saturating_sub(log_height)
                 .saturating_sub(logs.scroll_offset()),
-        );
-        let track = Rect {
-            y: area.y + 1,
-            height: area.height.saturating_sub(1),
-            ..area
-        };
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None),
-            track,
-            &mut state,
         );
     }
 }
@@ -1100,5 +1174,68 @@ mod tests {
     #[test]
     fn soc_bar_rounds_to_the_nearest_cell() {
         assert_eq!(soc_bar(34.0), "███░░░░░░░");
+    }
+
+    // --- tree scrolling ----------------------------------------------------------------
+
+    fn charger_with_evses(evses: Vec<EvseState>) -> ChargerState {
+        let mut state = charger_state_for_header("CP-CHARGE");
+        state.evses = evses;
+        state
+    }
+
+    #[test]
+    fn tree_focus_line_index_finds_the_focused_connectors_row() {
+        let charger = charger_with_evses(vec![
+            evse_with_statuses(&[ConnectorStatus::Available, ConnectorStatus::Available]),
+            evse_with_statuses(&[ConnectorStatus::Available]),
+        ]);
+
+        // EVSE 1 summary (0), connector 1 (1), connector 2 (2), EVSE 2 summary (3), connector 1 (4)
+        assert_eq!(
+            tree_focus_line_index(
+                &charger,
+                FocusedConnector {
+                    evse: 0,
+                    connector: 1
+                }
+            ),
+            2
+        );
+        assert_eq!(
+            tree_focus_line_index(
+                &charger,
+                FocusedConnector {
+                    evse: 1,
+                    connector: 0
+                }
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn tree_scroll_offset_stays_at_zero_while_focus_is_already_visible() {
+        assert_eq!(tree_scroll_offset(20, 5, 0), 0);
+        assert_eq!(tree_scroll_offset(20, 5, 4), 0);
+    }
+
+    #[test]
+    fn tree_scroll_offset_moves_the_minimum_amount_to_reveal_focus_below_the_window() {
+        // 20 lines, a 5-row window, focus on line 10 (0-indexed): the window must end exactly
+        // on the focused line, i.e. start at 10 - 5 + 1 = 6.
+        assert_eq!(tree_scroll_offset(20, 5, 10), 6);
+    }
+
+    #[test]
+    fn tree_scroll_offset_never_exceeds_the_maximum_offset() {
+        // Focus on the very last line still clamps to `total - height`, not further.
+        assert_eq!(tree_scroll_offset(20, 5, 19), 15);
+    }
+
+    #[test]
+    fn tree_scroll_offset_is_zero_when_everything_fits() {
+        assert_eq!(tree_scroll_offset(3, 5, 2), 0);
+        assert_eq!(tree_scroll_offset(0, 5, 0), 0);
     }
 }

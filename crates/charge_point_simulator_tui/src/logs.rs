@@ -62,6 +62,34 @@ impl LogEntry {
         }
     }
 
+    /// A single plain-text line suitable for the system clipboard - the same information the
+    /// log pane renders as columns (see `ui::dashboard::log_line`), but as one unstyled string
+    /// rather than styled spans.
+    pub fn to_plain_text(&self) -> String {
+        let mut line = String::new();
+        if let Some(timestamp) = &self.timestamp {
+            line.push_str(timestamp);
+            line.push(' ');
+        }
+        line.push_str(&format!("{:?} ", self.level).to_uppercase());
+        match self.direction {
+            Some(Direction::Outbound) => line.push_str("-> "),
+            Some(Direction::Inbound) => line.push_str("<- "),
+            None => {}
+        }
+        line.push_str(&self.short_target());
+        line.push(' ');
+        if let Some(action) = &self.action {
+            line.push_str(action);
+            line.push(' ');
+        }
+        line.push_str(&self.message);
+        for (name, value) in &self.fields {
+            line.push_str(&format!(" {name}={value}"));
+        }
+        line
+    }
+
     /// Case-insensitive substring match against message, target, and action.
     pub fn matches(&self, needle: &str) -> bool {
         let needle = needle.to_lowercase();
@@ -206,6 +234,13 @@ impl LogBuffer {
         self.rebuild_cache();
     }
 
+    /// Discards every entry, keeping the current filter and level threshold. Used by `Ctrl+L`.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.filtered_cache.clear();
+        self.scroll_offset = 0;
+    }
+
     pub fn filter(&self) -> Option<&str> {
         self.filter.as_deref()
     }
@@ -252,6 +287,19 @@ impl LogBuffer {
         let bottom_index = last_index.saturating_sub(self.scroll_offset);
         let start_index = bottom_index.saturating_sub(height - 1);
         filtered[start_index..=bottom_index].to_vec()
+    }
+
+    /// The entry the view is currently anchored on - the bottom-most visible line, i.e. the
+    /// same entry `visible_lines`'s last element would be regardless of the height it's called
+    /// with. This is what `y` copies: "the log line you're looking at", which while following
+    /// the tail is the newest entry, and while paused is wherever `scroll_offset` parked it.
+    pub fn focused_entry(&self) -> Option<&LogEntry> {
+        let filtered = self.filtered();
+        if filtered.is_empty() {
+            return None;
+        }
+        let last_index = filtered.len() - 1;
+        Some(filtered[last_index.saturating_sub(self.scroll_offset)])
     }
 
     fn passes_filters(&self, entry: &LogEntry) -> bool {
@@ -419,6 +467,38 @@ mod tests {
     }
 
     #[test]
+    fn clear_discards_every_entry_and_resumes_following_the_tail() {
+        let mut logs = LogBuffer::default();
+        for line in ["one", "two", "three"] {
+            logs.push(line);
+        }
+        logs.scroll_up();
+        assert!(logs.is_paused());
+
+        logs.clear();
+
+        assert_eq!(logs.filtered_len(), 0);
+        assert!(logs.visible_lines(5).is_empty());
+        assert!(!logs.is_paused());
+    }
+
+    #[test]
+    fn clear_keeps_the_active_filter_so_new_entries_are_still_filtered() {
+        let mut logs = LogBuffer::default();
+        logs.push("connector faulted");
+        logs.set_filter("fault");
+
+        logs.clear();
+        logs.push("heartbeat sent");
+        logs.push("connector faulted again");
+
+        assert_eq!(
+            messages(logs.visible_lines(10)),
+            vec!["connector faulted again"]
+        );
+    }
+
+    #[test]
     fn filter_accessor_reports_the_active_filter() {
         let mut logs = LogBuffer::default();
         assert_eq!(logs.filter(), None);
@@ -445,6 +525,57 @@ mod tests {
         logs.push("heartbeat sent again");
         let after = messages(logs.visible_lines(1));
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn focused_entry_is_none_for_an_empty_buffer() {
+        let logs = LogBuffer::default();
+        assert!(logs.focused_entry().is_none());
+    }
+
+    #[test]
+    fn focused_entry_is_the_newest_entry_while_following_the_tail() {
+        let mut logs = LogBuffer::default();
+        for line in ["one", "two", "three"] {
+            logs.push(line);
+        }
+        assert_eq!(logs.focused_entry().unwrap().message, "three");
+    }
+
+    #[test]
+    fn focused_entry_tracks_scroll_position_while_paused() {
+        let mut logs = LogBuffer::default();
+        for line in ["one", "two", "three"] {
+            logs.push(line);
+        }
+        logs.scroll_up();
+        assert_eq!(logs.focused_entry().unwrap().message, "two");
+    }
+
+    #[test]
+    fn to_plain_text_includes_timestamp_level_target_and_message() {
+        let entry = LogEntry {
+            timestamp: Some("12:00:00.000".to_string()),
+            level: LogLevel::Info,
+            target: "charge_point_simulator_core::ocpp".to_string(),
+            message: "sent heartbeat".to_string(),
+            fields: vec![("id".to_string(), "1".to_string())],
+            direction: Some(Direction::Outbound),
+            action: Some("Heartbeat".to_string()),
+        };
+        let text = entry.to_plain_text();
+        assert!(text.contains("12:00:00.000"));
+        assert!(text.contains("INFO"));
+        assert!(text.contains("core::ocpp"));
+        assert!(text.contains("Heartbeat"));
+        assert!(text.contains("sent heartbeat"));
+        assert!(text.contains("id=1"));
+    }
+
+    #[test]
+    fn to_plain_text_omits_a_missing_timestamp_rather_than_printing_a_blank_column() {
+        let entry: LogEntry = "hello".into();
+        assert_eq!(entry.to_plain_text(), "INFO tui hello");
     }
 
     #[test]
