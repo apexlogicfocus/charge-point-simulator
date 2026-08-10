@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::config::{ChargerConfig, EvseConfig, OcppVersion};
+use super::config::{CapabilitiesConfig, ChargerConfig, EvseConfig, OcppVersion};
 
 /// A charger definition together with where it came from, so callers (e.g. the
 /// TUI picker) can distinguish presets from user-provided configs if needed.
@@ -34,6 +34,7 @@ pub fn built_in_chargers() -> Vec<ChargerEntry> {
                     connectors: 1,
                 }],
                 has_display: false,
+                capabilities: CapabilitiesConfig::default(),
             },
             source: ChargerSource::BuiltIn,
         },
@@ -52,6 +53,7 @@ pub fn built_in_chargers() -> Vec<ChargerEntry> {
                     },
                 ],
                 has_display: true,
+                capabilities: CapabilitiesConfig::default(),
             },
             source: ChargerSource::BuiltIn,
         },

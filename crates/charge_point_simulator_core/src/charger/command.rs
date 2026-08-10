@@ -259,7 +259,7 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::charger::config::{ChargerConfig, OcppVersion};
+    use crate::charger::config::{CapabilitiesConfig, ChargerConfig, OcppVersion};
     use crate::charger::state::ConnectorState;
 
     fn charger_with_display(has_display: bool) -> ChargerState {
@@ -268,6 +268,7 @@ mod tests {
             ocpp_version: OcppVersion::V21,
             evses: vec![],
             has_display,
+            capabilities: CapabilitiesConfig::default(),
         })
     }
 
