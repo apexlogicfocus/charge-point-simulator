@@ -17,6 +17,28 @@ The guiding principles, which every task should be checked against:
 | `Ok` means the hardware moved | Upstream's sharpest contract — a fake that lies fails open. |
 | `core` is a published API | Signature churn is cheapest now, before downstream consumers exist. |
 
+## Done
+
+- **H1** — `charger/hardware.rs` split into `charger/hardware/{mod,charge_point,evse,connector}.rs`.
+  Pure refactor; `charger/mod.rs` has a zero-line diff, test count unchanged at 115.
+- **H2** — `connect_charger` drives `ChargePointBuilder` itself: dial via `ocpp_client::connect`,
+  match `NegotiatedClient`, register through a `register_setup_blocks` helper that is generic over
+  the CSMS client exactly as `setup()` is, then add the 2.1-only extras and seal with `build()`.
+  `ChargerHardware` (in `charger/hardware_bundle.rs`) landed field-less, per decision 5.
+
+  Three things this turned up that the plan above had wrong or didn't know:
+
+  1. `setup()` registers **24** blocks, not the 21 written here originally — the first count missed
+     `local_authorization_list`, `cost`, and `tariffs`. The vendored source is the specification;
+     any summary of it, including this document, is not.
+  2. The equivalence test needed two halves, not one. Comparing `ChargePointState` alone is a weak
+     signal, because most registrations (`clear_cache`, `remote_control`, `trigger_message`,
+     `reservation`, …) only call a `register_*` method on the CSMS client and never touch state —
+     dropping one passes a pure state diff undetected. A `RecordingCsms` fake that logs every
+     `register_*` call, asserted against directly, is what actually catches a dropped registration.
+  3. Upstream's `WebSocketPingInterval` keepalive loop cannot be reproduced downstream at all — see
+     "Known gaps" below.
+
 ## Where we are
 
 The baseline, after moving from the `ocpp-charge-point` git dependency to the published 0.1.0:
@@ -79,11 +101,14 @@ cheaper than it sounds, and one makes it more expensive:
   returns the `NegotiatedClient` enum, and `network_switch::ConnectionTarget` (`new`, `install`,
   `set_version`, `set_max_inbound_frame_bytes`, `attach_security_reporting`) is a public module.
   The migration can be a faithful reproduction, not a reinvention.
-- But `setup()` registers 21 blocks (13 unconditional, 8 capability-gated), and 2.1-only extras
-  live above it in `connect_and_setup`: security reporting attached to the redial target,
-  priority charging plus its notification worker, and network-profile switching. Reproducing that
-  list is the actual work of H2, and silently dropping one of them is the failure mode to test
-  against.
+- But `setup()` registers 24 blocks — 13 unconditional, and 11 gated across six `if capabilities.*`
+  blocks (`reservation` + `reservation_status_updates`; `local_authorization_list`; `cost` +
+  `tariffs`; `smart_charging` + `charging_profile_reports`; `variable_monitoring` +
+  `monitoring_reports` + `variable_monitor_events`; `periodic_event_streams`). 2.1-only extras
+  live above it in `connect_and_setup`: priority charging plus its notification worker, dynamic
+  charging profiles, and network-profile switching (which also attaches security reporting to the
+  redial target — one builder call does both). Reproducing that list is the actual work of H2, and
+  silently dropping one of them is the failure mode to test against.
 
 ## Tasks
 
@@ -262,9 +287,15 @@ discharge mode on the simulated meter. Cheap *if* decision 4 held; expensive if 
 
 No two tasks in the same wave touch the same file.
 
+If a wave is run by agents in git worktrees, check the base commit before anything else: a
+worktree may be created from the default branch rather than from the branch the previous wave
+landed on. H1's first attempt refactored long-superseded code that way, passed its own tests
+against it, and had to be thrown away. `git reset --hard <branch>` plus an assertion about
+something only the current branch has is the cheap guard.
+
 | Wave | Tasks | Notes |
 | --- | --- | --- |
-| 0 | **H1**, **H2** | Different files, so both at once. H1 is hours; H2 is the long pole of the whole roadmap — start it first if only one person is on this. |
+| 0 | ~~**H1**, **H2**~~ | Done. Different files, so both at once. H1 was hours; H2 was the long pole, as expected. |
 | 1 | **H3**, **H4**, **H5a**, **H6a** | Four-way parallel. H5a and H6a are pure trait impls with `tempfile`-backed tests and no dependency on H2 at all — the cheapest work to hand to a second pair of hands. |
 | 2 | **H5b**, **H6b**, **H7**, **H11** | All small; H5b/H6b are registrations that H2 made possible, H7 is frontend plumbing. |
 | 3 | **H8**, **H9**, **H10**, **H12** | The widest wave: four independent functional blocks. H8 and H9 share `hardware_bundle.rs`, so sequence those two or split the file by block first. |
@@ -288,6 +319,22 @@ more satisfying task.
   is `f64`. Round at emission, never in the accumulator.
 - `core` is published. Any change to `connect_charger`, `ChargerConfig`, or the `Fake*` types is a
   change to somebody else's build.
+
+## Known gaps
+
+- **The keepalive ping loop is gone, and cannot be brought back from here.** Upstream's
+  `connect_and_setup` spawns `keepalive::run_ping_interval_updates`, which applies a CSMS-written
+  `WebSocketPingInterval` device-model variable to the live connection. It needs a
+  `ChargePointActor`, obtainable only via `ChargePointRuntime::actor()` — which is `pub(crate)` and
+  exposed nowhere on `ChargePointBuilder`. So this is the one thing the builder path genuinely
+  cannot match, and the price paid for being able to register optional hardware at all. Fixing it
+  means an upstream change: either make `actor()` public or add a builder method that spawns the
+  loop. Worth raising against `ocpp-charge-point` before H5b makes the builder path permanent.
+- **`connect_charger` is OCPP 2.1 only, now explicitly.** A CSMS that negotiates 1.6J or 2.0.1 gets
+  `ConnectAndSetupError::UnsupportedNegotiatedVersion` instead of a session. That matches how the
+  TUI already gates the call and the function's long-standing doc comment, but it is a narrowing:
+  `connect_and_setup` would have run those versions. Driving their builder chains is its own task,
+  worth scheduling once someone actually wants 1.6J against a live CSMS.
 
 ## Not on this roadmap
 
