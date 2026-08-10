@@ -13,7 +13,7 @@ pub use catalog::{
     ChargerEntry, ChargerSource, all_chargers, built_in_chargers, discover_configured_chargers,
 };
 pub use command::{Command, CommandParameter};
-pub use config::{ChargerConfig, EvseConfig, OcppVersion};
+pub use config::{CapabilitiesConfig, ChargerConfig, EvseConfig, OcppVersion};
 pub use connect::{connect_charger, websocket_url};
 pub use connection::{ConnectionProfile, PasswordTooLong, SecurityProfile};
 pub use connection_store::ConnectionStore;

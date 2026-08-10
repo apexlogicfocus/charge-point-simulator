@@ -190,7 +190,7 @@ pub fn meter_sample_events(charger: &ChargerState) -> Vec<ChargePointEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::charger::config::{ChargerConfig, EvseConfig, OcppVersion};
+    use crate::charger::config::{CapabilitiesConfig, ChargerConfig, EvseConfig, OcppVersion};
     use crate::charger::state::{ChargerState, ConnectorStatus, SimulationMode};
     use ocpp_charge_point::state::LifecycleState;
 
@@ -203,6 +203,7 @@ mod tests {
                 connectors: 2,
             }],
             has_display: false,
+            capabilities: CapabilitiesConfig::default(),
         })
     }
 
