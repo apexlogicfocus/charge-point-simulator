@@ -22,3 +22,8 @@ ocpp-client = { version = "0.5", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+# Only for the `connect_charger` builder-registration equivalence test in `charger/connect.rs`,
+# which has to implement `ocpp_charge_point::provisioning::HeartbeatSender` for its fake CSMS -
+# that trait's `send_heartbeat` returns `chrono::DateTime<Utc>`, and naming that type in our own
+# impl needs `chrono` as a direct dependency even though `ocpp-charge-point` already depends on it.
+chrono = "0.4"

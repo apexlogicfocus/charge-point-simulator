@@ -5,6 +5,7 @@ mod connect;
 mod connection;
 mod connection_store;
 mod hardware;
+mod hardware_bundle;
 mod ocpp_bridge;
 mod state;
 
@@ -17,6 +18,7 @@ pub use connect::{connect_charger, websocket_url};
 pub use connection::{ConnectionProfile, PasswordTooLong, SecurityProfile};
 pub use connection_store::ConnectionStore;
 pub use hardware::{FakeChargePoint, FakeConnector, FakeEvse};
+pub use hardware_bundle::ChargerHardware;
 pub use ocpp_bridge::{apply_ocpp_state, build_ocpp_event_for_connector, meter_sample_events};
 pub use ocpp_charge_point::state::{ChargePointEvent, ChargePointState};
 pub use ocpp_charge_point::{ChargePointRuntime, ConnectAndSetupError};

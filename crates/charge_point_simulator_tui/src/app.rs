@@ -2,9 +2,10 @@ use crate::logs::{LogBuffer, LogEntry};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
-    ChargePointEvent, ChargePointState, ChargerEntry, ChargerState, Command, CommandParameter,
-    ConnectionProfile, ConnectionStore, OcppVersion, SecurityProfile, SimulationMode,
-    apply_ocpp_state, build_ocpp_event_for_connector, connect_charger, meter_sample_events,
+    ChargePointEvent, ChargePointState, ChargerEntry, ChargerHardware, ChargerState, Command,
+    CommandParameter, ConnectionProfile, ConnectionStore, OcppVersion, SecurityProfile,
+    SimulationMode, apply_ocpp_state, build_ocpp_event_for_connector, connect_charger,
+    meter_sample_events,
 };
 use color_eyre::Result;
 use crossterm::event::{
@@ -1159,7 +1160,7 @@ impl App {
                     .build()
                     .expect("failed to build a runtime for the CSMS connection attempt");
                 tokio_runtime.block_on(async move {
-                    match connect_charger(&config, &profile).await {
+                    match connect_charger(&config, &profile, ChargerHardware::default()).await {
                         Ok(charge_point_runtime) => {
                             let _ = result_sender.send(Ok(()));
 
