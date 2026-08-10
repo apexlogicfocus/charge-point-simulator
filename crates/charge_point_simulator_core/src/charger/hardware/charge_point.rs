@@ -1,129 +1,14 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ocpp_charge_point::hardware::{
-    Capabilities, ChargePoint, Connector, Evse, HardwareCommandReceiver, HardwareEventSender,
+    Capabilities, ChargePoint, HardwareCommandReceiver, HardwareEventSender,
     execute_hardware_command,
 };
 
-use super::config::ChargerConfig;
+use crate::charger::config::ChargerConfig;
 
-/// A simulated connector actuator: no real hardware behind it, just lock/contactor
-/// state tracked in memory. Every action is reported via `tracing` so it flows into
-/// whatever is bridging tracing output (e.g. the TUI's log panel) the same way real
-/// hardware driver logs would.
-#[derive(Debug)]
-pub struct FakeConnector {
-    evse_id: usize,
-    connector_id: usize,
-    locked: AtomicBool,
-    contactor_closed: AtomicBool,
-    /// The most recent current limit applied via [`Connector::set_current_limit`], in mA, or
-    /// `None` when no CSMS-imposed limit currently applies. Stored but not yet acted on - the
-    /// simulator has no current draw to clamp until metering is simulated.
-    current_limit_ma: Mutex<Option<u32>>,
-}
-
-impl FakeConnector {
-    pub fn new(evse_id: usize, connector_id: usize) -> Self {
-        Self {
-            evse_id,
-            connector_id,
-            locked: AtomicBool::new(false),
-            contactor_closed: AtomicBool::new(false),
-            current_limit_ma: Mutex::new(None),
-        }
-    }
-
-    pub fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Relaxed)
-    }
-
-    pub fn is_contactor_closed(&self) -> bool {
-        self.contactor_closed.load(Ordering::Relaxed)
-    }
-
-    /// The current limit last applied to this connector, in mA, or `None` if unlimited.
-    pub fn current_limit_ma(&self) -> Option<u32> {
-        *self.current_limit_ma.lock().expect("lock poisoned")
-    }
-}
-
-#[async_trait::async_trait]
-impl Connector for FakeConnector {
-    type Error = core::convert::Infallible;
-
-    async fn lock(&self) -> Result<(), Self::Error> {
-        self.locked.store(true, Ordering::Relaxed);
-        tracing::info!(
-            evse = self.evse_id,
-            connector = self.connector_id,
-            "connector locked"
-        );
-        Ok(())
-    }
-
-    async fn unlock(&self) -> Result<(), Self::Error> {
-        self.locked.store(false, Ordering::Relaxed);
-        tracing::info!(
-            evse = self.evse_id,
-            connector = self.connector_id,
-            "connector unlocked"
-        );
-        Ok(())
-    }
-
-    async fn close_contactor(&self) -> Result<(), Self::Error> {
-        self.contactor_closed.store(true, Ordering::Relaxed);
-        tracing::info!(
-            evse = self.evse_id,
-            connector = self.connector_id,
-            "contactor closed"
-        );
-        Ok(())
-    }
-
-    async fn open_contactor(&self) -> Result<(), Self::Error> {
-        self.contactor_closed.store(false, Ordering::Relaxed);
-        tracing::info!(
-            evse = self.evse_id,
-            connector = self.connector_id,
-            "contactor opened"
-        );
-        Ok(())
-    }
-
-    async fn set_current_limit(&self, limit_ma: Option<u32>) -> Result<(), Self::Error> {
-        *self.current_limit_ma.lock().expect("lock poisoned") = limit_ma;
-        tracing::info!(
-            evse = self.evse_id,
-            connector = self.connector_id,
-            limit_ma = ?limit_ma,
-            "current limit set"
-        );
-        Ok(())
-    }
-}
-
-pub struct FakeEvse {
-    pub connectors: Vec<FakeConnector>,
-}
-
-#[async_trait::async_trait]
-impl Evse<FakeConnector> for FakeEvse {
-    type Error = core::convert::Infallible;
-
-    fn connectors(&self) -> &[FakeConnector] {
-        &self.connectors
-    }
-
-    /// A simulated reboot: nothing to restart, so this only reports the request. The state
-    /// machine has already stopped any transaction and unlocked fail-safely by this point.
-    async fn reboot(&self) -> Result<(), Self::Error> {
-        tracing::info!("evse reboot requested");
-        Ok(())
-    }
-}
+use super::connector::FakeConnector;
+use super::evse::FakeEvse;
 
 /// Fake hardware for a charger: an EVSE/connector layout with no physical backing,
 /// built to match a [`ChargerConfig`] so the shape the OCPP stack sees lines up with
@@ -203,6 +88,7 @@ mod tests {
     use crate::charger::config::{EvseConfig, OcppVersion};
     use ocpp_charge_point::ChargePointRuntime;
     use ocpp_charge_point::executor::TokioExecutor;
+    use ocpp_charge_point::hardware::Evse;
     use std::time::Duration;
 
     #[tokio::test]
@@ -236,30 +122,6 @@ mod tests {
 
         assert!(result.is_ok(), "start() did not return within the timeout");
         assert!(result.unwrap().is_ok());
-    }
-
-    #[tokio::test]
-    async fn lock_and_unlock_flip_the_locked_flag() {
-        let connector = FakeConnector::new(1, 1);
-        assert!(!connector.is_locked());
-
-        connector.lock().await.unwrap();
-        assert!(connector.is_locked());
-
-        connector.unlock().await.unwrap();
-        assert!(!connector.is_locked());
-    }
-
-    #[tokio::test]
-    async fn close_and_open_contactor_flip_the_contactor_flag() {
-        let connector = FakeConnector::new(1, 1);
-        assert!(!connector.is_contactor_closed());
-
-        connector.close_contactor().await.unwrap();
-        assert!(connector.is_contactor_closed());
-
-        connector.open_contactor().await.unwrap();
-        assert!(!connector.is_contactor_closed());
     }
 
     #[tokio::test]
@@ -300,22 +162,6 @@ mod tests {
 
         let charge_point = FakeChargePoint::from_config(&config);
         assert_eq!(charge_point.evses().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn set_current_limit_records_the_limit_and_clears_it_again() {
-        let connector = FakeConnector::new(1, 1);
-        assert_eq!(connector.current_limit_ma(), None);
-
-        connector.set_current_limit(Some(16_000)).await.unwrap();
-        assert_eq!(connector.current_limit_ma(), Some(16_000));
-
-        // `Some(0)` is "suspend charging", distinct from `None` - both must round-trip.
-        connector.set_current_limit(Some(0)).await.unwrap();
-        assert_eq!(connector.current_limit_ma(), Some(0));
-
-        connector.set_current_limit(None).await.unwrap();
-        assert_eq!(connector.current_limit_ma(), None);
     }
 
     #[tokio::test]
