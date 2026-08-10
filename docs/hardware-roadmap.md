@@ -39,6 +39,39 @@ The guiding principles, which every task should be checked against:
   3. Upstream's `WebSocketPingInterval` keepalive loop cannot be reproduced downstream at all — see
      "Known gaps" below.
 
+- **H3** — a `SimulatedMeter` in `charger/hardware/metering.rs`, advanced by an injected `elapsed`
+  and emitted per connector by `FakeChargePoint::tick`. Energy flows on `contactor_closed` — the
+  hardware layer has no view of the OCPP connector state machine and doesn't need one — clamped by
+  `set_current_limit`, which finally does something.
+
+  **Scope changed during the wave.** The roadmap said to move the physics *out of*
+  `EvseState::tick`. That can't happen yet: `FakeChargePoint` only exists inside `connect_charger`,
+  so a local (unconnected) simulation would have no hardware to run a meter, and the TUI's
+  dashboard and goldens would go with it. H3 built the hardware-side meter only; the physics are
+  temporarily duplicated with `charger/state.rs`, and **H3b** below owns the convergence.
+
+  Two things it turned up:
+
+  1. Meter events must be addressed by **array position** (`enumerate()` over `evses`/`connectors`),
+     not by `FakeConnector`'s own `evse_id`/`connector_id`, which carry the YAML's numbering — often
+     1-based, possibly non-contiguous. Addressed the wrong way, every sample is silently dropped
+     rather than rejected. `ocpp_bridge.rs::meter_sample_events` already had this right.
+  2. The hardware meter reports `power_w`/`current_ma`/`voltage_v` as `Some(0)` when idle, where
+     `ocpp_bridge.rs` leaves them `None` — "measured zero" versus "cannot measure". Both defensible;
+     H3b has to pick one deliberately.
+- **H4** — a `capabilities:` block in the charger YAML, `deny_unknown_fields` so a typo'd flag is a
+  parse error rather than a silent `false`, reaching the hardware through
+  `ChargerConfig::capabilities()`. The legacy top-level `has_display:` key still parses and still
+  lands in `Capabilities`.
+- **H5a** — `FileStorage`: one file per key under a caller-supplied directory. Keys are hex-encoded
+  with a `k` prefix, a lossless bijection that as a side effect makes `/`, `\`, NUL, `..`, dotfiles,
+  and Windows reserved device names all unrepresentable. Writes are temp file → `sync_all` →
+  rename, so a reader sees the whole old value or the whole new one.
+- **H6a** — `FakeDisplay`, recording what it was told to show. State is a three-way
+  `Never`/`Cleared`/`Message` enum rather than an `Option`, because upstream defines `show(None)` as
+  "clear the screen", not "no change". `supported_formats` deliberately omits `Html`/`Uri`/`QrCode`
+  so the handler's `NotSupportedMessageFormat` path stays exercisable.
+
 ## Where we are
 
 The baseline, after moving from the `ocpp-charge-point` git dependency to the published 0.1.0:
@@ -215,6 +248,26 @@ assumed. Same a/b split as H5.
 
 Pairs with a TUI panel rendering the charger's screen — tracked in the TUI roadmap, not here.
 
+### H3b — Converge the two simulations
+
+**Owns:** `charger/state.rs`, `charger/ocpp_bridge.rs`, and the TUI's tick plumbing.
+**Depends on:** H3.
+
+The half of H3 that got deferred, and the task that finally makes decision 1 true. `ChargerState`
+stops simulating and starts projecting: delete the physics from `EvseState::tick`, drive
+`FakeChargePoint::tick` instead, and retire `ocpp_bridge.rs::meter_sample_events` along with the
+TUI's `maybe_send_meter_values`.
+
+The hard part is not the connected path — it's that a local (1.6J / unconnected) simulation has no
+`FakeChargePoint` at all today, because one is only built inside `connect_charger`. Something has to
+own fake hardware for an unconnected charger before the physics can move. Settle that first; the
+rest is mechanical.
+
+Also decide, deliberately: idle meter fields read `Some(0)` (hardware) or `None` (bridge)?
+
+Expect TUI goldens to move. Per the TUI roadmap's working agreements, inspect every regenerated one
+rather than accepting the diff.
+
 ### H7 — Surface hardware state on `ChargerState`
 
 **Owns:** `charger/state.rs`, `charger/ocpp_bridge.rs`.
@@ -296,8 +349,8 @@ something only the current branch has is the cheap guard.
 | Wave | Tasks | Notes |
 | --- | --- | --- |
 | 0 | ~~**H1**, **H2**~~ | Done. Different files, so both at once. H1 was hours; H2 was the long pole, as expected. |
-| 1 | **H3**, **H4**, **H5a**, **H6a** | Four-way parallel. H5a and H6a are pure trait impls with `tempfile`-backed tests and no dependency on H2 at all — the cheapest work to hand to a second pair of hands. |
-| 2 | **H5b**, **H6b**, **H7**, **H11** | All small; H5b/H6b are registrations that H2 made possible, H7 is frontend plumbing. |
+| 1 | ~~**H3**, **H4**, **H5a**, **H6a**~~ | Done, four-way parallel. H5a and H6a were the cheapest to hand off, exactly as predicted — pure trait impls, no dependency on H2. |
+| 2 | **H3b**, **H5b**, **H6b**, **H7**, **H11** | H3b is the big one and owns `state.rs`; H7 also wants `state.rs`, so sequence those two or let H3b absorb H7. H5b/H6b are registrations H2 made possible. |
 | 3 | **H8**, **H9**, **H10**, **H12** | The widest wave: four independent functional blocks. H8 and H9 share `hardware_bundle.rs`, so sequence those two or split the file by block first. |
 | 4 | **H13**, **H14** | H13 needs H12; H14 needs only H3, so H14 can be pulled into wave 3 if someone is free. |
 
@@ -319,6 +372,15 @@ more satisfying task.
   is `f64`. Round at emission, never in the accumulator.
 - `core` is published. Any change to `connect_charger`, `ChargerConfig`, or the `Fake*` types is a
   change to somebody else's build.
+- Adding a field to `ChargerConfig` breaks every exhaustive literal in the workspace — currently 15
+  of them. That is deliberate: the struct is not `#[non_exhaustive]`, and a compile error at each
+  site is the right prompt to think about what the new field should be there. Don't "fix" it with
+  `..Default::default()`, which would silently absorb the next field too. Do budget for it when
+  scoping a task, and don't hand the field addition and the call sites to different agents.
+- File ownership only parallelizes tasks that are genuinely separable in Rust. H4 owned `config.rs`
+  alone, but its one new field made four other files stop compiling — so its commit could not stand
+  on its own, and the integration landed here instead. When a task changes a widely-constructed
+  type, it owns the ripple too.
 
 ## Known gaps
 
@@ -330,6 +392,11 @@ more satisfying task.
   cannot match, and the price paid for being able to register optional hardware at all. Fixing it
   means an upstream change: either make `actor()` public or add a builder method that spawns the
   loop. Worth raising against `ocpp-charge-point` before H5b makes the builder path permanent.
+- **`FileStorage` doesn't bound encoded key length.** Hex doubles it, so a key over ~127 bytes would
+  exceed the 255-byte filename limit and surface as an opaque `ENAMETOOLONG`. Latent, not live:
+  every key upstream currently uses is a short constant (`ocpp-cp/auth-cache`, `ocpp-cp/txn`, …) or
+  built from small integers, the longest around 25 characters. Worth a guard returning a real error
+  before anything starts deriving keys from CSMS-supplied data.
 - **`connect_charger` is OCPP 2.1 only, now explicitly.** A CSMS that negotiates 1.6J or 2.0.1 gets
   `ConnectAndSetupError::UnsupportedNegotiatedVersion` instead of a session. That matches how the
   TUI already gates the call and the function's long-standing doc comment, but it is a narrowing:
