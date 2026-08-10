@@ -366,6 +366,7 @@ mod tests {
             ocpp_version: SimOcppVersion::V21,
             evses: vec![],
             has_display: false,
+            capabilities: Default::default(),
         };
         let profile = ConnectionProfile {
             csms_url: std::env::var("OCPP_TEST_URL")
@@ -856,6 +857,7 @@ mod tests {
             ocpp_version: SimOcppVersion::V21,
             evses: vec![],
             has_display: false,
+            capabilities: Default::default(),
         }
     }
 

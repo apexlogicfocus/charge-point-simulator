@@ -43,10 +43,10 @@ impl FakeChargePoint {
                         .collect(),
                 })
                 .collect(),
-            // Deliberately conservative: only what the simulator actually simulates today is
-            // declared, so the CSMS isn't told about functional blocks nothing here implements.
-            // `has_display` is the one capability the YAML config already describes.
-            capabilities: Capabilities::default().with_has_display(config.has_display),
+            // Whatever the charger's YAML declares (H4) - still conservative by construction,
+            // since an absent `capabilities:` block parses to all-false and a flag only belongs
+            // in a config once hardware here actually backs it.
+            capabilities: config.capabilities(),
             events: Mutex::new(None),
         }
     }
@@ -138,7 +138,7 @@ impl ChargePoint<FakeEvse, FakeConnector> for FakeChargePoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::charger::config::{EvseConfig, OcppVersion};
+    use crate::charger::config::{CapabilitiesConfig, EvseConfig, OcppVersion};
     use ocpp_charge_point::ChargePointRuntime;
     use ocpp_charge_point::executor::TokioExecutor;
     use ocpp_charge_point::hardware::Evse;
@@ -157,6 +157,7 @@ mod tests {
                 connectors: 1,
             }],
             has_display: false,
+            capabilities: Default::default(),
         };
 
         // A throwaway runtime, just to mint real event/command channel handles - `start` is
@@ -189,6 +190,7 @@ mod tests {
                 connectors: 1,
             }],
             has_display: false,
+            capabilities: Default::default(),
         };
 
         let charge_point = FakeChargePoint::from_config(&config);
@@ -205,6 +207,7 @@ mod tests {
                 connectors: 2,
             }],
             has_display: false,
+            capabilities: Default::default(),
         };
 
         let channel_source =
@@ -241,6 +244,7 @@ mod tests {
                 },
             ],
             has_display: false,
+            capabilities: Default::default(),
         };
 
         let charge_point = FakeChargePoint::from_config(&config);
@@ -259,6 +263,7 @@ mod tests {
             ocpp_version: OcppVersion::V21,
             evses: vec![],
             has_display: false,
+            capabilities: Default::default(),
         };
 
         let charge_point = FakeChargePoint::from_config(&config);
@@ -272,6 +277,7 @@ mod tests {
             ocpp_version: OcppVersion::V21,
             evses: vec![],
             has_display: true,
+            capabilities: Default::default(),
         };
 
         let capabilities = FakeChargePoint::from_config(&config).capabilities();
@@ -282,6 +288,32 @@ mod tests {
         assert!(!capabilities.firmware_management);
     }
 
+    /// Covers the wiring between H4's config parsing and the hardware: `from_config` must report
+    /// what the charger's YAML declared, not a hardcoded set. Before H4 the capabilities were
+    /// built inline here and a declared flag could never have reached them.
+    #[tokio::test]
+    async fn capabilities_come_from_the_configs_declared_capabilities() {
+        let config = ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+            capabilities: CapabilitiesConfig {
+                smart_charging: true,
+                reservation: true,
+                ..Default::default()
+            },
+        };
+
+        let capabilities = FakeChargePoint::from_config(&config).capabilities();
+
+        assert!(capabilities.smart_charging);
+        assert!(capabilities.reservation);
+        // Untouched flags stay false - declaring two things must not declare a third.
+        assert!(!capabilities.firmware_management);
+        assert!(!capabilities.has_display);
+    }
+
     #[tokio::test]
     async fn capabilities_follow_the_configs_display_flag() {
         let config = ChargerConfig {
@@ -289,6 +321,7 @@ mod tests {
             ocpp_version: OcppVersion::V21,
             evses: vec![],
             has_display: false,
+            capabilities: Default::default(),
         };
 
         assert!(

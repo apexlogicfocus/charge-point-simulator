@@ -283,6 +283,7 @@ mod tests {
             ocpp_version: OcppVersion::V16J,
             evses,
             has_display: false,
+            capabilities: Default::default(),
         }
     }
 

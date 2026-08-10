@@ -123,6 +123,7 @@ mod tests {
                 connectors: 2,
             }],
             has_display: false,
+            capabilities: Default::default(),
         }));
         app
     }

@@ -132,6 +132,7 @@ fn charger_config(
         ocpp_version,
         evses,
         has_display,
+        capabilities: Default::default(),
     }
 }
 

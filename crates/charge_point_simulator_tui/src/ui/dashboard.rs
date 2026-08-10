@@ -1108,6 +1108,7 @@ mod tests {
             ocpp_version: OcppVersion::V16J,
             evses: vec![],
             has_display: false,
+            capabilities: Default::default(),
         })
     }
 

@@ -1371,6 +1371,7 @@ mod tests {
                 ocpp_version: OcppVersion::V16J,
                 evses,
                 has_display: false,
+                capabilities: Default::default(),
             },
             source: ChargerSource::BuiltIn,
         }
@@ -1386,6 +1387,7 @@ mod tests {
                     connectors: 1,
                 }],
                 has_display: false,
+                capabilities: Default::default(),
             },
             source: ChargerSource::BuiltIn,
         }
@@ -1401,6 +1403,7 @@ mod tests {
                     connectors: 1,
                 }],
                 has_display: true,
+                capabilities: Default::default(),
             },
             source: ChargerSource::BuiltIn,
         }
