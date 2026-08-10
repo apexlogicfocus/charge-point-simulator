@@ -6,10 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Flowion Charge Point Simulator (by Flowion AB) is an OCPP charge point simulator. It emulates real
 charging hardware over OCPP 1.6J, 2.0.1, and 2.1 so that CSMS backends can be developed and tested
-without physical chargers. It is built on top of the `ocpp-charge-point` protocol library (see the
-commented-out git dependency in `crates/charge_point_simulator_core/Cargo.toml`) and layers fake
-hardware mappings on top of it to simulate real charger behavior (connectors, meter values, charging
-sessions, faults, etc.).
+without physical chargers. It is built on top of the `ocpp-charge-point` protocol library (a crates.io
+dependency of `charge_point_simulator_core`) and layers fake hardware mappings on top of it to
+simulate real charger behavior (connectors, meter values, charging sessions, faults, etc.).
+`docs/hardware-roadmap.md` plans how that fake hardware grows to cover the rest of the library's
+hardware trait surface.
 
 Charger configurations and mock vehicles are defined via YAML (see the `configuration` example in
 README.md). Planned advanced simulation scenarios include plug and charge, vehicle-to-grid (V2G), and
