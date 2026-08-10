@@ -52,7 +52,11 @@ pub async fn connect_charger(
     ocpp_charge_point::connect_and_setup(
         charge_point,
         &url,
+        // No explicit version list or payload limits: offer whatever the client supports and
+        // take the crate's default frame ceiling.
+        None,
         Some(options),
+        None,
         TokioExecutor,
         TokioBackoff,
     )

@@ -291,6 +291,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -1613,7 +1614,8 @@ dependencies = [
 [[package]]
 name = "ocpp-charge-point"
 version = "0.1.0"
-source = "git+https://github.com/flowionab/ocpp-charge-point#1318b2d75f48eb193b771598659620a202964f27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52b63dfa3262784ef3371b61b61f3511561c392c740d5d318630205f71941204"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1621,15 +1623,17 @@ dependencies = [
  "embassy-sync",
  "heapless 0.8.0",
  "ocpp-client",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "ocpp-client"
-version = "0.2.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b151b0a401bc6bd0f155405bd84cde8259704b98f0d29f6383d8616604b38564"
+checksum = "fbed213749fb4696f1a48850169a376a97b0b40a817ce866a0f8013b0e03b831"
 dependencies = [
  "base64",
  "critical-section",
@@ -1648,10 +1652,11 @@ dependencies = [
 
 [[package]]
 name = "ocpp-types"
-version = "0.1.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a14c954e7dda647f787a1d7664ec32406dbe7c3702fdf3ea2a50976d5d6ccd07"
+checksum = "54a90bec37abef3d067e869f7e748f9011c47a16436e5d2ae4a7450a6a36b52a"
 dependencies = [
+ "chrono",
  "heapless 0.8.0",
  "serde",
  "serde-json-core",

@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ocpp_charge_point::hardware::{
-    ChargePoint, Connector, Evse, HardwareCommandReceiver, HardwareEventSender,
+    Capabilities, ChargePoint, Connector, Evse, HardwareCommandReceiver, HardwareEventSender,
     execute_hardware_command,
 };
 
@@ -18,6 +18,10 @@ pub struct FakeConnector {
     connector_id: usize,
     locked: AtomicBool,
     contactor_closed: AtomicBool,
+    /// The most recent current limit applied via [`Connector::set_current_limit`], in mA, or
+    /// `None` when no CSMS-imposed limit currently applies. Stored but not yet acted on - the
+    /// simulator has no current draw to clamp until metering is simulated.
+    current_limit_ma: Mutex<Option<u32>>,
 }
 
 impl FakeConnector {
@@ -27,6 +31,7 @@ impl FakeConnector {
             connector_id,
             locked: AtomicBool::new(false),
             contactor_closed: AtomicBool::new(false),
+            current_limit_ma: Mutex::new(None),
         }
     }
 
@@ -36,6 +41,11 @@ impl FakeConnector {
 
     pub fn is_contactor_closed(&self) -> bool {
         self.contactor_closed.load(Ordering::Relaxed)
+    }
+
+    /// The current limit last applied to this connector, in mA, or `None` if unlimited.
+    pub fn current_limit_ma(&self) -> Option<u32> {
+        *self.current_limit_ma.lock().expect("lock poisoned")
     }
 }
 
@@ -82,6 +92,17 @@ impl Connector for FakeConnector {
         );
         Ok(())
     }
+
+    async fn set_current_limit(&self, limit_ma: Option<u32>) -> Result<(), Self::Error> {
+        *self.current_limit_ma.lock().expect("lock poisoned") = limit_ma;
+        tracing::info!(
+            evse = self.evse_id,
+            connector = self.connector_id,
+            limit_ma = ?limit_ma,
+            "current limit set"
+        );
+        Ok(())
+    }
 }
 
 pub struct FakeEvse {
@@ -90,8 +111,17 @@ pub struct FakeEvse {
 
 #[async_trait::async_trait]
 impl Evse<FakeConnector> for FakeEvse {
-    async fn connectors(&self) -> &[FakeConnector] {
+    type Error = core::convert::Infallible;
+
+    fn connectors(&self) -> &[FakeConnector] {
         &self.connectors
+    }
+
+    /// A simulated reboot: nothing to restart, so this only reports the request. The state
+    /// machine has already stopped any transaction and unlocked fail-safely by this point.
+    async fn reboot(&self) -> Result<(), Self::Error> {
+        tracing::info!("evse reboot requested");
+        Ok(())
     }
 }
 
@@ -101,7 +131,8 @@ impl Evse<FakeConnector> for FakeEvse {
 pub struct FakeChargePoint {
     vendor_name: String,
     model_name: String,
-    evses: Arc<Vec<FakeEvse>>,
+    evses: Vec<FakeEvse>,
+    capabilities: Capabilities,
 }
 
 impl FakeChargePoint {
@@ -109,19 +140,21 @@ impl FakeChargePoint {
         Self {
             vendor_name: "Flowion".to_string(),
             model_name: config.id.clone(),
-            evses: Arc::new(
-                config
-                    .evses
-                    .iter()
-                    .map(|evse_config| FakeEvse {
-                        connectors: (1..=evse_config.connectors)
-                            .map(|connector_id| {
-                                FakeConnector::new(evse_config.id as usize, connector_id as usize)
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            ),
+            evses: config
+                .evses
+                .iter()
+                .map(|evse_config| FakeEvse {
+                    connectors: (1..=evse_config.connectors)
+                        .map(|connector_id| {
+                            FakeConnector::new(evse_config.id as usize, connector_id as usize)
+                        })
+                        .collect(),
+                })
+                .collect(),
+            // Deliberately conservative: only what the simulator actually simulates today is
+            // declared, so the CSMS isn't told about functional blocks nothing here implements.
+            // `has_display` is the one capability the YAML config already describes.
+            capabilities: Capabilities::default().with_has_display(config.has_display),
         }
     }
 }
@@ -130,31 +163,34 @@ impl FakeChargePoint {
 impl ChargePoint<FakeEvse, FakeConnector> for FakeChargePoint {
     type StartError = core::convert::Infallible;
 
-    async fn vendor_name(&self) -> &str {
+    fn vendor_name(&self) -> &str {
         &self.vendor_name
     }
 
-    async fn model_name(&self) -> &str {
+    fn model_name(&self) -> &str {
         &self.model_name
     }
 
-    async fn evses(&self) -> &[FakeEvse] {
+    fn evses(&self) -> &[FakeEvse] {
         &self.evses
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
     }
 
     /// `setup()` (in `ocpp-charge-point`) awaits `start()` directly before registering with the
     /// CSMS, so this must return promptly rather than pumping the command loop inline - the
-    /// loop is spawned onto its own task instead, fed by an `Arc` clone of `evses` so it keeps
-    /// running independent of this call's lifetime.
+    /// loop is spawned onto its own task instead, owning the `Arc<Self>` the runtime already
+    /// holds so it keeps running independent of this call's lifetime.
     async fn start(
-        &self,
+        self: Arc<Self>,
         events: HardwareEventSender,
         mut commands: HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
-        let evses = Arc::clone(&self.evses);
         tokio::spawn(async move {
             while let Ok(command) = commands.recv().await {
-                execute_hardware_command(&evses, command, &events).await;
+                execute_hardware_command(self.evses(), command, &events).await;
             }
         });
         Ok(())
@@ -191,7 +227,7 @@ mod tests {
         let events = channel_source.hardware_events();
         let commands = channel_source.hardware_commands();
 
-        let charge_point = FakeChargePoint::from_config(&config);
+        let charge_point = Arc::new(FakeChargePoint::from_config(&config));
         let result = tokio::time::timeout(
             Duration::from_millis(200),
             charge_point.start(events, commands),
@@ -246,11 +282,11 @@ mod tests {
 
         let charge_point = FakeChargePoint::from_config(&config);
 
-        assert_eq!(charge_point.evses().await.len(), 2);
-        assert_eq!(charge_point.evses().await[0].connectors().await.len(), 2);
-        assert_eq!(charge_point.evses().await[1].connectors().await.len(), 1);
-        assert_eq!(charge_point.model_name().await, "CP001");
-        assert_eq!(charge_point.vendor_name().await, "Flowion");
+        assert_eq!(charge_point.evses().len(), 2);
+        assert_eq!(charge_point.evses()[0].connectors().len(), 2);
+        assert_eq!(charge_point.evses()[1].connectors().len(), 1);
+        assert_eq!(charge_point.model_name(), "CP001");
+        assert_eq!(charge_point.vendor_name(), "Flowion");
     }
 
     #[tokio::test]
@@ -263,6 +299,55 @@ mod tests {
         };
 
         let charge_point = FakeChargePoint::from_config(&config);
-        assert_eq!(charge_point.evses().await.len(), 0);
+        assert_eq!(charge_point.evses().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn set_current_limit_records_the_limit_and_clears_it_again() {
+        let connector = FakeConnector::new(1, 1);
+        assert_eq!(connector.current_limit_ma(), None);
+
+        connector.set_current_limit(Some(16_000)).await.unwrap();
+        assert_eq!(connector.current_limit_ma(), Some(16_000));
+
+        // `Some(0)` is "suspend charging", distinct from `None` - both must round-trip.
+        connector.set_current_limit(Some(0)).await.unwrap();
+        assert_eq!(connector.current_limit_ma(), Some(0));
+
+        connector.set_current_limit(None).await.unwrap();
+        assert_eq!(connector.current_limit_ma(), None);
+    }
+
+    #[tokio::test]
+    async fn capabilities_declare_only_what_the_simulator_supports() {
+        let config = ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses: vec![],
+            has_display: true,
+        };
+
+        let capabilities = FakeChargePoint::from_config(&config).capabilities();
+
+        assert!(capabilities.has_display);
+        assert!(!capabilities.smart_charging);
+        assert!(!capabilities.reservation);
+        assert!(!capabilities.firmware_management);
+    }
+
+    #[tokio::test]
+    async fn capabilities_follow_the_configs_display_flag() {
+        let config = ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+        };
+
+        assert!(
+            !FakeChargePoint::from_config(&config)
+                .capabilities()
+                .has_display
+        );
     }
 }

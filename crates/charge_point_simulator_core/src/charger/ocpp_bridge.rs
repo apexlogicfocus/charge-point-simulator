@@ -23,6 +23,13 @@ pub fn map_connector_status(state: OcppConnectorState) -> ConnectorStatus {
         | OcppConnectorState::Finishing
         | OcppConnectorState::Unlocking => ConnectorStatus::Occupied,
         OcppConnectorState::Starting | OcppConnectorState::Charging => ConnectorStatus::Charging,
+        // Suspended by either side is still an active session with a cable in it - the simulator's
+        // coarse status has no "suspended", and "occupied" is closer than "charging" since no
+        // energy is flowing.
+        OcppConnectorState::SuspendedEv | OcppConnectorState::SuspendedEvse => {
+            ConnectorStatus::Occupied
+        }
+        OcppConnectorState::Reserved => ConnectorStatus::Reserved,
         OcppConnectorState::Unavailable => ConnectorStatus::Unavailable,
         OcppConnectorState::Faulted | OcppConnectorState::FaultedSafe => ConnectorStatus::Faulted,
     }
@@ -57,7 +64,9 @@ pub fn apply_ocpp_state(charger: &mut ChargerState, ocpp_state: &ChargePointStat
             connector.status = map_connector_status(ocpp_connector);
             if matches!(
                 ocpp_connector,
-                OcppConnectorState::Available | OcppConnectorState::Unavailable
+                OcppConnectorState::Available
+                    | OcppConnectorState::Unavailable
+                    | OcppConnectorState::Reserved
             ) {
                 connector.vehicle = None;
             } else if connector.vehicle.is_none() {
@@ -166,7 +175,12 @@ pub fn meter_sample_events(charger: &ChargerState) -> Vec<ChargePointEvent> {
                     evse_id,
                     event: EvseEvent::Connector {
                         connector_id,
-                        event: ConnectorEvent::MeterValueSampled(MeterSample { energy_wh }),
+                        // Only cumulative energy is simulated today; every other quantity is
+                        // left `None` rather than fabricated (see `MeterSample`'s docs).
+                        event: ConnectorEvent::MeterValueSampled(MeterSample {
+                            energy_wh,
+                            ..Default::default()
+                        }),
                     },
                 })
         })
@@ -178,7 +192,7 @@ mod tests {
     use super::*;
     use crate::charger::config::{ChargerConfig, EvseConfig, OcppVersion};
     use crate::charger::state::{ChargerState, ConnectorStatus, SimulationMode};
-    use ocpp_charge_point::state::{EvseState as OcppEvseState, LifecycleState};
+    use ocpp_charge_point::state::LifecycleState;
 
     fn charger_state() -> ChargerState {
         ChargerState::from_config(ChargerConfig {
@@ -193,16 +207,13 @@ mod tests {
     }
 
     fn ocpp_state_with(connectors: Vec<OcppConnectorState>) -> ChargePointState {
-        ChargePointState {
-            lifecycle: LifecycleState::Available,
-            registration: Some(RegistrationStatus::Accepted),
-            evses: vec![OcppEvseState {
-                status: ocpp_charge_point::state::EvseStatus::Available,
-                connectors,
-                transactions: vec![None, None],
-            }],
-            next_transaction_id: 0,
-        }
+        // Built through the crate's own constructor rather than a struct literal: `ChargePointState`
+        // has grown a field per functional block, and only these three matter to this mapping.
+        let mut state = ChargePointState::new([connectors.len()]);
+        state.lifecycle = LifecycleState::Available;
+        state.registration = Some(RegistrationStatus::Accepted);
+        state.evses[0].connectors = connectors;
+        state
     }
 
     #[test]
@@ -242,6 +253,18 @@ mod tests {
         assert_eq!(
             map_connector_status(OcppConnectorState::Unlocking),
             ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::SuspendedEv),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::SuspendedEvse),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            map_connector_status(OcppConnectorState::Reserved),
+            ConnectorStatus::Reserved
         );
         assert_eq!(
             map_connector_status(OcppConnectorState::Unavailable),
@@ -389,6 +412,25 @@ mod tests {
     }
 
     #[test]
+    fn apply_ocpp_state_does_not_invent_a_vehicle_for_a_reserved_connector() {
+        // A reservation holds a connector for someone who hasn't arrived yet - nothing is
+        // plugged in, so no vehicle should be synthesized.
+        let mut charger = charger_state();
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Reserved,
+            OcppConnectorState::Available,
+        ]);
+
+        apply_ocpp_state(&mut charger, &ocpp);
+
+        assert_eq!(
+            charger.evses[0].connectors[0].status,
+            ConnectorStatus::Reserved
+        );
+        assert!(charger.evses[0].connectors[0].vehicle.is_none());
+    }
+
+    #[test]
     fn plug_in_vehicle_maps_to_cable_connected_only_when_available() {
         assert_eq!(
             command_to_connector_event(Command::PlugInVehicle, OcppConnectorState::Available, ""),
@@ -518,7 +560,10 @@ mod tests {
                 evse_id: 0,
                 event: EvseEvent::Connector {
                     connector_id: 0,
-                    event: ConnectorEvent::MeterValueSampled(MeterSample { energy_wh: 1500 }),
+                    event: ConnectorEvent::MeterValueSampled(MeterSample {
+                        energy_wh: 1500,
+                        ..Default::default()
+                    }),
                 },
             }]
         );
@@ -544,7 +589,10 @@ mod tests {
             event,
             ChargePointEvent::Evse {
                 event: EvseEvent::Connector {
-                    event: ConnectorEvent::MeterValueSampled(MeterSample { energy_wh: 2000 }),
+                    event: ConnectorEvent::MeterValueSampled(MeterSample {
+                        energy_wh: 2000,
+                        ..
+                    }),
                     ..
                 },
                 ..

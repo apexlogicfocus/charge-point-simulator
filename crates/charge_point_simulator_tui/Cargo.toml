@@ -25,4 +25,4 @@ arboard = "3.6.1"
 [dev-dependencies]
 # Only for constructing ChargePointState/ConnectorState test fixtures directly - production
 # code talks to the OCPP protocol layer exclusively through charge_point_simulator_core.
-ocpp-charge-point = { git = "https://github.com/flowionab/ocpp-charge-point" }
+ocpp-charge-point = "0.1.0"
