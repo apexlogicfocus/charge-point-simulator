@@ -198,6 +198,26 @@ fn resolve_simulation_mode(csms_url: &str) -> SimulationMode {
     }
 }
 
+/// Where `charger_id`'s persisted hardware state (in-flight transaction, boot reason, cached
+/// device model, ...) lives on disk - `ChargerHardware::new`'s `FileStorage` is rooted here.
+///
+/// `FileStorage` deliberately "stays decoupled from `dirs`" (see its own module docs) and takes
+/// an explicit directory instead, so resolving one is this call site's job - the same split
+/// `main.rs`'s `connection_store_path` already draws for `ConnectionStore`: one subdirectory per
+/// charger under the same `flowion-charge-point-simulator` config root `connections.yaml` lives
+/// in, honoring the same `FLOWION_STATE_DIR` override so tests/CI can redirect both without
+/// touching the real home directory.
+fn charger_storage_dir(charger_id: &str) -> PathBuf {
+    if let Ok(path) = std::env::var("FLOWION_STATE_DIR") {
+        return PathBuf::from(path).join("storage").join(charger_id);
+    }
+    dirs::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("flowion-charge-point-simulator")
+        .join("storage")
+        .join(charger_id)
+}
+
 impl App {
     pub fn new(chargers: Vec<ChargerEntry>) -> Self {
         Self {
@@ -1160,7 +1180,8 @@ impl App {
                     .build()
                     .expect("failed to build a runtime for the CSMS connection attempt");
                 tokio_runtime.block_on(async move {
-                    match connect_charger(&config, &profile, ChargerHardware::default()).await {
+                    let hardware = ChargerHardware::new(charger_storage_dir(&config.id));
+                    match connect_charger(&config, &profile, hardware).await {
                         Ok(charge_point_runtime) => {
                             let _ = result_sender.send(Ok(()));
 
