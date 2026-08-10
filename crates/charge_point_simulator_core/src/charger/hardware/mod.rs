@@ -2,6 +2,7 @@ mod charge_point;
 mod connector;
 mod display;
 mod evse;
+mod metering;
 mod storage;
 
 pub use charge_point::FakeChargePoint;
