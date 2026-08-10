@@ -1,12 +1,3 @@
-// `FakeDisplay` is complete and fully exercised by the tests below, but nothing outside this
-// file constructs one yet: registering it via `ChargePointBuilder::display_messages` is H6b
-// (`docs/hardware-roadmap.md`), a separate task owned by wiring in `charger/connect.rs` and
-// `charger/mod.rs`'s re-export - files this task (H6a) deliberately does not touch. Until that
-// lands, `rustc` sees everything here as unreachable from the crate's public surface even though
-// the test module below constructs and calls every bit of it. Drop this once H6b registers
-// `FakeDisplay` somewhere reachable.
-#![allow(dead_code)]
-
 use std::sync::Mutex;
 
 use ocpp_charge_point::hardware::Display;

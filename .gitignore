@@ -1,3 +1,6 @@
 target/
 /chargers/
 .DS_Store
+
+# Agent worktrees created by Claude Code
+.claude/worktrees/
