@@ -182,6 +182,32 @@ More examples and configuration documentation will be added as the project evolv
 
 ---
 
+## 💾 State and persistence
+
+Every simulated charger - whether it's dialed against a CSMS or running fully offline as a local
+simulation - persists its hardware-backed state (boot reason, in-flight transactions, the
+authorization cache, the device model, the security event log, ...) to disk by default. This
+includes an unconnected/local charger: it's the one people tend to leave running, so surviving a
+restart is exactly where that persistence earns its keep, and it now gets the same treatment a
+CSMS-connected charger does.
+
+State lives under one directory per charger:
+
+```
+<config dir>/flowion-charge-point-simulator/storage/<charger-id>/
+```
+
+`<config dir>` follows your OS's usual convention (e.g. `~/.config` on Linux, `~/Library/Application
+Support` on macOS) unless the `FLOWION_STATE_DIR` environment variable is set, in which case state is
+written under `<FLOWION_STATE_DIR>/storage/<charger-id>/` instead - handy for tests, CI, or running
+multiple isolated instances side by side.
+
+Whether anything actually gets written still depends on the charger's own declared
+`capabilities.has_persistent_storage`/`has_display` - the directory is only ever read from or written
+to when the charger's configuration says to.
+
+---
+
 ## 🖥️ Dashboard
 
 The built-in Ratatui dashboard provides:

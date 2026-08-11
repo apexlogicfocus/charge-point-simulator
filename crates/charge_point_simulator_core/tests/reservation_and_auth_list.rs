@@ -59,8 +59,8 @@
 use std::time::Duration as StdDuration;
 
 use charge_point_simulator_core::charger::{
-    CapabilitiesConfig, ChargerConfig, ChargerState, ConnectorStatus, EvseConfig, OcppVersion,
-    RunningCharger, start_local_charger,
+    CapabilitiesConfig, ChargerConfig, ChargerHardware, ChargerState, ConnectorStatus, EvseConfig,
+    OcppVersion, RunningCharger, start_local_charger,
 };
 use ocpp_charge_point::state::{
     AuthorizationStatus, ChargePointEvent, ConnectorEvent, ConnectorState as OcppConnectorState,
@@ -147,7 +147,7 @@ async fn a_charger_declaring_reservation_can_have_a_connector_reserved_with_no_v
         reservation: true,
         ..Default::default()
     });
-    let charger = start_local_charger(&config).await;
+    let charger = start_local_charger(&config, ChargerHardware::default()).await;
     let mut states = charger.subscribe();
 
     // Before anything happens, the connector reads its construction-time default.
@@ -186,7 +186,7 @@ async fn cancelling_a_reservation_returns_the_connector_to_available() {
         reservation: true,
         ..Default::default()
     });
-    let charger = start_local_charger(&config).await;
+    let charger = start_local_charger(&config, ChargerHardware::default()).await;
     let mut states = charger.subscribe();
 
     charger
@@ -239,7 +239,7 @@ async fn reservation_capability_has_no_effect_on_the_connector_state_machine_its
     });
 
     for config in [declares_it, does_not_declare_it] {
-        let charger = start_local_charger(&config).await;
+        let charger = start_local_charger(&config, ChargerHardware::default()).await;
         let mut states = charger.subscribe();
 
         charger
@@ -279,7 +279,7 @@ async fn a_charger_declaring_local_auth_list_authorizes_a_locally_listed_identif
         local_auth_list: true,
         ..Default::default()
     });
-    let charger = start_local_charger(&config).await;
+    let charger = start_local_charger(&config, ChargerHardware::default()).await;
     let mut states = charger.subscribe();
 
     charger
@@ -367,7 +367,7 @@ async fn local_auth_list_rejection_is_observable_in_local_mode() {
         local_auth_list: true,
         ..Default::default()
     });
-    let charger = start_local_charger(&config).await;
+    let charger = start_local_charger(&config, ChargerHardware::default()).await;
     let mut states = charger.subscribe();
 
     charger

@@ -78,11 +78,12 @@ pub struct ChargerHardware {
 }
 
 impl ChargerHardware {
-    /// Real hardware: a [`FileStorage`] rooted at `storage_dir` plus a [`FakeDisplay`]. `connect_charger`
-    /// (via `docs/hardware-roadmap.md`'s H5b/H6b registration) only actually wires either one up
-    /// for a charger whose YAML `capabilities:` block declares the matching flag
-    /// (`has_persistent_storage`/`has_display`) - passing real hardware here doesn't by itself
-    /// register anything the charger didn't declare.
+    /// Real hardware: a [`FileStorage`] rooted at `storage_dir` plus a [`FakeDisplay`]. Both
+    /// [`super::connect::connect_charger`] and [`super::running_charger::start_local_charger`]
+    /// (via `docs/hardware-roadmap.md`'s H5b/H6b registration, and H3d/decision 6 for local mode)
+    /// only actually wire either one up for a charger whose YAML `capabilities:` block declares
+    /// the matching flag (`has_persistent_storage`/`has_display`) - passing real hardware here
+    /// doesn't by itself register anything the charger didn't declare.
     ///
     /// Every other field - `firmware_installer`/`firmware_verifier`/`file_transfer`/
     /// `certificate_store` - stays `None`: unlike storage/display, each of those needs a

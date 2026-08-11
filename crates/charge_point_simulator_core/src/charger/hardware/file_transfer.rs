@@ -57,6 +57,15 @@ pub struct FakeFileTransfer {
     upload_progress: Mutex<Option<watch::Sender<Duration>>>,
     download_fail: AtomicBool,
     upload_fail: AtomicBool,
+    /// The most recent [`UploadSource::Bytes`] this transfer was asked to upload, if any - `None`
+    /// both before the first upload and whenever the most recent one was
+    /// [`UploadSource::Local`] (this fake never sees real bytes for that variant, per this
+    /// module's own docs). Exists purely for tests: unlike `download`/`upload`'s pacing, which is
+    /// observable through [`Self::tick`]/`TransferProgress`, nothing else about `upload`'s content
+    /// is otherwise reachable from outside this type, and `docs/hardware-roadmap.md`'s decision 8
+    /// (`log_uploads` sharing the restored `SecurityEventLog`) needs to verify what actually got
+    /// rendered and handed to `upload`, not merely that it was called.
+    last_upload_bytes: Mutex<Option<Vec<u8>>>,
 }
 
 impl FakeFileTransfer {
@@ -70,7 +79,17 @@ impl FakeFileTransfer {
             upload_progress: Mutex::new(None),
             download_fail: AtomicBool::new(false),
             upload_fail: AtomicBool::new(false),
+            last_upload_bytes: Mutex::new(None),
         }
+    }
+
+    /// The bytes handed to the most recent [`FileTransfer::upload`] call, if it carried
+    /// [`UploadSource::Bytes`] - see [`Self::last_upload_bytes`]'s field doc comment.
+    pub fn last_upload(&self) -> Option<Vec<u8>> {
+        self.last_upload_bytes
+            .lock()
+            .expect("lock poisoned")
+            .clone()
     }
 
     /// Advances whichever of `download`/`upload` is currently in flight by `elapsed` - both, if
@@ -204,6 +223,13 @@ impl FileTransfer for FakeFileTransfer {
         progress: &TransferProgress<'_>,
     ) -> Result<(), Self::Error> {
         tracing::info!(url, ?source, "file upload starting");
+        // Captured for tests - see `Self::last_upload_bytes`'s field doc comment. `Local` carries
+        // no bytes this fake ever sees, so it leaves the previous capture untouched rather than
+        // clearing it to `None` - a caller reading `last_upload` after a `Local` upload should see
+        // "nothing changed", not "nothing was ever uploaded".
+        if let UploadSource::Bytes(bytes) = &source {
+            *self.last_upload_bytes.lock().expect("lock poisoned") = Some(bytes.to_vec());
+        }
         let result = Self::run(
             &self.upload,
             &self.upload_progress,

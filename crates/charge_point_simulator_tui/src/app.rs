@@ -1136,6 +1136,15 @@ impl App {
     /// anyway is deliberate: `docs/hardware-roadmap.md`'s H3b is about a local and a connected
     /// charger being driven the same way, and that includes the TUI-side plumbing, not only the
     /// `core` types underneath it.
+    ///
+    /// Gives `start_local_charger` the same real [`ChargerHardware`] bundle
+    /// [`Self::confirm_connection_setup`]'s connected path builds, rooted at the same per-charger
+    /// state directory (`docs/hardware-roadmap.md` decision 6: a local charger is the one people
+    /// leave running, so it persists by default too - see the README's "State and persistence"
+    /// section for the cost that accepts). Whether that bundle actually touches disk still depends
+    /// entirely on the charger's own declared `capabilities.has_persistent_storage`/`has_display` -
+    /// `ChargerHardware::new` only supplies the storage/display *objects*, and `register_setup_blocks`
+    /// (H5b/H6b) never reads from or writes to either unless the matching capability says to.
     fn spawn_local_charger(&mut self, config: ChargerConfig) {
         let (state_sender, state_receiver) = mpsc::unbounded_channel();
         self.ocpp_state_receiver = Some(state_receiver);
@@ -1152,7 +1161,8 @@ impl App {
                 .build()
                 .expect("failed to build a runtime for the local charger");
             tokio_runtime.block_on(async move {
-                let running = start_local_charger(&config).await;
+                let hardware = ChargerHardware::new(charger_storage_dir(&config.id));
+                let running = start_local_charger(&config, hardware).await;
                 drive_running_charger(running, state_sender, event_receiver, tick_receiver).await;
             });
         });
@@ -1699,11 +1709,14 @@ mod tests {
     /// `RunningCharger` (see `spawn_local_charger`) - unlike every other test in this module,
     /// this one lets that thread actually run rather than injecting `ocpp_state_receiver`/
     /// `ocpp_tick_sender` by hand, so it is deliberately the one place this suite waits on real
-    /// (if very short-lived) background-thread timing. The thread does no I/O - it only starts
-    /// the fake hardware and an authorization worker - so polling is bounded well under what
-    /// would ever be a flake risk in practice; a genuine regression (the thread never sending
-    /// anything, or `apply_ocpp_state` never reaching `Offline`) fails this test rather than
-    /// hanging it.
+    /// (if very short-lived) background-thread timing. The thread does no I/O: `charger()` below
+    /// builds a config with default (all-`false`) capabilities, and `ChargerHardware::new`'s real
+    /// `FileStorage`/`FakeDisplay` (decision 6) are only ever read from or written to when the
+    /// charger's own `has_persistent_storage`/`has_display` capability says to - see
+    /// `register_setup_blocks`'s own doc comment - so this thread only starts the fake hardware
+    /// and an authorization worker, exactly as before. Polling is bounded well under what would
+    /// ever be a flake risk in practice; a genuine regression (the thread never sending anything,
+    /// or `apply_ocpp_state` never reaching `Offline`) fails this test rather than hanging it.
     #[test]
     fn a_locally_selected_charger_reports_offline_rather_than_booting_forever() {
         let mut app = App::new(vec![charger("CP001")]);
