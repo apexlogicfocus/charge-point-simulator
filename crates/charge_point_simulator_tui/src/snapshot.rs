@@ -26,7 +26,7 @@ use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargerConfig, ChargerEntry, ChargerSource, ChargerState, Command, ConnectionProfile,
-    ConnectionStatus, EvseConfig, OcppVersion, SecurityProfile, SimulationMode,
+    ConnectionStatus, EvseConfig, EvseMetrics, OcppVersion, SecurityProfile, SimulationMode,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
@@ -175,11 +175,20 @@ fn charging_dashboard_app() -> App {
     Command::PlugInVehicle.apply_to(&mut state.evses[0], 0, "MY-EV-1");
     Command::PresentRfid.apply_to(&mut state.evses[0], 0, "TAG-42");
     // A fixed, non-wall-clock elapsed time - this mirrors what `App::tick_metrics_with` does to
-    // `charger_state` (`state.tick(elapsed)`); `tick_metrics_with` itself is private to the
-    // `app` module and out of reach from here, but the rest of what it does
-    // (`maybe_send_meter_values`) is a no-op anyway without a live `ocpp_event_sender`, which
-    // none of these scenarios set up.
+    // `charger_state` (`state.tick(elapsed)`), for the session-duration/SoC bookkeeping that
+    // still lives there.
     state.tick(Duration::from_secs(600));
+    // H3b moved the meter itself into `core`'s hardware layer, reached only through a real
+    // `RunningCharger` and `apply_ocpp_state` - out of reach from a bare `ChargerState` fixture
+    // like this one, which renders straight from `App::charger_state` with no running charger
+    // behind it. Setting the reading `EvseState::tick`'s old accumulator would have produced for
+    // 600 simulated seconds at 7.4 kW keeps this "mid-session" fixture's numbers meaningful
+    // without standing up a whole runtime just to render a snapshot.
+    state.evses[0].metrics = EvseMetrics {
+        power_kw: 7.4,
+        current_a: 7.4 * 1000.0 / 230.0,
+        energy_kwh: 7.4 * 600.0 / 3600.0,
+    };
 
     // Structured entries rather than plain strings, so the goldens actually pin the log pane's
     // columns: timestamp, level, direction marker, elided target, action, and fields.
@@ -658,6 +667,14 @@ fn multi_evse_mixed_status_app() -> App {
     Command::PresentRfid.apply_to(&mut state.evses[0], 0, "TAG-1");
     Command::ReportFault.apply_to(&mut state.evses[1], 0, "OverCurrentFailure");
     state.tick(Duration::from_secs(600));
+    // See `charging_dashboard_app`'s comment: H3b moved the meter out of `ChargerState::tick`, so
+    // this fixture sets EVSE 1's reading directly rather than through a `RunningCharger` it has
+    // none of. EVSE 2 is faulted, not charging, so its metrics correctly stay zeroed.
+    state.evses[0].metrics = EvseMetrics {
+        power_kw: 7.4,
+        current_a: 7.4 * 1000.0 / 230.0,
+        energy_kwh: 7.4 * 600.0 / 3600.0,
+    };
     app
 }
 

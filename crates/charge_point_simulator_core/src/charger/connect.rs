@@ -2,7 +2,6 @@ use core::convert::Infallible;
 use std::sync::Arc;
 
 use ocpp_charge_point::ChargePointBuilder;
-use ocpp_charge_point::ChargePointRuntime;
 use ocpp_charge_point::ConnectAndSetupError;
 use ocpp_charge_point::authorization::{Authorizer, ClearCacheHandler};
 use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
@@ -56,6 +55,7 @@ use super::config::ChargerConfig;
 use super::connection::{ConnectionProfile, SecurityProfile};
 use super::hardware::{FakeChargePoint, FakeDisplay, FileStorage};
 use super::hardware_bundle::ChargerHardware;
+use super::running_charger::RunningCharger;
 
 /// Builds the WebSocket URL to dial for `ocpp_identity`, given the CSMS's configured base
 /// address: normalizes an `http(s)://` scheme to `ws(s)://` (so [`ConnectionProfile::csms_url`]
@@ -379,7 +379,7 @@ pub async fn connect_charger(
     config: &ChargerConfig,
     profile: &ConnectionProfile,
     hardware: ChargerHardware,
-) -> Result<ChargePointRuntime<FakeChargePoint>, ConnectAndSetupError<Infallible>> {
+) -> Result<RunningCharger, ConnectAndSetupError<Infallible>> {
     let ChargerHardware { storage, display } = hardware;
 
     let charge_point = FakeChargePoint::from_config(config);
@@ -454,7 +454,12 @@ async fn connect_ocpp_2_1(
     target: Arc<ConnectionTarget>,
     storage: Option<FileStorage>,
     display: Option<FakeDisplay>,
-) -> Result<ChargePointRuntime<FakeChargePoint>, ConnectAndSetupError<Infallible>> {
+) -> Result<RunningCharger, ConnectAndSetupError<Infallible>> {
+    // Cloned before `charge_point` is moved into `ChargePointBuilder::start` below - that call
+    // wraps it in an `Arc` this function can never reach again (see `RunningCharger`'s doc
+    // comment), so the only way to keep a handle for ticking the meter later is to have taken one
+    // first.
+    let hardware = charge_point.clone();
     let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
         .await
         .map_err(ConnectAndSetupError::Start)?;
@@ -479,7 +484,10 @@ async fn connect_ocpp_2_1(
     }
     builder = builder.network_profile_switching(&target, client.clone(), TokioBackoff);
 
-    Ok(builder.offline_queue_retries(TokioBackoff, 60).build())
+    Ok(RunningCharger::new(
+        builder.offline_queue_retries(TokioBackoff, 60).build(),
+        hardware,
+    ))
 }
 
 #[cfg(test)]

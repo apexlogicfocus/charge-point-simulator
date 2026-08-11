@@ -7,17 +7,13 @@ use ocpp_charge_point::state::MeterSample;
 /// limit clamps it further, in kW - a plausible single-phase AC rate, not derived from any real
 /// hardware spec.
 ///
-/// `charger/state.rs`'s `EvseState::SIMULATED_CHARGING_POWER_KW` is a temporary duplicate of this
-/// value. It exists only until the physics-convergence task in `docs/hardware-roadmap.md` (the
-/// second half of H3, deliberately out of scope here) deletes `EvseState::tick`'s copy of the
-/// constants and the accumulation loop they drive, once a local (unconnected) simulation has this
-/// hardware layer to route its meter samples through. This module is the canonical home for the
-/// constant from that point on.
+/// This module is the sole home for the constant - `charger/state.rs`'s old `EvseState`
+/// accumulator, which used to duplicate it, was deleted in `docs/hardware-roadmap.md`'s H3b once
+/// a local (unconnected) simulation had this hardware layer to route its meter samples through.
 pub const SIMULATED_CHARGING_POWER_KW: f64 = 7.4;
 
 /// Nominal single-phase voltage used to convert between the simulated power and current
-/// readings. Duplicated in `charger/state.rs` for the same reason as
-/// [`SIMULATED_CHARGING_POWER_KW`] - see that constant's doc comment.
+/// readings. See [`SIMULATED_CHARGING_POWER_KW`]'s doc comment.
 pub const NOMINAL_VOLTAGE: f64 = 230.0;
 
 /// The nominal current draw at [`SIMULATED_CHARGING_POWER_KW`]/[`NOMINAL_VOLTAGE`], in
@@ -78,9 +74,10 @@ impl SimulatedMeter {
     /// that task doesn't need a rework to express it.
     ///
     /// `soc_percent` is always `None`: there is no vehicle model in the hardware layer yet, and
-    /// fabricating a state of charge would violate "never advertise what isn't simulated". Left
-    /// for the physics-convergence task, once `charger/state.rs`'s vehicle model has somewhere to
-    /// plug into.
+    /// fabricating a state of charge would violate "never advertise what isn't simulated".
+    /// `charger/state.rs`'s vehicle model (`session_duration`/`Vehicle::state_of_charge`)
+    /// deliberately stayed put in H3b for exactly this reason - moving it needs a simulated
+    /// battery down here that doesn't exist yet.
     pub fn tick(
         &self,
         elapsed: Duration,

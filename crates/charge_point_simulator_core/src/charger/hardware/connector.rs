@@ -54,12 +54,12 @@ impl FakeConnector {
 
     /// Advances this connector's simulated meter by `elapsed`, reading the contactor and current
     /// limit state tracked right here as the meter's inputs - see [`SimulatedMeter::tick`] for
-    /// the physics. Nothing calls this yet; it exists for
-    /// [`super::charge_point::FakeChargePoint::tick`] to drive per connector - which addresses
-    /// the resulting sample by this connector's *position* among its EVSE's connectors, not by
-    /// `evse_id`/`connector_id` here (those exist for `tracing` only, and carry the config's
-    /// possibly non-contiguous EVSE/connector numbering rather than the array index the
-    /// OCPP-facing state machine addresses by).
+    /// the physics. Driven per connector by
+    /// [`super::charge_point::FakeChargePoint::tick`], which addresses the resulting sample by
+    /// this connector's *position* among its EVSE's connectors, not by `evse_id`/`connector_id`
+    /// here (those exist for `tracing` only, and carry the config's possibly non-contiguous
+    /// EVSE/connector numbering rather than the array index the OCPP-facing state machine
+    /// addresses by).
     pub fn tick(&self, elapsed: Duration) -> MeterSample {
         self.meter
             .tick(elapsed, self.is_contactor_closed(), self.current_limit_ma())

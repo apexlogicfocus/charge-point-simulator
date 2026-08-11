@@ -3,19 +3,23 @@ use std::time::Duration;
 
 use super::config::ChargerConfig;
 
-/// How a charger's `connection_status` gets driven, and therefore who is allowed to write it.
+/// How a charger's `connection_status` gets driven.
 ///
-/// The two variants own `ChargerState::connection_status` for mutually exclusive reasons:
-/// - `Local`: there's no real CSMS in the picture, so [`ChargerState::tick`] drives the whole
-///   boot-to-connected lifecycle itself, purely from simulated elapsed time.
-/// - `LiveCsms`: a real OCPP connection exists, and [`super::ocpp_bridge::apply_ocpp_state`]
-///   mirrors the CSMS's actual registration/connector state onto `connection_status` every time
-///   a snapshot arrives. `tick` must never touch `connection_status` in this mode - doing so
-///   would race the real protocol state and make the display flicker between what the bridge
-///   just set and what a local simulated clock thinks it should be.
+/// As of `docs/hardware-roadmap.md`'s H3b, both variants run a real
+/// `ocpp_charge_point::ChargePointRuntime` (see [`crate::charger::RunningCharger`]) and
+/// `connection_status` comes exclusively from [`super::ocpp_bridge::apply_ocpp_state`], which
+/// reads this to decide *how* to interpret the runtime's `ChargePointState` - never from
+/// [`ChargerState::tick`], which no longer touches `connection_status` at all:
+/// - `Local`: there is no CSMS to register with (`RunningCharger::register`/
+///   `register_until_accepted` are simply never called), so `ChargePointState::registration`
+///   stays `None` forever. `apply_ocpp_state` reads that, via this variant, as
+///   [`ConnectionStatus::Offline`] rather than the endlessly-retried `Booting` an unanswered
+///   real CSMS registration would mean.
+/// - `LiveCsms`: a real OCPP connection exists, and `apply_ocpp_state` mirrors the CSMS's actual
+///   registration status onto `connection_status` every time a snapshot arrives.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SimulationMode {
-    /// No CSMS connection: the simulator owns the whole lifecycle itself.
+    /// No CSMS connection: the simulator runs its own hardware with nothing on the other end.
     Local,
     /// Driven by a live CSMS connection; the OCPP bridge owns connection_status.
     LiveCsms { url: String },
@@ -117,35 +121,21 @@ pub struct EvseState {
 }
 
 impl EvseState {
-    /// Simulated charging power per actively-charging connector, in kW - a plausible
-    /// single-phase AC rate, not derived from any real hardware spec.
-    const SIMULATED_CHARGING_POWER_KW: f64 = 7.4;
-    /// Nominal single-phase voltage used to derive a simulated current reading from power.
-    const NOMINAL_VOLTAGE: f64 = 230.0;
-
     /// Simulated state-of-charge gain per second of simulated time while a connector is
-    /// `Charging`. This is a demo pace, not a physically derived one (it isn't back-calculated
-    /// from [`Self::SIMULATED_CHARGING_POWER_KW`] and a battery capacity) - much like
-    /// [`ChargerState::SIMULATED_BOOT_DURATION`] isn't a real boot time. At this rate, a vehicle
+    /// `Charging`. This is a demo pace, not a physically derived one. At this rate, a vehicle
     /// plugged in at the default 20% (see [`crate::charger::Command::PlugInVehicle`]) reaches
     /// 100% after exactly 4 simulated minutes of charging, which is fast enough that a session
     /// visibly progresses within a short live demo without looking instantaneous.
     const SOC_PERCENT_PER_SECOND: f64 = 1.0 / 3.0;
 
-    /// Advances this EVSE's simulated meter reading by `elapsed`: power and current reflect
-    /// how many connectors are currently `Charging` (multiple charging connectors on one EVSE
-    /// simply add up - this simulator has no per-connector meter, only an EVSE-level one), and
-    /// energy accumulates accordingly. Power/current drop to zero (energy holds) once nothing's
-    /// charging.
-    ///
-    /// Also drives two pieces of per-connector state from the same simulated `elapsed`: each
-    /// `Charging` connector's [`ConnectorState::session_duration`] accumulates and its plugged-in
-    /// vehicle's [`Vehicle::state_of_charge`] rises (clamped at 100, see
-    /// [`Self::SOC_PERCENT_PER_SECOND`]); a connector that returns to `Available` has its session
-    /// duration reset to zero since the vehicle is gone. Neither field moves for any other
-    /// status (`Occupied`, `Faulted`, `Unavailable`, `Reserved`) - a connector merely paused
-    /// mid-session (e.g. `Charging -> Occupied -> Charging` after a fault clears) holds its
-    /// accumulated duration and SoC rather than losing them, since it's still the same session.
+    /// Drives two pieces of per-connector state from the simulated `elapsed`: each `Charging`
+    /// connector's [`ConnectorState::session_duration`] accumulates and its plugged-in vehicle's
+    /// [`Vehicle::state_of_charge`] rises (clamped at 100, see [`Self::SOC_PERCENT_PER_SECOND`]);
+    /// a connector that returns to `Available` has its session duration reset to zero since the
+    /// vehicle is gone. Neither field moves for any other status (`Occupied`, `Faulted`,
+    /// `Unavailable`, `Reserved`) - a connector merely paused mid-session (e.g.
+    /// `Charging -> Occupied -> Charging` after a fault clears) holds its accumulated duration
+    /// and SoC rather than losing them, since it's still the same session.
     ///
     /// `state_of_charge` accumulates as the exact `f64` it's stored as (see the doc comment on
     /// [`Vehicle::state_of_charge`]) - it is never rounded to a coarser type mid-simulation, only
@@ -153,23 +143,15 @@ impl EvseState {
     /// however many ticks the same total elapsed time is split across.
     ///
     /// Charging never tapers or stops once the vehicle reaches 100% SoC - that's
-    /// charging-strategy behavior for a later phase, not this simulator's meter/session tick.
+    /// charging-strategy behavior for a later phase, not this simulator's session tick.
+    ///
+    /// This is deliberately the only thing left in here (`docs/hardware-roadmap.md`'s H3b): the
+    /// electrical simulation (power, current, energy) that used to live alongside it moved into
+    /// the hardware layer's `SimulatedMeter`, driven by `FakeChargePoint::tick` and read back
+    /// through [`super::ocpp_bridge::apply_ocpp_state`] into [`Self::metrics`] - there is no
+    /// vehicle/battery model down there yet, so `session_duration`/`state_of_charge` stay here
+    /// until one exists.
     pub fn tick(&mut self, elapsed: std::time::Duration) {
-        let charging_connectors = self
-            .connectors
-            .iter()
-            .filter(|connector| connector.status == ConnectorStatus::Charging)
-            .count();
-        let power_kw = Self::SIMULATED_CHARGING_POWER_KW * charging_connectors as f64;
-
-        self.metrics.power_kw = power_kw;
-        self.metrics.current_a = if power_kw > 0.0 {
-            power_kw * 1000.0 / Self::NOMINAL_VOLTAGE
-        } else {
-            0.0
-        };
-        self.metrics.energy_kwh += power_kw * (elapsed.as_secs_f64() / 3600.0);
-
         for connector in &mut self.connectors {
             match connector.status {
                 ConnectorStatus::Charging => {
@@ -210,10 +192,6 @@ pub struct ChargerState {
 }
 
 impl ChargerState {
-    /// Simulated time a locally-driven charger spends `Booting` before `tick` promotes it to
-    /// `Connected`. ~1.5s reads as a plausible boot handshake without making a demo wait for it.
-    const SIMULATED_BOOT_DURATION: Duration = Duration::from_millis(1500);
-
     /// Builds the initial state for a freshly started charger: booting,
     /// every connector available, no vehicles plugged in, and zeroed metrics.
     pub fn from_config(config: ChargerConfig) -> Self {
@@ -250,20 +228,13 @@ impl ChargerState {
         }
     }
 
-    /// Advances every EVSE's simulated meter reading by `elapsed` (see [`EvseState::tick`]) and
-    /// accumulates simulated `uptime`. In [`SimulationMode::Local`], also drives the charger from
-    /// `Booting` to `Connected` once `uptime` reaches [`Self::SIMULATED_BOOT_DURATION`]. In
-    /// [`SimulationMode::LiveCsms`], `connection_status` is never touched here - the OCPP bridge
-    /// owns it exclusively (see [`SimulationMode`]).
+    /// Accumulates simulated `uptime` and advances every EVSE's session/SoC bookkeeping (see
+    /// [`EvseState::tick`]) by `elapsed`. Never touches `connection_status` or any EVSE's
+    /// `metrics` - both are projections of a real `ChargePointState`, written exclusively by
+    /// [`super::ocpp_bridge::apply_ocpp_state`], for a local charger and a live-CSMS one alike
+    /// (see [`SimulationMode`] and `docs/hardware-roadmap.md`'s H3b).
     pub fn tick(&mut self, elapsed: std::time::Duration) {
         self.uptime += elapsed;
-
-        if self.mode == SimulationMode::Local
-            && self.connection_status == ConnectionStatus::Booting
-            && self.uptime >= Self::SIMULATED_BOOT_DURATION
-        {
-            self.connection_status = ConnectionStatus::Connected;
-        }
 
         for evse in &mut self.evses {
             evse.tick(elapsed);
@@ -354,85 +325,22 @@ mod tests {
         assert_eq!(state.evses[0].metrics, EvseMetrics::default());
     }
 
+    /// H3b: `EvseState::tick` no longer computes anything electrical - `metrics` is written
+    /// exclusively by `ocpp_bridge::apply_ocpp_state`, reading real meter samples off a
+    /// `ChargePointState`. See `charger/hardware/metering.rs`'s `SimulatedMeter` tests for the
+    /// physics this used to duplicate, and `ocpp_bridge.rs`'s `apply_ocpp_state_populates_*`
+    /// tests for where it lives now.
     #[test]
-    fn ticking_with_no_charging_connectors_leaves_metrics_at_zero() {
+    fn ticking_never_touches_metrics_regardless_of_connector_status() {
         let mut state = ChargerState::from_config(config(vec![EvseConfig {
             id: 1,
             connectors: 1,
         }]));
+        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
 
         state.tick(Duration::from_secs(3600));
 
         assert_eq!(state.evses[0].metrics, EvseMetrics::default());
-    }
-
-    #[test]
-    fn ticking_an_hour_with_one_charging_connector_adds_a_full_hour_of_energy() {
-        let mut state = ChargerState::from_config(config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]));
-        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
-
-        state.tick(Duration::from_secs(3600));
-
-        let metrics = state.evses[0].metrics;
-        assert_eq!(metrics.power_kw, EvseState::SIMULATED_CHARGING_POWER_KW);
-        assert!((metrics.energy_kwh - EvseState::SIMULATED_CHARGING_POWER_KW).abs() < 1e-9);
-        assert!(metrics.current_a > 0.0);
-    }
-
-    #[test]
-    fn energy_accumulates_across_multiple_ticks() {
-        let mut state = ChargerState::from_config(config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]));
-        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
-
-        state.tick(Duration::from_secs(1800));
-        state.tick(Duration::from_secs(1800));
-
-        assert!(
-            (state.evses[0].metrics.energy_kwh - EvseState::SIMULATED_CHARGING_POWER_KW).abs()
-                < 1e-9
-        );
-    }
-
-    #[test]
-    fn two_charging_connectors_on_one_evse_double_the_simulated_power() {
-        let mut state = ChargerState::from_config(config(vec![EvseConfig {
-            id: 1,
-            connectors: 2,
-        }]));
-        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
-        state.evses[0].connectors[1].status = ConnectorStatus::Charging;
-
-        state.tick(Duration::from_secs(3600));
-
-        assert_eq!(
-            state.evses[0].metrics.power_kw,
-            EvseState::SIMULATED_CHARGING_POWER_KW * 2.0
-        );
-    }
-
-    #[test]
-    fn power_and_current_drop_back_to_zero_once_charging_stops_but_energy_holds() {
-        let mut state = ChargerState::from_config(config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]));
-        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
-        state.tick(Duration::from_secs(3600));
-        let energy_after_charging = state.evses[0].metrics.energy_kwh;
-
-        state.evses[0].connectors[0].status = ConnectorStatus::Available;
-        state.tick(Duration::from_secs(3600));
-
-        let metrics = state.evses[0].metrics;
-        assert_eq!(metrics.power_kw, 0.0);
-        assert_eq!(metrics.current_a, 0.0);
-        assert_eq!(metrics.energy_kwh, energy_after_charging);
     }
 
     #[test]
@@ -466,48 +374,18 @@ mod tests {
         assert_eq!(state.uptime, Duration::from_millis(800));
     }
 
+    /// H3b: `tick` no longer drives any boot-to-connected lifecycle itself - `connection_status`
+    /// is written exclusively by `ocpp_bridge::apply_ocpp_state`, for a local charger and a
+    /// live-CSMS one alike (see `SimulationMode`'s doc comment). This holds regardless of how
+    /// long a `Local` charger ticks with nothing else acting on it.
     #[test]
-    fn a_local_charger_stays_booting_before_the_boot_duration_elapses() {
+    fn a_local_chargers_connection_status_never_moves_from_ticking_alone() {
         let mut state = ChargerState::from_config(config(vec![]));
-
-        state.tick(ChargerState::SIMULATED_BOOT_DURATION - Duration::from_millis(1));
-
-        assert_eq!(state.connection_status, ConnectionStatus::Booting);
-    }
-
-    #[test]
-    fn a_local_charger_connects_once_the_boot_duration_elapses() {
-        let mut state = ChargerState::from_config(config(vec![]));
-
-        state.tick(ChargerState::SIMULATED_BOOT_DURATION);
-
-        assert_eq!(state.connection_status, ConnectionStatus::Connected);
-    }
-
-    #[test]
-    fn the_boot_transition_survives_being_reached_across_several_small_ticks() {
-        let mut state = ChargerState::from_config(config(vec![]));
-        let step = ChargerState::SIMULATED_BOOT_DURATION / 10;
-
-        for _ in 0..9 {
-            state.tick(step);
-        }
-        assert_eq!(state.connection_status, ConnectionStatus::Booting);
-
-        state.tick(step);
-
-        assert_eq!(state.connection_status, ConnectionStatus::Connected);
-    }
-
-    #[test]
-    fn a_local_charger_does_not_regress_from_connected_back_to_booting() {
-        let mut state = ChargerState::from_config(config(vec![]));
-        state.tick(ChargerState::SIMULATED_BOOT_DURATION);
-        assert_eq!(state.connection_status, ConnectionStatus::Connected);
 
         state.tick(Duration::from_secs(3600));
 
-        assert_eq!(state.connection_status, ConnectionStatus::Connected);
+        assert_eq!(state.connection_status, ConnectionStatus::Booting);
+        assert_eq!(state.uptime, Duration::from_secs(3600));
     }
 
     #[test]
@@ -521,20 +399,6 @@ mod tests {
 
         assert_eq!(state.connection_status, ConnectionStatus::Booting);
         assert_eq!(state.uptime, Duration::from_secs(3600));
-    }
-
-    #[test]
-    fn metrics_still_tick_normally_alongside_the_boot_lifecycle() {
-        let mut state = ChargerState::from_config(config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]));
-        state.evses[0].connectors[0].status = ConnectorStatus::Charging;
-
-        state.tick(ChargerState::SIMULATED_BOOT_DURATION);
-
-        assert_eq!(state.connection_status, ConnectionStatus::Connected);
-        assert!(state.evses[0].metrics.energy_kwh > 0.0);
     }
 
     #[test]
@@ -675,11 +539,8 @@ mod tests {
             Some(100.0)
         );
         // Reaching 100% does not taper or stop the simulated charge - see the doc comment on
-        // `EvseState::tick` - so metrics keep reflecting a charging connector.
-        assert_eq!(
-            state.evses[0].metrics.power_kw,
-            EvseState::SIMULATED_CHARGING_POWER_KW
-        );
+        // `EvseState::tick` - the connector itself stays `Charging`.
+        assert_eq!(connector.status, ConnectorStatus::Charging);
     }
 
     #[test]
