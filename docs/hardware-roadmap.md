@@ -269,12 +269,33 @@ These are the calls this roadmap is built on. Revisit them here rather than re-d
 4. **Power is signed from day one.** V2G is on this roadmap; discovering that export needs a sign
    after the accumulator is written is a rework nobody needs. `MeterSample`'s fields are already
    `i64`.
-5. **`ring` is the `SoftwareCrypto` backend** for H13. It is already in the tree transitively via
-   `rustls` in the websocket stack, so it adds no new supply-chain surface and no new build tooling,
-   and it is the most-audited option. Accepted cost: C/assembly internals make unusual
-   cross-compilation targets awkward, and its API is opinionated about available algorithms. Do not
-   substitute another backend without revisiting this line — it is a security decision, not a
-   dependency preference.
+5. **RustCrypto (`ecdsa`/`p256`/`p384`) is the `SoftwareCrypto` backend** for H13 — *reversing* an
+   earlier choice of `ring`, which implementation proved cannot do the job.
+
+   `ring` was chosen because it is already in the tree transitively via `rustls`, adding no
+   supply-chain surface, and is the most-audited option. H13a then discovered the disqualifying
+   detail: **`ring` has no public API to sign a pre-hashed digest.** Its `signature` module hashes
+   the message internally on both sign and verify, and the private `sign_digest`/`verify_digest` are
+   not `pub`. But `KeyStore::sign`'s contract is exactly that — "signs `digest` (a value already
+   hashed by the caller, not raw message bytes)" — and `certificates/csr.rs` SHA-256s the encoded
+   `CertificationRequestInfo` before calling it.
+
+   A `ring` backend therefore signs SHA-256(SHA-256(csr)). That is self-consistent — sign and verify
+   double-hash identically, so the module's own tests pass and it fails closed correctly — and
+   completely non-interoperable: a real CA or TLS peer hashes once and would reject every signature.
+   Since testing against a real CA is much of why plug and charge is worth having, that is
+   disqualifying rather than a documented quirk.
+
+   RustCrypto's `ecdsa` exposes `sign_prehash` (via `PrehashSigner`), which is precisely the
+   operation the trait models. Accepted costs: three new direct dependencies, and less audit
+   attention than `ring` has had. Still a security decision, not a dependency preference — do not
+   substitute another backend without revisiting this line.
+
+   **The transferable lesson:** "already in the dependency tree" is an argument about cost, not about
+   fitness. The fitness question — can this library perform the exact operation the trait requires —
+   went unasked until someone tried to implement against it, and a self-consistent implementation
+   with passing tests is not evidence of interoperability. Where cryptography has to interoperate,
+   check the primitive before choosing the crate.
 6. **A local charger persists to disk by default.** A local charger is the one people leave running,
    so surviving a restart is where `FileStorage` earns its keep, and matching the connected path's
    default is the whole point of H3d. Writes go under the existing per-charger state directory.
