@@ -174,6 +174,19 @@ The guiding principles, which every task should be checked against:
   schedule switches exactly at the period boundary, and an undeclared capability leaves the profile
   inert. Every link works — **once actually wired up**, which local mode does not do. See H3c.
 
+- **H10a** — `FakeFirmwareInstaller`/`FakeFirmwareVerifier` and `FakeFileTransfer`, paced by injected
+  `elapsed` through a `watch` channel rather than any wall clock: because a new subscriber sees the
+  channel's current value immediately, ticking a "90 second" install's whole duration up front
+  resolves it instantly in a test and paces it normally in the app. `Duration` addition being exact
+  means the many-small-ticks-equals-one-big-tick test needs no float tolerance, unlike
+  `SimulatedMeter`.
+
+  Every failure is caller-triggered and reproducible, never random: `trigger_failure()` on the
+  installer, `set_outcome(...)`/`fail_to_verify()` on the verifier (distinguishing "verified and
+  invalid" from "could not be attempted"), and independent `trigger_download_failure()` /
+  `trigger_upload_failure()` so failing a log upload leaves a firmware download in flight alone.
+  The registration follow-up needs these names.
+
 ## Where we are
 
 Every charger — local or connected — runs a real `ocpp_charge_point::ChargePointRuntime` (see
@@ -490,8 +503,9 @@ something only the current branch has is the cheap guard.
 | 0 | ~~**H1**, **H2**~~ | Done. Different files, so both at once. H1 was hours; H2 was the long pole, as expected. |
 | 1 | ~~**H3**, **H4**, **H5a**, **H6a**~~ | Done, four-way parallel. H5a and H6a were the cheapest to hand off, exactly as predicted — pure trait impls, no dependency on H2. |
 | 2 | ~~**H5b+H6b**~~, ~~**H3b**~~, **H7** | H5b+H6b done as one task. H3b followed, and ended up owning `charger/connect.rs` too for the handle problem — see its "Done" entry. H7 is what's left. H11 turned out to be blocked upstream; see its section. |
-| 3 | **H8**, **H9**, **H10**, **H12** | The widest wave: four independent functional blocks. H8 and H9 share `hardware_bundle.rs`, so sequence those two or split the file by block first. |
-| 4 | **H13**, **H14** | H13 needs H12; H14 needs only H3, so H14 can be pulled into wave 3 if someone is free. |
+| 3 | ~~**H8**, **H9**, **H10a**, **H12a**~~ | Done, four-way parallel with no shared files. H8/H9 became test-only tasks — the registrations already existed — and ran as integration tests under `tests/`, which also proves the published surface is usable from outside. H10/H12 split implement-then-register, as H5/H6 did. |
+| 3.5 | **H3c**, the local-authorizer fix, **H10b+H12b** | H3c and the authorizer fix first, together — both are "local mode is under-wired", and registering yet more hardware into a path local mode doesn't use only widens that gap. Then register firmware/file-transfer/certificates/keys as one task, the way H5b+H6b was. |
+| 4 | **H13**, **H14** | H13 needs H12 **and a `SoftwareCrypto` decision** — see "Known gaps". H14 needs only H3, so it can go earlier if someone is free. |
 
 The critical path is **H2 → H5b → H12 → H13**. Everything else has slack. If H2 slips, waves 2–4
 all slip with it, which is the argument for starting it before H1 despite H1 being the smaller,
