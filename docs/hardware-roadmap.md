@@ -272,9 +272,16 @@ These are the calls this roadmap is built on. Revisit them here rather than re-d
 5. **RustCrypto (`ecdsa`/`p256`/`p384`) is the `SoftwareCrypto` backend** for H13 — *reversing* an
    earlier choice of `ring`, which implementation proved cannot do the job.
 
-   `ring` was chosen because it is already in the tree transitively via `rustls`, adding no
-   supply-chain surface, and is the most-audited option. H13a then discovered the disqualifying
-   detail: **`ring` has no public API to sign a pre-hashed digest.** Its `signature` module hashes
+   `ring` was chosen on two grounds, **and the first of them was simply false.** It was said to be
+   already in the tree transitively via `rustls`, adding no supply-chain surface. It is not:
+   `rustls-webpki` lists `ring` as an *optional* dependency and this build activates its `aws-lc-rs`
+   feature instead, so `cargo tree -i ring` prints nothing and `ring` has never been compiled here.
+   The crypto library actually in this build is `aws-lc-rs`. Adding `ring` would have meant a
+   genuinely new dependency, compiled for the first time — the opposite of the argument made for it.
+   Nobody checked before deciding.
+
+   The second ground — that `ring` is heavily audited — was true but not sufficient, because H13a
+   then found the disqualifying detail: **`ring` has no public API to sign a pre-hashed digest.** Its `signature` module hashes
    the message internally on both sign and verify, and the private `sign_digest`/`verify_digest` are
    not `pub`. But `KeyStore::sign`'s contract is exactly that — "signs `digest` (a value already
    hashed by the caller, not raw message bytes)" — and `certificates/csr.rs` SHA-256s the encoded
@@ -291,11 +298,23 @@ These are the calls this roadmap is built on. Revisit them here rather than re-d
    attention than `ring` has had. Still a security decision, not a dependency preference — do not
    substitute another backend without revisiting this line.
 
-   **The transferable lesson:** "already in the dependency tree" is an argument about cost, not about
-   fitness. The fitness question — can this library perform the exact operation the trait requires —
-   went unasked until someone tried to implement against it, and a self-consistent implementation
-   with passing tests is not evidence of interoperability. Where cryptography has to interoperate,
-   check the primitive before choosing the crate.
+   **Worth revisiting once, cheaply:** `aws-lc-rs` *is* already built here, so if it exposes
+   pre-hashed signing it would give interoperable signatures with no new direct dependency at all —
+   the argument `ring` was wrongly credited with. Nobody has checked. Not urgent: the RustCrypto
+   backend works and is proven not to double-hash, and a third swap of the same module should clear
+   a higher bar than "one fewer dependency".
+
+   **Two transferable lessons, both learned the expensive way:**
+
+   1. *"Already in the dependency tree" is a claim to verify, not to assert.* One `cargo tree -i ring`
+      would have taken seconds and falsified it, and the same command would have shown `aws-lc-rs`
+      sitting right there. A dependency argument nobody checks is just a guess with a citation.
+   2. *"Already in the dependency tree" is an argument about cost, not fitness.* Even had it been
+      true, it says nothing about whether the library can perform the operation the trait requires —
+      a question that went unasked until someone implemented against it. And a self-consistent
+      implementation with passing tests is not evidence of interoperability: `ring`'s double-hash
+      passed every symmetric test written for it. Where cryptography has to interoperate, check the
+      primitive before choosing the crate, and test against an independently built verifier.
 6. **A local charger persists to disk by default.** A local charger is the one people leave running,
    so surviving a restart is where `FileStorage` earns its keep, and matching the connected path's
    default is the whole point of H3d. Writes go under the existing per-charger state directory.
