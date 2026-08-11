@@ -3,6 +3,7 @@
 //! `docs/hardware-roadmap.md`'s H3b for why this module exists.
 
 use std::ops::Deref;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ocpp_charge_point::ChargePointBuilder;
@@ -12,8 +13,9 @@ use ocpp_charge_point::executor::TokioExecutor;
 use ocpp_charge_point::provisioning::TokioBackoff;
 
 use super::config::ChargerConfig;
-use super::connect::{NullCsms, register_setup_blocks};
-use super::hardware::{FakeChargePoint, FakeDisplay, FileStorage};
+use super::connect::{NullCsms, register_optional_hardware, register_setup_blocks};
+use super::hardware::{FakeChargePoint, FakeFileTransfer, FakeFirmwareInstaller};
+use super::hardware_bundle::ChargerHardware;
 use super::ocpp_bridge::{apply_hardware_state, apply_ocpp_state};
 use super::state::ChargerState;
 
@@ -43,25 +45,60 @@ use super::state::ChargerState;
 /// Every [`ChargePointRuntime`] method beyond ticking (`state`, `subscribe`, `send`, ...) is
 /// reached through [`Deref`] rather than re-exposed one by one, so this stays a thin wrapper that
 /// tracks upstream's own surface instead of drifting from it.
+///
+/// # What `tick` drives (`docs/hardware-roadmap.md` H3d)
+///
+/// `RunningCharger` is the one place both the ticking caller (the TUI's `drive_running_charger`,
+/// today) and every piece of the fake hardware bundle that needs simulated time are in scope
+/// together - the same reasoning [`Self::apply_state`] already relies on for `hardware`. Before
+/// H3d, `tick` advanced only [`FakeChargePoint`] (the meter), so a CSMS-initiated firmware
+/// install or file transfer registered through [`super::connect::register_optional_hardware`] sat
+/// at 0% forever in the running app; the only place it ever progressed was a test holding its own
+/// `Arc` and ticking the installer directly. `firmware_installer`/`file_transfer` are held here for
+/// exactly the same "clone before handing ownership away" reason [`FakeChargePoint`] itself is
+/// (see [`super::connect::connect_charger`]/[`start_local_charger`]'s own doc comments): both
+/// callers clone their `Arc`s before consuming the originals via `register_optional_hardware`, and
+/// hand the clones to [`Self::new`] here. A caller of [`Self::tick`] therefore never needs to know
+/// which pieces of the bundle exist or need ticking separately - it drives the whole simulation
+/// with one call, exactly like ticking a real charger's clock would.
 pub struct RunningCharger {
     runtime: ChargePointRuntime<FakeChargePoint>,
     hardware: FakeChargePoint,
+    firmware_installer: Option<Arc<FakeFirmwareInstaller>>,
+    file_transfer: Option<Arc<FakeFileTransfer>>,
 }
 
 impl RunningCharger {
     pub(crate) fn new(
         runtime: ChargePointRuntime<FakeChargePoint>,
         hardware: FakeChargePoint,
+        firmware_installer: Option<Arc<FakeFirmwareInstaller>>,
+        file_transfer: Option<Arc<FakeFileTransfer>>,
     ) -> Self {
-        Self { runtime, hardware }
+        Self {
+            runtime,
+            hardware,
+            firmware_installer,
+            file_transfer,
+        }
     }
 
-    /// Advances the simulated hardware clock by `elapsed` - see [`FakeChargePoint::tick`]. The
-    /// only entry point through which this charger's meter ever moves, for a local charger and a
+    /// Advances the whole simulation by `elapsed`: the meter ([`FakeChargePoint::tick`]), and -
+    /// H3d - any in-flight firmware install or file transfer the bundle carries
+    /// ([`FakeFirmwareInstaller::tick`]/[`FakeFileTransfer::tick`], both no-ops when nothing is in
+    /// flight, so calling this on a charger with neither registered costs nothing). The only entry
+    /// point through which this charger's simulated time ever moves, for a local charger and a
     /// live-CSMS one alike (decision 2 in `docs/hardware-roadmap.md`: simulated time only,
-    /// injected by the caller, never a `tokio::time::interval` owned in here).
+    /// injected by the caller, never a `tokio::time::interval` owned in here) - see this type's own
+    /// doc comment for why a caller never has to tick each piece separately.
     pub async fn tick(&self, elapsed: Duration) {
         self.hardware.tick(elapsed).await;
+        if let Some(installer) = &self.firmware_installer {
+            installer.tick(elapsed);
+        }
+        if let Some(transfer) = &self.file_transfer {
+            transfer.tick(elapsed);
+        }
     }
 
     /// Projects this charger's full observable state onto `charger` in one call:
@@ -104,6 +141,24 @@ impl Deref for RunningCharger {
 /// uses, against [`NullCsms`], a CSMS stand-in that answers nothing a real CSMS would answer (see
 /// its own doc comment) so this exercises the *offline* paths rather than a fake-online one.
 ///
+/// # `hardware` (`docs/hardware-roadmap.md` H3d)
+///
+/// Takes a [`ChargerHardware`] exactly like [`super::connect::connect_charger`] does, and runs it
+/// through the *same* registration sequence - [`register_setup_blocks`] then
+/// [`register_optional_hardware`] - with `has_csms: false` the only thing that differs. Before
+/// H3d, this function took no hardware at all and hardcoded `None` for storage and display, and
+/// never called `register_optional_hardware`, so a local charger got no persistence, no display,
+/// no firmware installer, no certificate store regardless of what a caller might have wanted to
+/// give it - the same "local mode is under-wired" gap H3c had already fixed one layer up, for
+/// functional blocks rather than hardware.
+///
+/// `firmware_installer`/`file_transfer` are cloned before `hardware` is consumed by
+/// `register_optional_hardware`, so [`RunningCharger`] still has a live handle to tick even though
+/// `register_optional_hardware` itself only ever registers `certificates` locally (`firmware_updates`/
+/// `log_uploads` are has_csms-gated - see that function's own doc comment) - installing firmware is
+/// local hardware behavior independent of whether a CSMS campaign is registered to drive it (see
+/// [`RunningCharger::tick`]'s doc comment for what this makes possible).
+///
 /// `has_csms: false` skips every block whose entire purpose is talking to a CSMS that does not
 /// exist here - `provisioning` above all, since against a `NullCsms` that never fabricates
 /// acceptance its retry-until-accepted call would otherwise hang this function forever. What's
@@ -115,46 +170,90 @@ impl Deref for RunningCharger {
 /// `remote_control`, `trigger_message`, `availability_control`, `reset`, `device_model`), and -
 /// gated on the same `Capabilities` flags the connected path reads - `reservation`
 /// (+`reservation_status_updates`, so a reservation actually expires locally),
-/// `local_authorization_list`, and `smart_charging` (+`charging_profile_reports`, so a locally
-/// installed `ChargingProfileSet` actually computes and applies a current limit - H8's gap).
-/// [`register_setup_blocks`]'s own `has_csms` doc comment has the full registered/skipped list and
-/// the reasoning behind each entry.
+/// `local_authorization_list`, `smart_charging` (+`charging_profile_reports`, so a locally
+/// installed `ChargingProfileSet` actually computes and applies a current limit - H8's gap), and
+/// persistence/display (H5b/H6b's own gating, unaffected by `has_csms`). [`register_setup_blocks`]'s
+/// own `has_csms` doc comment has the full registered/skipped list and the reasoning behind each
+/// entry; [`register_optional_hardware`]'s own doc comment covers `certificates`/`firmware_updates`/
+/// `log_uploads`.
 ///
 /// See `docs/hardware-roadmap.md`'s H3b for why this is the shape a local (unconnected)
 /// simulation takes at all, instead of the coarse, hardware-free state machine
 /// `charger/state.rs`/`charger/command.rs` used to run entirely on their own.
-pub async fn start_local_charger(config: &ChargerConfig) -> RunningCharger {
-    let hardware = FakeChargePoint::from_config(config);
-    let handle = hardware.clone();
+pub async fn start_local_charger(
+    config: &ChargerConfig,
+    hardware: ChargerHardware,
+) -> RunningCharger {
+    let charge_point = FakeChargePoint::from_config(config);
+    let handle = charge_point.clone();
 
-    let builder = ChargePointBuilder::start(hardware, TokioExecutor)
+    let ChargerHardware {
+        storage,
+        display,
+        firmware_installer,
+        firmware_verifier,
+        file_transfer,
+        certificate_store,
+    } = hardware;
+    // Cloned before being consumed by `register_optional_hardware` below - see this function's
+    // own doc comment and `RunningCharger::tick`'s for why a live handle has to survive that call.
+    let firmware_installer_handle = firmware_installer.clone();
+    let file_transfer_handle = file_transfer.clone();
+
+    let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
         .await
         .unwrap_or_else(|error: core::convert::Infallible| match error {});
-    let builder = register_setup_blocks(
+    let (mut builder, security_log) = register_setup_blocks(
         builder,
         &NullCsms,
         TokioBackoff,
         SystemMonotonicClock,
         SystemClock,
-        None::<&FileStorage>,
-        None::<FakeDisplay>,
+        storage.as_ref(),
+        display,
         false, // has_csms: no CSMS is ever dialed in local mode.
     )
     .await;
 
-    RunningCharger::new(builder.build(), handle)
+    builder = register_optional_hardware(
+        builder,
+        &NullCsms,
+        TokioBackoff,
+        SystemClock,
+        firmware_installer,
+        firmware_verifier,
+        file_transfer,
+        certificate_store,
+        security_log, // decision 8: share whatever `register_setup_blocks` restored, if anything.
+        false, // has_csms: no CSMS is ever dialed in local mode - see the function's own doc comment.
+    )
+    .await;
+
+    RunningCharger::new(
+        builder.build(),
+        handle,
+        firmware_installer_handle,
+        file_transfer_handle,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::charger::config::CapabilitiesConfig;
     use crate::charger::config::EvseConfig;
     use crate::charger::config::OcppVersion;
+    use ocpp_charge_point::hardware::FirmwareInstaller;
+    use ocpp_charge_point::persistence::{SecurityLogStore, restore_security_log};
+    use ocpp_charge_point::security::SecurityEventLog;
     use ocpp_charge_point::state::{
         AuthorizationStatus, ChargePointEvent, ConnectorEvent,
         ConnectorState as OcppConnectorState, EvseEvent, IdToken, IdTokenKind, LocalListEntry,
+        SecurityEvent, SecurityEventType,
     };
     use std::time::Duration as StdDuration;
+
+    use super::super::hardware::FileStorage;
 
     fn config(evses: Vec<EvseConfig>) -> ChargerConfig {
         ChargerConfig {
@@ -271,16 +370,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_local_charger_has_no_registration_and_stays_offline_from_the_ocpp_state_alone() {
-        let charger = start_local_charger(&config(vec![])).await;
+        let charger = start_local_charger(&config(vec![]), ChargerHardware::default()).await;
         assert_eq!(charger.state().registration, None);
     }
 
     #[tokio::test]
     async fn a_local_chargers_connector_reaches_charging_with_no_csms_at_all() {
-        let charger = start_local_charger(&config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]))
+        let charger = start_local_charger(
+            &config(vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }]),
+            ChargerHardware::default(),
+        )
         .await;
 
         charge_locally(&charger, 0, 0).await;
@@ -302,7 +404,7 @@ mod tests {
             id: 1,
             connectors: 1,
         }]);
-        let charger = start_local_charger(&config).await;
+        let charger = start_local_charger(&config, ChargerHardware::default()).await;
         let mut state = ChargerState::from_config(config);
 
         // Before anything happens, both read their construction-time defaults.
@@ -325,10 +427,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_local_chargers_meter_accrues_energy_while_the_contactor_is_closed() {
-        let charger = start_local_charger(&config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]))
+        let charger = start_local_charger(
+            &config(vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }]),
+            ChargerHardware::default(),
+        )
         .await;
         charge_locally(&charger, 0, 0).await;
 
@@ -347,18 +452,24 @@ mod tests {
     /// `FakeChargePoint::tick` down to `SimulatedMeter::tick` - rather than the meter type alone.
     #[tokio::test]
     async fn the_same_total_elapsed_time_reads_the_same_whether_split_across_many_ticks_or_one() {
-        let one_big_tick = start_local_charger(&config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]))
+        let one_big_tick = start_local_charger(
+            &config(vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }]),
+            ChargerHardware::default(),
+        )
         .await;
         charge_locally(&one_big_tick, 0, 0).await;
         one_big_tick.tick(StdDuration::from_secs(3600)).await;
 
-        let many_small_ticks = start_local_charger(&config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]))
+        let many_small_ticks = start_local_charger(
+            &config(vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }]),
+            ChargerHardware::default(),
+        )
         .await;
         charge_locally(&many_small_ticks, 0, 0).await;
         for _ in 0..100 {
@@ -381,10 +492,13 @@ mod tests {
 
     #[tokio::test]
     async fn ticking_before_anything_is_charging_records_a_zero_sample_not_no_sample() {
-        let charger = start_local_charger(&config(vec![EvseConfig {
-            id: 1,
-            connectors: 1,
-        }]))
+        let charger = start_local_charger(
+            &config(vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }]),
+            ChargerHardware::default(),
+        )
         .await;
 
         charger.tick(StdDuration::from_secs(60)).await;
@@ -394,5 +508,101 @@ mod tests {
         assert_eq!(sample.energy_wh, 0);
         assert_eq!(sample.power_w, Some(0));
         assert_eq!(sample.current_ma, Some(0));
+    }
+
+    // --- H3d: `start_local_charger` given a real bundle -----------------------------------------
+    //
+    // Before H3d, `start_local_charger` took no `ChargerHardware` at all and hardcoded `None` for
+    // storage and display - a caller could not give a local charger persistence, a display, or
+    // firmware/file-transfer hardware no matter what it passed, because there was nowhere to pass
+    // it. These two tests drive the *public* entry point end to end with a real bundle (a tempdir
+    // for storage, a real `FakeFirmwareInstaller`) to prove neither is silently dropped - unlike
+    // `connect.rs`'s equivalent proof (which uses `RecordingCsms`/`RecordingStorage` at the
+    // `register_setup_blocks` level), these go through `start_local_charger` by name.
+
+    /// Persistence: a security event recorded on a local charger built with a real, tempdir-backed
+    /// `FileStorage` must actually reach disk - not the `None` a hardcoded local path used to pass
+    /// regardless of what `ChargerHardware` it was given. Reads the data back with a fresh
+    /// `SecurityLogStore` over the same directory rather than through the running charger itself,
+    /// so this is a genuine disk-content check, not a check that the in-memory handle merely exists.
+    #[tokio::test]
+    async fn a_local_charger_given_a_real_bundle_persists_a_security_event_to_disk() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let mut cfg = config(vec![]);
+        cfg.capabilities = CapabilitiesConfig {
+            has_persistent_storage: true,
+            ..Default::default()
+        };
+        let hardware = ChargerHardware::new(dir.path());
+
+        let charger = start_local_charger(&cfg, hardware).await;
+
+        charger
+            .send(ChargePointEvent::SecurityEventOccurred(SecurityEvent {
+                event_type: SecurityEventType::TamperDetectionActivated,
+                tech_info: Some("wired through, not dropped".into()),
+            }))
+            .await
+            .expect("sending to a freshly-built runtime never fails");
+
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let restored = restore_security_log(
+                    &SecurityEventLog::new(),
+                    &SecurityLogStore::new(FileStorage::new(dir.path())),
+                )
+                .await;
+                if restored > 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the security event was never persisted to disk");
+    }
+
+    /// Firmware: `RunningCharger` must hold - and tick - the *same* `FakeFirmwareInstaller`
+    /// `ChargerHardware` was given, not silently drop it. Driven with no CSMS at all
+    /// (`install()` is called directly, the same public entry point `run_firmware_updates` itself
+    /// calls internally): local mode never registers `firmware_updates` against a CSMS that
+    /// doesn't exist (see `register_optional_hardware`'s `has_csms` doc comment), but the installer
+    /// handle and its ticking are independent of whether a CSMS campaign ever drives it - installing
+    /// firmware is local hardware behavior in its own right.
+    #[tokio::test]
+    async fn a_local_chargers_running_charger_ticks_a_firmware_installer_from_a_real_bundle() {
+        let installer = Arc::new(FakeFirmwareInstaller::new(StdDuration::from_secs(90)));
+        let hardware = ChargerHardware {
+            firmware_installer: Some(Arc::clone(&installer)),
+            ..Default::default()
+        };
+
+        let charger = start_local_charger(&config(vec![]), hardware).await;
+
+        // `installer` is only cloned above - the original was moved into `hardware` and from
+        // there into `RunningCharger`, so ticking through `charger` is the only way this
+        // installation can ever progress. Ticks repeatedly rather than once, since a tick issued
+        // before the spawned task has reached `install()` is a documented no-op (see
+        // `FakeFirmwareInstaller::tick`'s own doc comment) - this simply keeps advancing simulated
+        // time until one lands after that point.
+        let install = tokio::spawn(async move { installer.install().await });
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while !install.is_finished() {
+                charger.tick(StdDuration::from_secs(90)).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the firmware install never completed through RunningCharger::tick");
+
+        let outcome = install.await.expect("the install task panicked");
+        assert!(
+            matches!(
+                outcome,
+                Ok(ocpp_charge_point::hardware::FirmwareInstallOutcome::Installed)
+            ),
+            "expected the install to complete once RunningCharger::tick supplied enough \
+             simulated time, got {outcome:?}"
+        );
     }
 }

@@ -50,8 +50,8 @@ use std::time::Duration as StdDuration;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use charge_point_simulator_core::charger::{
-    CapabilitiesConfig, ChargerConfig, ChargerState, EvseConfig, FakeChargePoint, OcppVersion,
-    RunningCharger, apply_hardware_state, apply_ocpp_state, start_local_charger,
+    CapabilitiesConfig, ChargerConfig, ChargerHardware, ChargerState, EvseConfig, FakeChargePoint,
+    OcppVersion, RunningCharger, apply_hardware_state, apply_ocpp_state, start_local_charger,
 };
 use ocpp_charge_point::ChargePointBuilder;
 use ocpp_charge_point::ChargePointRuntime;
@@ -529,10 +529,10 @@ async fn bespoke_wait_for_current_limit(
 async fn a_restrictive_profile_accrues_less_energy_than_no_profile_over_the_same_elapsed_time() {
     let cfg = config(true);
 
-    let unrestricted = start_local_charger(&cfg).await;
+    let unrestricted = start_local_charger(&cfg, ChargerHardware::default()).await;
     charge_locally(&unrestricted, 0, 0).await;
 
-    let restricted = start_local_charger(&cfg).await;
+    let restricted = start_local_charger(&cfg, ChargerHardware::default()).await;
     charge_locally(&restricted, 0, 0).await;
     install_profile(
         &restricted,
@@ -564,7 +564,7 @@ async fn a_restrictive_profile_accrues_less_energy_than_no_profile_over_the_same
 #[tokio::test]
 async fn a_zero_limit_suspends_accrual_without_ending_the_transaction_or_faulting() {
     let cfg = config(true);
-    let charger = start_local_charger(&cfg).await;
+    let charger = start_local_charger(&cfg, ChargerHardware::default()).await;
     charge_locally(&charger, 0, 0).await;
 
     install_profile(
@@ -598,7 +598,7 @@ async fn a_zero_limit_suspends_accrual_without_ending_the_transaction_or_faultin
 #[tokio::test]
 async fn clearing_the_profile_restores_the_unrestricted_rate() {
     let cfg = config(true);
-    let charger = start_local_charger(&cfg).await;
+    let charger = start_local_charger(&cfg, ChargerHardware::default()).await;
     charge_locally(&charger, 0, 0).await;
 
     install_profile(
@@ -690,7 +690,7 @@ async fn a_stepped_schedule_changes_the_applied_limit_at_the_period_boundary() {
 #[tokio::test]
 async fn a_charger_without_the_smart_charging_capability_is_unaffected_by_an_installed_profile() {
     let cfg = config(false);
-    let charger = start_local_charger(&cfg).await;
+    let charger = start_local_charger(&cfg, ChargerHardware::default()).await;
     charge_locally(&charger, 0, 0).await;
 
     install_profile(

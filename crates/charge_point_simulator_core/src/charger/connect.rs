@@ -98,6 +98,19 @@ pub fn websocket_url(base_url: &str, ocpp_identity: &str) -> String {
 /// registration afterwards. Returning the still-open builder is what lets `connect_charger` add
 /// OCPP 2.1's extra blocks `setup()` cannot know about (see its caller).
 ///
+/// # Return value (`docs/hardware-roadmap.md` decision 8)
+///
+/// Returns `(builder, security_log)` rather than just the builder. `security_log` is the same
+/// [`Arc<SecurityEventLog>`](SecurityEventLog) handle `security_log_persisted` restored persisted
+/// history into - `Some` exactly when `storage` was declared and present (the same condition that
+/// registers `security_log_persisted` at all), `None` otherwise. It exists so
+/// [`register_optional_hardware`]'s `log_uploads` can share it instead of being handed a fresh,
+/// empty log: before this, `log_uploads` had no way to reach the restored handle at all (it lives
+/// entirely inside this function's own stack frame), so an uploaded security log silently omitted
+/// everything from before the last restart. Every caller of this function should thread its
+/// `security_log` straight into [`register_optional_hardware`], whether or not it ends up calling
+/// that function's `diagnostics`-gated branch.
+///
 /// # Persistence (H5b) and display (H6b)
 ///
 /// `setup()` has no `Storage`/`Display` parameter at all - it cannot persist anything or drive a
@@ -178,7 +191,7 @@ pub(crate) async fn register_setup_blocks<T, E, C, N, X, B, M, K, S, D>(
     storage: Option<&S>,
     display: Option<D>,
     has_csms: bool,
-) -> ChargePointBuilder<T, X>
+) -> (ChargePointBuilder<T, X>, Option<Arc<SecurityEventLog>>)
 where
     T: ChargePoint<E, C>,
     E: Evse<C>,
@@ -335,14 +348,19 @@ where
             builder.security_events(csms).await
         };
     }
+    // Captured before the move into `security_log_persisted` (decision 8) so this function can
+    // hand the same restored handle back to its caller - see the doc comment above.
+    let mut security_log = None;
     if let Some(storage) = storage {
+        let log = Arc::new(SecurityEventLog::new());
         builder = builder
             .security_log_persisted(
-                Arc::new(SecurityEventLog::new()),
+                Arc::clone(&log),
                 SecurityLogStore::new(storage.clone()),
                 clock.clone(),
             )
             .await;
+        security_log = Some(log);
     }
 
     builder = builder
@@ -440,7 +458,7 @@ where
         builder = builder.display_messages(csms, display).await;
     }
 
-    builder
+    (builder, security_log)
 }
 
 /// What every `Result`-returning method on [`NullCsms`] returns: there is no CSMS to answer, so
@@ -460,15 +478,18 @@ impl core::fmt::Display for NoCsms {
 
 impl std::error::Error for NoCsms {}
 
-/// The CSMS [`start_local_charger`](super::running_charger::start_local_charger) registers
-/// [`register_setup_blocks`] against - `docs/hardware-roadmap.md`'s H3c, done together with the
-/// local-authorizer fix in "Known gaps" because both are "local mode is under-wired".
+/// The CSMS [`start_local_charger`](super::running_charger::start_local_charger) registers both
+/// [`register_setup_blocks`] and [`register_optional_hardware`] against -
+/// `docs/hardware-roadmap.md`'s H3c (functional blocks) and H3d (optional hardware), done as one
+/// type because both are "local mode is under-wired" against the same shape of fix.
 ///
-/// Implements the same ~47-trait bound `register_setup_blocks`'s `N` requires - the whole reason
-/// local mode can route through that function at all rather than a second hand-built chain like
-/// `tests/smart_charging.rs` used to need (H8's gap). Modeled on this module's own test-only
-/// `RecordingCsms` (same trait list, same shape) but answering every question differently, on
-/// purpose:
+/// Implements the ~47-trait bound `register_setup_blocks`'s `N` requires, plus the six more
+/// [`register_optional_hardware`] adds (`UpdateFirmwareHandler`, `SignedUpdateFirmwareHandler`,
+/// `FirmwareStatusNotifier`, `GetLogHandler`, `LogStatusNotifier`, `CertificateHandler`) - the
+/// whole reason local mode can route through both functions at all rather than a second
+/// hand-built chain like `tests/smart_charging.rs` used to need (H8's gap). Modeled on this
+/// module's own test-only `RecordingCsms` (same trait list, same shape) but answering every
+/// question differently, on purpose:
 ///
 /// - **Every `register_*_handler` method is a harmless no-op.** These only ever wire a callback
 ///   for a CSMS-initiated wire message (`UnlockConnector`, `Reset`, `SendLocalList`, ...) to this
@@ -942,6 +963,75 @@ impl ClearDisplayMessageHandler for NullCsms {
     }
 }
 
+// --- `register_optional_hardware`'s six-trait bound (H3d) -------------------------------------
+//
+// Firmware/log-upload registration is itself has_csms-gated in `register_optional_hardware` (see
+// its own doc comment), so none of these are ever actually *called* against `NullCsms` today -
+// `certificates` is the one exception, and `register_certificate_handlers` below is a plain
+// no-op like every other `register_*_handler` above. They exist so `NullCsms` satisfies the trait
+// bound at all, the same reason the ~47 above do.
+
+#[async_trait::async_trait]
+impl UpdateFirmwareHandler for NullCsms {
+    async fn register_update_firmware_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+        _updates: ocpp_charge_point::firmware::FirmwareUpdateQueue,
+        _state: Arc<ocpp_charge_point::firmware::FirmwareUpdateState>,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SignedUpdateFirmwareHandler for NullCsms {}
+
+#[async_trait::async_trait]
+impl FirmwareStatusNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_firmware_status(
+        &self,
+        _request_id: Option<i64>,
+        _status: ocpp_charge_point::firmware::FirmwareStatus,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl GetLogHandler for NullCsms {
+    async fn register_get_log_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+        _uploads: ocpp_charge_point::diagnostics::LogUploadQueue,
+        _state: Arc<ocpp_charge_point::diagnostics::LogUploadState>,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl LogStatusNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_log_status(
+        &self,
+        _request_id: Option<i64>,
+        _status: ocpp_charge_point::diagnostics::LogUploadStatus,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl CertificateHandler for NullCsms {
+    async fn register_certificate_handlers<S>(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+        _store: S,
+    ) where
+        S: ocpp_charge_point::hardware::CertificateStore + Send + Sync + 'static,
+    {
+    }
+}
+
 #[async_trait::async_trait]
 impl ReconnectHandler for NullCsms {
     async fn register_reconnect_handler<F, FF>(&self, _callback: F)
@@ -1078,13 +1168,18 @@ async fn connect_ocpp_2_1(
     // Cloned before `charge_point` is moved into `ChargePointBuilder::start` below - that call
     // wraps it in an `Arc` this function can never reach again (see `RunningCharger`'s doc
     // comment), so the only way to keep a handle for ticking the meter later is to have taken one
-    // first.
+    // first. `firmware_installer`/`file_transfer` get the same treatment, for the same reason:
+    // `register_optional_hardware` consumes its own copies, and `RunningCharger::tick` needs a
+    // live handle to drive them once this function's own locals are gone - see `RunningCharger`'s
+    // own doc comment for what it now advances.
     let hardware = charge_point.clone();
+    let firmware_installer_handle = firmware_installer.clone();
+    let file_transfer_handle = file_transfer.clone();
     let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
         .await
         .map_err(ConnectAndSetupError::Start)?;
 
-    let mut builder = register_setup_blocks(
+    let (mut builder, security_log) = register_setup_blocks(
         builder,
         &client,
         TokioBackoff,
@@ -1113,6 +1208,7 @@ async fn connect_ocpp_2_1(
         firmware_verifier,
         file_transfer,
         certificate_store,
+        security_log, // decision 8: share whatever `register_setup_blocks` restored, if anything.
         true, // has_csms: a real CSMS is dialed on this path - see the function's own doc comment.
     )
     .await;
@@ -1122,6 +1218,8 @@ async fn connect_ocpp_2_1(
     Ok(RunningCharger::new(
         builder.offline_queue_retries(TokioBackoff, 60).build(),
         hardware,
+        firmware_installer_handle,
+        file_transfer_handle,
     ))
 }
 
@@ -1133,41 +1231,34 @@ async fn connect_ocpp_2_1(
 /// supplying the object it needs - the same "declared but not backed logs a warning and registers
 /// nothing" contract [`register_setup_blocks`] uses for storage/display.
 ///
-/// # Why this is not part of `register_setup_blocks`
+/// # Why this is not folded into `register_setup_blocks`
 ///
-/// `register_setup_blocks` is called from two places: [`connect_ocpp_2_1`] (a real CSMS is always
-/// dialed) and [`super::running_charger::start_local_charger`] (no CSMS, no hardware bundle at
-/// all - `start_local_charger` takes only a `&ChargerConfig`, so `register_setup_blocks`'s own
-/// `storage`/`display` arguments are hardcoded `None` on that call site today). Adding parameters
-/// to `register_setup_blocks` for the hardware this function registers would require updating both
-/// call sites, including the one inside `charger/running_charger.rs` - a file this task does not
-/// own (see `docs/hardware-roadmap.md`'s H10b/H12b task notes). Keeping this as a second,
-/// independent function - generic over the CSMS type exactly like `register_setup_blocks` is, so
-/// `RecordingCsms` can drive it in tests without a live CSMS - means `register_setup_blocks`'s
-/// signature (and therefore `start_local_charger`) never has to change; [`connect_ocpp_2_1`] simply
-/// calls both.
-///
-/// One real consequence: a local (unconnected) charger cannot get firmware/file-transfer/
-/// certificate hardware through this change, exactly as it already cannot get persistent storage
-/// or a display today (`start_local_charger` passes `None`/`None` for those, unconditionally). This
-/// is not a new gap this function introduces, just the existing one extended to three more kinds
-/// of hardware - wiring a `ChargerHardware` into local mode at all is its own, `running_charger.rs`
-/// -owning task.
+/// As of `docs/hardware-roadmap.md`'s H3d, both [`connect_ocpp_2_1`] and
+/// [`super::running_charger::start_local_charger`] call this function too - the gap that used to
+/// keep it separate (`start_local_charger` had no `ChargerHardware` to pass through) is closed. It
+/// stays a second function anyway: its `N` bound (six traits: `UpdateFirmwareHandler`,
+/// `SignedUpdateFirmwareHandler`, `FirmwareStatusNotifier`, `GetLogHandler`, `LogStatusNotifier`,
+/// `CertificateHandler`) is disjoint from `register_setup_blocks`'s own ~47, and firmware/file
+/// transfer/certificates are optional in a way the always-registered functional blocks aren't -
+/// splitting them keeps each function's trait bound legible and lets
+/// [`RecordingCsms`] drive either independently in tests. Both callers now run the *same*
+/// registration sequence either way: `register_setup_blocks` then `register_optional_hardware`,
+/// `has_csms` the only thing that differs between them.
 ///
 /// # `has_csms`
 ///
-/// Only ever called with `true` today (`connect_ocpp_2_1`'s one call site), but the parameter
-/// exists - matching `register_setup_blocks`'s own convention - so the reasoning below is
-/// executable and testable now, ready to gate a future call from local mode once it gains a
-/// `ChargerHardware` of its own:
+/// `true` for [`connect_ocpp_2_1`], `false` for
+/// [`super::running_charger::start_local_charger`] - the same split `register_setup_blocks` makes,
+/// for the same reason:
 ///
 /// - **`firmware_updates` (has_csms-gated):** a firmware *campaign* - `UpdateFirmware`/
 ///   `SignedUpdateFirmware` inbound, `FirmwareStatusNotification` outbound - is a CSMS round trip
 ///   from end to end. With no CSMS, nothing could ever send the request that starts one, and
 ///   `FirmwareStatusNotifier::notify_firmware_status` would have nobody to report to. Installing
 ///   firmware is itself local hardware behavior (see [`FakeFirmwareInstaller`]'s own docs, and the
-///   roadmap task notes) - which is why the fakes remain fully constructible and tickable in tests
-///   regardless of `has_csms` - but the OCPP-level campaign this method registers is not.
+///   roadmap task notes) - which is why the fakes remain fully constructible and tickable
+///   (`RunningCharger::tick` reaches them - see its own doc comment) regardless of `has_csms` - but
+///   the OCPP-level campaign this method registers is not.
 /// - **`log_uploads` (has_csms-gated):** a log upload needs somewhere to upload to - the URL is
 ///   supplied by the CSMS's own `GetLog`/`GetDiagnostics` request. With no CSMS, no such request
 ///   can arrive, so registering it would spawn a background task that awaits an empty queue
@@ -1179,7 +1270,18 @@ async fn connect_ocpp_2_1(
 ///   `register_certificate_handlers` call with no spawned loop - the same "cheap enough to keep
 ///   the functional-block shape complete even though nothing ever dials in to trigger it locally"
 ///   reasoning `register_setup_blocks` gives `clear_cache`/`remote_control`/... . Registering it
-///   costs nothing regardless of whether a CSMS exists to ever call it.
+///   costs nothing regardless of whether a CSMS exists to ever call it - so it is the one block
+///   `start_local_charger` actually registers through this function today.
+///
+/// # `security_log` (`docs/hardware-roadmap.md` decision 8)
+///
+/// The same [`Arc<SecurityEventLog>`](SecurityEventLog) [`register_setup_blocks`] returns - `Some`
+/// when persistent storage backed it (restored from whatever survived the last restart), `None`
+/// otherwise. `log_uploads` uses it directly when present, so an uploaded security log includes
+/// history from before a restart rather than only what happened on this boot; when `None` (no
+/// persistent storage declared), it falls back to a fresh, empty, in-RAM-only log - the same
+/// behavior this function had before decision 8, and the correct one: there is no restored history
+/// to share when nothing was ever persisted.
 ///
 /// # Not registered here (and why)
 ///
@@ -1209,6 +1311,7 @@ pub(crate) async fn register_optional_hardware<T, X, N, B, K>(
     firmware_verifier: Option<Arc<FakeFirmwareVerifier>>,
     file_transfer: Option<Arc<FakeFileTransfer>>,
     certificate_store: Option<FileCertificateStore>,
+    security_log: Option<Arc<SecurityEventLog>>,
     has_csms: bool,
 ) -> ChargePointBuilder<T, X>
 where
@@ -1271,20 +1374,16 @@ where
 
     if has_csms && capabilities.diagnostics {
         if let Some(transfer) = &file_transfer {
-            // A fresh, empty log - not the same handle `register_setup_blocks`'s
-            // `security_log_persisted` restores into (that Arc is created and consumed entirely
-            // inside that function, which this one does not have access to without changing
-            // `register_setup_blocks`'s signature - see this function's own doc comment on why
-            // that is out of scope). A `GetLog` for the security log therefore reports only what
-            // happens on this connection, not history that survived an earlier restart, until that
-            // plumbing is unified.
+            // Decision 8: share the restored handle when there is one, so an uploaded log
+            // includes history from before a restart - see this function's own doc comment on
+            // `security_log`. Falls back to a fresh, empty, in-RAM-only log exactly when
+            // `register_setup_blocks` returned `None` (no persistent storage declared), matching
+            // this function's own behavior before decision 8 for that case.
+            let log = security_log
+                .clone()
+                .unwrap_or_else(|| Arc::new(SecurityEventLog::new()));
             builder = builder
-                .log_uploads(
-                    csms,
-                    Arc::clone(transfer),
-                    Arc::new(SecurityEventLog::new()),
-                    backoff.clone(),
-                )
+                .log_uploads(csms, Arc::clone(transfer), log, backoff.clone())
                 .await;
         } else {
             tracing::warn!(
@@ -1313,16 +1412,21 @@ mod tests {
     use super::*;
     use crate::charger::config::{CapabilitiesConfig, OcppVersion as SimOcppVersion};
     use ocpp_charge_point::actor::ChargePointActor;
-    use ocpp_charge_point::diagnostics::{LogUploadQueue, LogUploadState, LogUploadStatus};
+    use ocpp_charge_point::diagnostics::{
+        GetLogOutcome, LogUploadQueue, LogUploadRequest, LogUploadState, LogUploadStatus,
+        handle_get_log, render_security_log,
+    };
     use ocpp_charge_point::firmware::{
         FirmwareStatus, FirmwareUpdateQueue, FirmwareUpdateRequest, FirmwareUpdateState,
         handle_update_firmware,
     };
+    use ocpp_charge_point::hardware::LogKind;
+    use ocpp_charge_point::persistence::restore_security_log;
     use ocpp_charge_point::provisioning::BootNotificationOutcome;
     use ocpp_charge_point::state::{
-        AuthorizationStatus, BootReasonCause, ConnectorState, ConnectorStatus, IdToken,
-        MeterSample, RegistrationStatus, ReservationUpdate, SecurityEventType, Transaction,
-        TransactionEventKind, TriggeredMonitor,
+        AuthorizationStatus, BootReasonCause, ChargePointEvent, ConnectorState, ConnectorStatus,
+        IdToken, MeterSample, RegistrationStatus, ReservationUpdate, SecurityEvent,
+        SecurityEventType, Transaction, TransactionEventKind, TriggeredMonitor,
     };
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1426,6 +1530,12 @@ mod tests {
         Arc<FirmwareUpdateState>,
     );
 
+    /// What `register_get_log_handler` captures - the diagnostics counterpart of
+    /// `FirmwareUpdateHandle`, for the same reason: it lets a test feed a synthetic `GetLog`
+    /// through the crate's own public `handle_get_log` into the *registered* `run_log_uploads`
+    /// worker `log_uploads` spawned, rather than a hand-built substitute for it.
+    type LogUploadHandle = (ChargePointActor, LogUploadQueue, Arc<LogUploadState>);
+
     #[derive(Clone, Default)]
     struct RecordingCsms {
         calls: Arc<Mutex<Vec<String>>>,
@@ -1437,6 +1547,10 @@ mod tests {
         // that `run_firmware_updates` is already awaiting, driving the *registered* path rather
         // than a hand-built substitute for it.
         firmware_update_handle: Arc<Mutex<Option<FirmwareUpdateHandle>>>,
+        // H3d/decision 8: the same capture, for `register_get_log_handler` - lets a test drive a
+        // `GetLog` through `log_uploads`'s registered worker to prove which `SecurityEventLog`
+        // handle it actually uploads from.
+        log_upload_handle: Arc<Mutex<Option<LogUploadHandle>>>,
     }
 
     impl RecordingCsms {
@@ -1473,6 +1587,12 @@ mod tests {
                 .lock()
                 .expect("lock poisoned")
                 .take()
+        }
+
+        /// Takes the handle `register_get_log_handler` captured, if any - `None` if `log_uploads`
+        /// was never registered against this CSMS. See the field's own doc comment.
+        fn take_log_upload_handle(&self) -> Option<LogUploadHandle> {
+            self.log_upload_handle.lock().expect("lock poisoned").take()
         }
     }
 
@@ -1531,11 +1651,12 @@ mod tests {
     impl GetLogHandler for RecordingCsms {
         async fn register_get_log_handler(
             &self,
-            _actor: ChargePointActor,
-            _uploads: LogUploadQueue,
-            _state: Arc<LogUploadState>,
+            actor: ChargePointActor,
+            uploads: LogUploadQueue,
+            state: Arc<LogUploadState>,
         ) {
             self.record("get_log");
+            *self.log_upload_handle.lock().expect("lock poisoned") = Some((actor, uploads, state));
         }
     }
 
@@ -2054,7 +2175,7 @@ mod tests {
         // produce exactly the same session as if `storage`/`display` were `None`, proving hardware
         // presence alone never registers anything the charger didn't declare (H5b/H6b's gating
         // requirement).
-        let our_builder = register_setup_blocks(
+        let (our_builder, _security_log) = register_setup_blocks(
             our_builder,
             &RecordingCsms::new(),
             TokioBackoff,
@@ -2098,7 +2219,7 @@ mod tests {
             ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
                 .await
                 .expect("starting the fake hardware never fails");
-        let builder = register_setup_blocks(
+        let (builder, _security_log) = register_setup_blocks(
             builder,
             &csms,
             TokioBackoff,
@@ -2221,7 +2342,7 @@ mod tests {
             ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
                 .await
                 .expect("starting the fake hardware never fails");
-        let builder = register_setup_blocks(
+        let (builder, security_log) = register_setup_blocks(
             builder,
             &RecordingCsms::new(),
             TokioBackoff,
@@ -2233,6 +2354,12 @@ mod tests {
         )
         .await;
         let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        assert!(
+            security_log.is_some(),
+            "expected a restored security log handle back (decision 8) when has_persistent_storage \
+             is true"
+        );
 
         for key in [
             "boot-reason",
@@ -2282,7 +2409,7 @@ mod tests {
             ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
                 .await
                 .expect("starting the fake hardware never fails");
-        let builder = register_setup_blocks(
+        let (builder, _security_log) = register_setup_blocks(
             builder,
             &csms,
             TokioBackoff,
@@ -2332,7 +2459,7 @@ mod tests {
             ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
                 .await
                 .expect("starting the fake hardware never fails");
-        let builder = register_setup_blocks(
+        let (builder, _security_log) = register_setup_blocks(
             builder,
             &csms,
             TokioBackoff,
@@ -2424,6 +2551,7 @@ mod tests {
             Some(verifier),
             Some(transfer),
             Some(store),
+            None, // security_log: not exercised by this test.
             true, // has_csms: proving hardware presence alone never registers anything undeclared.
         )
         .await;
@@ -2461,6 +2589,7 @@ mod tests {
             None, // no verifier - `NoFirmwareVerifier` should stand in.
             Some(transfer),
             None,
+            None, // security_log: not exercised by this test.
             true,
         )
         .await;
@@ -2499,6 +2628,7 @@ mod tests {
             None,
             None,
             None,
+            None, // security_log: not exercised by this test.
             true,
         )
         .await;
@@ -2533,6 +2663,7 @@ mod tests {
             None,
             Some(transfer),
             None,
+            None, // security_log: not exercised by this test - falls back to a fresh log.
             true,
         )
         .await;
@@ -2571,6 +2702,7 @@ mod tests {
             None,
             None,
             None,
+            None, // security_log: not exercised by this test.
             true,
         )
         .await;
@@ -2605,6 +2737,7 @@ mod tests {
             None,
             None,
             Some(store),
+            None, // security_log: not exercised by this test.
             true,
         )
         .await;
@@ -2656,6 +2789,7 @@ mod tests {
             None,
             Some(transfer),
             Some(store),
+            None,  // security_log: not exercised by this test.
             false, // has_csms: no CSMS is dialed.
         )
         .await;
@@ -2704,6 +2838,7 @@ mod tests {
             None,
             Some(transfer),
             None,
+            None, // security_log: not exercised by this test.
             true,
         )
         .await;
@@ -2773,6 +2908,328 @@ mod tests {
         assert!(
             csms.called(firmware_status_name(FirmwareStatus::Installed)),
             "expected a FirmwareStatusNotification reporting Installed"
+        );
+    }
+
+    // --- H3d: `RunningCharger::tick` drives the whole bundle -----------------------------------
+
+    /// The reason H3d's ticker unification exists: before it, `RunningCharger::tick` advanced
+    /// only `FakeChargePoint`, so a registered firmware install never progressed unless the
+    /// caller kept its own `Arc` clone of the installer and ticked it directly - which is what
+    /// the test above does, and what H10b's own test had to do for lack of anywhere else to tick
+    /// from. This proves the fix: once `RunningCharger` is holding the installer/file-transfer
+    /// handles (the same ones `connect_ocpp_2_1`/`start_local_charger` now capture before handing
+    /// their owned copies to `register_optional_hardware`), `running_charger.tick(..)` alone
+    /// carries a CSMS-driven install all the way to completion. Nothing here ticks `installer`
+    /// directly - it is moved into `RunningCharger::new` below and never touched again; every
+    /// observation is made through `RecordingCsms`'s call log instead.
+    #[tokio::test]
+    async fn a_registered_firmware_install_progresses_to_completion_through_running_charger_tick_alone()
+     {
+        let config = optional_hardware_config(CapabilitiesConfig {
+            firmware_management: true,
+            ..Default::default()
+        });
+        let csms = RecordingCsms::new();
+        let installer = Arc::new(FakeFirmwareInstaller::new(Duration::from_secs(90)));
+        let transfer = instant_file_transfer();
+
+        let charge_point = FakeChargePoint::from_config(&config);
+        let handle = charge_point.clone();
+        let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            Some(Arc::clone(&installer)),
+            None,
+            Some(Arc::clone(&transfer)),
+            None,
+            None,
+            true, // has_csms: this is the connected path's shape - firmware_updates is has_csms-gated.
+        )
+        .await;
+        let runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        // `installer`/`transfer` are moved in here - the same "clone before handing ownership
+        // away" shape `connect_ocpp_2_1`/`start_local_charger` use, so this test's own locals go
+        // out of scope with nothing left to tick by hand.
+        let running_charger = RunningCharger::new(runtime, handle, Some(installer), Some(transfer));
+
+        let (actor, updates, state) = csms
+            .take_firmware_update_handle()
+            .expect("register_update_firmware_handler must have captured a handle");
+        let outcome = handle_update_firmware(
+            &actor,
+            &updates,
+            &state,
+            FirmwareUpdateRequest {
+                request_id: Some(1),
+                location: "https://example.invalid/firmware.bin".into(),
+                retrieve_at: None,
+                install_at: None,
+                signature: None,
+                signing_certificate: None,
+                retries: 0,
+                retry_interval_secs: 30,
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ocpp_charge_point::firmware::UpdateFirmwareOutcome::Accepted
+        );
+
+        // Ticks the *whole* charger repeatedly until the CSMS is told `Installed` - a tick issued
+        // before the worker has reached `install()` is a documented no-op (see
+        // `FakeFirmwareInstaller::tick`'s own doc comment), so this simply keeps advancing
+        // simulated time until one lands after that point, rather than assuming an exact ordering
+        // between the worker's own scheduling and this loop's ticks.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !csms.called(firmware_status_name(FirmwareStatus::Installed)) {
+                running_charger.tick(Duration::from_secs(90)).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the firmware install never completed through RunningCharger::tick alone");
+
+        assert!(
+            csms.called(firmware_status_name(FirmwareStatus::Installing)),
+            "expected a FirmwareStatusNotification reporting Installing"
+        );
+    }
+
+    // --- H3d: local mode's registration sequence -----------------------------------------------
+
+    /// `start_local_charger` used to hardcode `None`/`None` for storage/display regardless of
+    /// what `ChargerHardware` it was given, and never called `register_optional_hardware` at all -
+    /// the same "local mode is under-wired" gap H3c had already fixed one layer up, for functional
+    /// blocks. This proves the mechanism `start_local_charger` now goes through -
+    /// `register_setup_blocks` with `has_csms: false` - still registers persistence and display
+    /// when real hardware is present: `has_csms` alone never gates either off, so a local charger
+    /// given a real bundle gets them, not a silent `None`.
+    #[tokio::test]
+    async fn has_csms_false_still_registers_persistence_and_display_when_real_hardware_is_present()
+    {
+        let config = ChargerConfig {
+            id: "local-hardware-test".into(),
+            ocpp_version: SimOcppVersion::V21,
+            evses: vec![],
+            has_display: true,
+            capabilities: CapabilitiesConfig {
+                has_persistent_storage: true,
+                ..Default::default()
+            },
+        };
+        let csms = RecordingCsms::new();
+        let storage = RecordingStorage::new();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let (builder, security_log) = register_setup_blocks(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemMonotonicClock,
+            SystemClock,
+            Some(&storage),
+            Some(FakeDisplay::new()),
+            false, // has_csms: exactly what start_local_charger now calls with real hardware.
+        )
+        .await;
+        let _runtime = builder.build();
+
+        assert!(
+            storage.was_queried("security-log"),
+            "expected persistence to register with real storage even though has_csms is false"
+        );
+        assert!(
+            security_log.is_some(),
+            "expected a restored security log handle back even in local mode"
+        );
+        for block in [
+            "set_display_message",
+            "get_display_messages",
+            "clear_display_message",
+        ] {
+            assert!(
+                csms.called(block),
+                "expected `{block}` to register with a real display even though has_csms is false"
+            );
+        }
+    }
+
+    // --- decision 8: `log_uploads` shares the restored `SecurityEventLog` ----------------------
+
+    /// Before decision 8, `register_optional_hardware`'s `log_uploads` call was handed a fresh,
+    /// empty `Arc<SecurityEventLog>` rather than the one `register_setup_blocks`'s
+    /// `security_log_persisted` restores into - so an uploaded security log silently omitted
+    /// everything from before a restart, which rather defeats uploading it. This proves the fix
+    /// end to end: an event recorded before a simulated restart survives into the log a *second*
+    /// boot restores, and a `GetLog` driven through that second boot's *registered* `log_uploads`
+    /// worker uploads bytes that include it.
+    #[tokio::test]
+    async fn an_uploaded_security_log_includes_entries_recorded_before_a_simulated_restart() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let config = ChargerConfig {
+            id: "security-log-restart-test".into(),
+            ocpp_version: SimOcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+            capabilities: CapabilitiesConfig {
+                has_persistent_storage: true,
+                diagnostics: true,
+                ..Default::default()
+            },
+        };
+
+        // --- before the restart: boot once, record a security event, and let it persist.
+        let storage = FileStorage::new(dir.path());
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let (builder, security_log) = register_setup_blocks(
+            builder,
+            &RecordingCsms::new(),
+            TokioBackoff,
+            SystemMonotonicClock,
+            SystemClock,
+            Some(&storage),
+            None::<FakeDisplay>,
+            false, // has_csms: irrelevant to security_log_persisted, which isn't has_csms-gated.
+        )
+        .await;
+        let security_log = security_log.expect("has_persistent_storage should back a security log");
+        let runtime = builder.build();
+
+        runtime
+            .send(ChargePointEvent::SecurityEventOccurred(SecurityEvent {
+                event_type: SecurityEventType::TamperDetectionActivated,
+                tech_info: Some("door switch tripped".into()),
+            }))
+            .await
+            .expect("sending to a freshly-built runtime never fails");
+
+        // Waits for the event to actually reach *disk*, not merely `security_log`'s in-memory
+        // copy: `run_security_log_persistence` records into the log synchronously but persists to
+        // `storage` through a `spawn_blocking` write that can still be in flight when
+        // `security_log.len()` already reads 2 - polling storage directly is what this test is
+        // actually about (decision 8 is about what survives a restart).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let scratch = SecurityEventLog::new();
+                let recovered =
+                    restore_security_log(&scratch, &SecurityLogStore::new(storage.clone())).await;
+                if recovered >= 2 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the security event was never persisted to disk");
+        assert!(
+            security_log.len() >= 2,
+            "expected the in-memory log to have the event too, not just storage"
+        );
+        drop(runtime);
+
+        // --- the restart: a fresh boot over the same on-disk storage restores the log.
+        let builder2 =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let csms = RecordingCsms::new();
+        let (builder2, security_log2) = register_setup_blocks(
+            builder2,
+            &csms,
+            TokioBackoff,
+            SystemMonotonicClock,
+            SystemClock,
+            Some(&storage),
+            None::<FakeDisplay>,
+            false,
+        )
+        .await;
+        let security_log2 = security_log2
+            .expect("has_persistent_storage should back a security log after a restart");
+        assert!(
+            security_log2
+                .entries()
+                .iter()
+                .any(|entry| entry.event.tech_info.as_deref() == Some("door switch tripped")),
+            "expected the restored log to include the pre-restart event"
+        );
+
+        // --- the fix under test: `log_uploads` must receive *this* restored handle.
+        let transfer = instant_file_transfer();
+        let builder2 = register_optional_hardware(
+            builder2,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            None,
+            None,
+            Some(Arc::clone(&transfer)),
+            None,
+            Some(Arc::clone(&security_log2)),
+            true, // has_csms: log_uploads is has_csms-gated.
+        )
+        .await;
+        let _runtime2 = builder2.offline_queue_retries(TokioBackoff, 60).build();
+
+        let (actor, uploads, state) = csms
+            .take_log_upload_handle()
+            .expect("register_get_log_handler must have captured a handle");
+
+        let outcome = handle_get_log(
+            &actor,
+            &uploads,
+            &state,
+            &SystemClock,
+            LogUploadRequest {
+                request_id: Some(1),
+                log_kind: LogKind::Security,
+                remote_location: "https://example.invalid/security.log".into(),
+                oldest: None,
+                latest: None,
+                retries: 0,
+                retry_interval_secs: 30,
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, GetLogOutcome::Accepted { .. }),
+            "expected the GetLog request to be accepted, got {outcome:?}"
+        );
+
+        let uploaded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(bytes) = transfer.last_upload() {
+                    return bytes;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the log upload never ran");
+
+        assert_eq!(
+            uploaded,
+            render_security_log(&security_log2.entries()),
+            "expected the uploaded log to render the same entries the restored handle holds"
+        );
+        assert!(
+            String::from_utf8_lossy(&uploaded).contains("door switch tripped"),
+            "expected the uploaded log to include the event recorded before the simulated \
+             restart, not just what happened since - see docs/hardware-roadmap.md decision 8"
         );
     }
 }
