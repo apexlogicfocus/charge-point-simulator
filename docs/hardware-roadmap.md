@@ -72,6 +72,25 @@ The guiding principles, which every task should be checked against:
   "clear the screen", not "no change". `supported_formats` deliberately omits `Html`/`Uri`/`QrCode`
   so the handler's `NotSupportedMessageFormat` path stays exercisable.
 
+- **H5b + H6b** — done as one task, since both are registrations into the same two files and
+  splitting them would only have manufactured a conflict. `ChargerHardware` grew
+  `Option<FileStorage>`/`Option<FakeDisplay>` (so `::default()` still means "neither"), the TUI
+  passes a real bundle rooted at a per-charger state directory, and registration is gated on the
+  capabilities H4 made declarable.
+
+  The subtlety worth remembering: `status_notifications`, `transaction_events` and `security_events`
+  each come in a plain and a `_persisted` form, and `register_setup_blocks` already registered the
+  plain one unconditionally. They share a single-use broadcast subscription, so registering both
+  isn't a loud failure — the second call silently no-ops. The resolution is either/or: plain when
+  there's no storage (preserving equivalence with upstream `setup()`, which has no `Storage`
+  parameter and so always uses the plain form), `_persisted` exactly when `has_persistent_storage`
+  is declared. `security_log_persisted` is genuinely independent and registers alongside.
+
+  One reasoned call that the source did not settle: `reservation_persistence`,
+  `local_authorization_list_persistence` and `charging_profile_persistence` fire only when *both*
+  `has_persistent_storage` and their own capability are declared, on the grounds that restoring
+  state nothing will ever read is pointless.
+
 ## Where we are
 
 The baseline, after moving from the `ocpp-charge-point` git dependency to the published 0.1.0:
@@ -308,9 +327,17 @@ simulated time (decision 2 again — no `sleep`), so a CSMS firmware campaign an
 both be driven to completion, and to failure. Register via `firmware_updates`, `log_uploads`,
 `publish_firmware`.
 
-### H11 — `Watchdog`
+### H11 — `Watchdog` — **blocked upstream, do not schedule**
 
-**Depends on:** H2. Trivial; slot it into any wave that has capacity.
+Not implementable from a downstream crate, for the same reason the keepalive loop isn't. There is no
+`ChargePointBuilder::watchdog` method, `ChargePointRuntime::new` takes no watchdog, and the only
+public entry point — `ChargePointActor::spawn_with_watchdog` — returns an actor that cannot be handed
+to a runtime or a builder, since `ChargePointRuntime::actor()` is `pub(crate)`. A custom `Watchdog`
+therefore cannot take part in a real session; every session gets upstream's `NoWatchdog`.
+
+Fold this into the same upstream conversation as the keepalive gap under "Known gaps" — both are
+symptoms of the actor being private, and one upstream change (a public `actor()`, or builder methods
+that accept these) would unblock both.
 
 ### H12 — Certificates and key storage
 
@@ -350,7 +377,7 @@ something only the current branch has is the cheap guard.
 | --- | --- | --- |
 | 0 | ~~**H1**, **H2**~~ | Done. Different files, so both at once. H1 was hours; H2 was the long pole, as expected. |
 | 1 | ~~**H3**, **H4**, **H5a**, **H6a**~~ | Done, four-way parallel. H5a and H6a were the cheapest to hand off, exactly as predicted — pure trait impls, no dependency on H2. |
-| 2 | **H3b**, **H5b**, **H6b**, **H7**, **H11** | H3b is the big one and owns `state.rs`; H7 also wants `state.rs`, so sequence those two or let H3b absorb H7. H5b/H6b are registrations H2 made possible. |
+| 2 | ~~**H5b+H6b**~~, **H3b**, **H7** | H5b+H6b done as one task. H3b then H7, sequenced — both own `state.rs`, and H3b is large enough without absorbing it. H11 turned out to be blocked upstream; see its section. |
 | 3 | **H8**, **H9**, **H10**, **H12** | The widest wave: four independent functional blocks. H8 and H9 share `hardware_bundle.rs`, so sequence those two or split the file by block first. |
 | 4 | **H13**, **H14** | H13 needs H12; H14 needs only H3, so H14 can be pulled into wave 3 if someone is free. |
 
@@ -391,7 +418,11 @@ more satisfying task.
   exposed nowhere on `ChargePointBuilder`. So this is the one thing the builder path genuinely
   cannot match, and the price paid for being able to register optional hardware at all. Fixing it
   means an upstream change: either make `actor()` public or add a builder method that spawns the
-  loop. Worth raising against `ocpp-charge-point` before H5b makes the builder path permanent.
+  loop. H5b has since made the builder path permanent, so this is now a live gap rather than a
+  theoretical one.
+- **A custom `Watchdog` cannot be installed at all** — same root cause as the keepalive gap, see H11.
+  One upstream change (a public `actor()`, or builder methods accepting these) would unblock both,
+  which is the shape the request to `ocpp-charge-point` should take.
 - **`FileStorage` doesn't bound encoded key length.** Hex doubles it, so a key over ~127 bytes would
   exceed the 255-byte filename limit and surface as an opaque `ENAMETOOLONG`. Latent, not live:
   every key upstream currently uses is a short constant (`ocpp-cp/auth-cache`, `ocpp-cp/txn`, …) or
