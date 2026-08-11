@@ -85,5 +85,12 @@ One thing worth knowing before touching the dashboard:
 A local (unconnected) charger runs a real `ocpp_charge_point::ChargePointRuntime` too (see
 `charger::RunningCharger`/`start_local_charger`), just with no CSMS ever dialed and no
 `register`/`register_until_accepted` call — `apply_ocpp_state` is the single path into
-`ChargerState` for both a local and a live-CSMS charger, and reports a local charger's
-`connection_status` as `Offline` rather than the `Booting` it used to get stuck on forever.
+`ChargerState` for both a local and a live-CSMS charger.
+
+A local charger now reports `connection_status: Offline` permanently. It previously spent
+~1.5 simulated seconds `Booting` and was then promoted to `Connected` by `ChargerState::tick`
+(`SIMULATED_BOOT_DURATION`); H3b removed that lifecycle along with the rest of `tick`'s
+simulation. `Offline` is the honest reading — no CSMS was ever dialed, so `Connected` claimed a
+link that did not exist — but it is a deliberate product change, not a bug fix, and the five
+tests covering the old boot sequence went with it. An earlier version of this file claimed a
+local charger got stuck on `booting` forever; that was already out of date when it was written.

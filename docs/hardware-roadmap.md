@@ -119,6 +119,27 @@ The guiding principles, which every task should be checked against:
   `has_persistent_storage` and their own capability are declared, on the grounds that restoring
   state nothing will ever read is pointless.
 
+- **H3b** — decision 1 is now true. A local charger runs a real `ChargePointRuntime`, so
+  `apply_ocpp_state` is the only path into `ChargerState`, `EvseState::tick`'s physics are gone, and
+  `meter_sample_events`/`maybe_send_meter_values` are retired. `FakeChargePoint` became a cheap
+  `Clone` over an inner `Arc` so a handle survives being moved into the builder, bundled with the
+  runtime as `RunningCharger`.
+
+  Three things it decided that went beyond the brief, all defensible and all worth knowing:
+
+  1. **A bare `ChargePointRuntime::new` isn't enough for local mode.** With no functional blocks
+     registered, a connector presenting an identifier sits in `Authorizing` forever, so the
+     contactor never closes and the meter can never move. `start_local_charger` goes through
+     `ChargePointBuilder` and registers `authorization()` alone, against an always-accept
+     `LocalAuthorizer` — the same stance upstream's own `examples/simulated_charge_point.rs` takes.
+  2. **The simulated boot lifecycle is gone.** A local charger used to show `Booting` for ~1.5
+     simulated seconds and then `Connected`; it now reports `Offline` permanently. See `CLAUDE.md` —
+     this is a product change, not a bug fix, and the note that prompted it was stale.
+  3. **Local-mode connector *status* still comes from the coarse `Command::apply_to` path**, while
+     the meter is fully real. Routing local commands through the OCPP event pipeline is command
+     routing rather than physics, and was correctly left out of scope. Until it lands, local mode is
+     half-converged — which is worth fixing before anyone reads local-mode behavior as authoritative.
+
 ## Where we are
 
 Every charger — local or connected — runs a real `ocpp_charge_point::ChargePointRuntime` (see
