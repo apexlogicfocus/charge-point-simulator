@@ -211,6 +211,28 @@ The guiding principles, which every task should be checked against:
   Idleness was measured, not assumed: process CPU time before and after a 2s idle wait was
   identical (0.02s → 0.02s).
 
+- **H14a** — the meter discharges. `PowerDirection::{Import, Export}` is passed into
+  `SimulatedMeter::tick`, and `FakeConnector` gained `set_discharging`/`is_discharging` shaped exactly
+  like `current_limit_ma` — runtime state read fresh each tick, so direction is a property of the
+  session rather than of the wiring. The clamp is applied to the unsigned magnitude *before* the sign
+  is attached, so `Some(0)` suspends both directions identically and no limit can be bypassed by
+  discharging.
+
+  **`energy_wh` freezes while discharging rather than running backwards.** Upstream documents it as
+  OCPP's `Energy.Active.Import.Register` specifically — monotonically increasing, not a net total —
+  and `MeterSample` has no export counterpart. Exported energy accumulates separately
+  (`exported_energy_wh`), so nothing is silently discarded and a future wire-format change has real
+  numbers waiting. Getting this backwards would have quietly corrupted every energy reading.
+
+  **Verdict on decision 4: partially held, and worth knowing which part.** The type-level bet paid
+  off — `power_w`/`current_ma` were already `i64`, so no signature migration and no rework of
+  `MeterSample`. But nothing in the accumulator could *produce* a negative: current was
+  `nominal.min(limit)`, a bare magnitude with no concept of direction. There was no `max(0, ..)`
+  suppressing negatives; there was simply no code path that could reach one. So "cheap if it held"
+  meant cheap on the wire types, not free on the state machine — a signed field reserves the
+  possibility of a direction, it does not model one. Worth remembering the next time a decision is
+  justified as "costs nothing now, saves a rework later".
+
 ## Where we are
 
 Every charger — local or connected — runs a real `ocpp_charge_point::ChargePointRuntime` (see
