@@ -23,6 +23,11 @@ ocpp-client = { version = "0.5", default-features = false }
 # directly, and `charger/hardware/certificates.rs` implements that trait, so `chrono` has to be a
 # direct (non-dev) dependency even though `ocpp-charge-point` already depends on it.
 chrono = "0.4"
+# `charger/hardware/crypto.rs` implements `ocpp_charge_point::hardware::SoftwareCrypto` directly
+# against `ring`'s ECDSA primitives (`docs/hardware-roadmap.md` decision 5), so `ring` has to be a
+# direct (non-dev) dependency even though it is already present transitively via `rustls` in the
+# websocket stack.
+ring = "0.17"
 
 [dev-dependencies]
 tempfile = "3"
