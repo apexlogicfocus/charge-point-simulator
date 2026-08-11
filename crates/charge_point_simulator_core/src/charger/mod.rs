@@ -19,7 +19,8 @@ pub use connect::{connect_charger, websocket_url};
 pub use connection::{ConnectionProfile, PasswordTooLong, SecurityProfile};
 pub use connection_store::ConnectionStore;
 pub use hardware::{
-    FakeChargePoint, FakeConnector, FakeDisplay, FakeEvse, FileStorage, FileStorageError,
+    FakeChargePoint, FakeConnector, FakeDisplay, FakeEvse, FileCertificateStore, FileKeyStore,
+    FileStorage, FileStorageError,
 };
 pub use hardware_bundle::ChargerHardware;
 pub use ocpp_bridge::{apply_hardware_state, apply_ocpp_state, build_ocpp_event_for_connector};
