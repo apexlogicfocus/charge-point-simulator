@@ -24,7 +24,7 @@ The guiding principles, which every task should be checked against:
 - **H2** — `connect_charger` drives `ChargePointBuilder` itself: dial via `ocpp_client::connect`,
   match `NegotiatedClient`, register through a `register_setup_blocks` helper that is generic over
   the CSMS client exactly as `setup()` is, then add the 2.1-only extras and seal with `build()`.
-  `ChargerHardware` (in `charger/hardware_bundle.rs`) landed field-less, per decision 5.
+  `ChargerHardware` (in `charger/hardware_bundle.rs`) landed field-less, per decision 9.
 
   Three things this turned up that the plan above had wrong or didn't know:
 
@@ -247,7 +247,26 @@ These are the calls this roadmap is built on. Revisit them here rather than re-d
 4. **Power is signed from day one.** V2G is on this roadmap; discovering that export needs a sign
    after the accumulator is written is a rework nobody needs. `MeterSample`'s fields are already
    `i64`.
-5. **Optional hardware is bundled, not appended.** `connect_charger` takes a `ChargerHardware`
+5. **`ring` is the `SoftwareCrypto` backend** for H13. It is already in the tree transitively via
+   `rustls` in the websocket stack, so it adds no new supply-chain surface and no new build tooling,
+   and it is the most-audited option. Accepted cost: C/assembly internals make unusual
+   cross-compilation targets awkward, and its API is opinionated about available algorithms. Do not
+   substitute another backend without revisiting this line — it is a security decision, not a
+   dependency preference.
+6. **A local charger persists to disk by default.** A local charger is the one people leave running,
+   so surviving a restart is where `FileStorage` earns its keep, and matching the connected path's
+   default is the whole point of H3d. Writes go under the existing per-charger state directory.
+   Accepted cost: an unconnected simulator writes to disk without being asked, which should be
+   mentioned in the README rather than discovered.
+7. **A local charger reports `Offline` permanently** — no simulated boot handshake. No CSMS is ever
+   dialed, so `Connected` claimed a link that did not exist, and the header already distinguishes
+   local from live. The ~1.5s `Booting` phase H3b deleted stays deleted. See `CLAUDE.md`.
+8. **`log_uploads` shares the restored `SecurityEventLog`.** An uploaded security log that silently
+   omits everything from before a restart is worse than useless, because someone will trust it while
+   debugging. Fixing it means changing `register_setup_blocks`' return type so the restored handle is
+   reachable — contained, but it touches the function every registration flows through, so do it as
+   part of H3d rather than on its own.
+9. **Optional hardware is bundled, not appended.** `connect_charger` takes a `ChargerHardware`
    struct rather than growing a parameter per trait. One breaking change to a published signature
    instead of eight.
 
