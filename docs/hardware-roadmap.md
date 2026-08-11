@@ -455,35 +455,24 @@ Do not let the null CSMS quietly *become* a CSMS. It must not fabricate authoriz
 transaction acknowledgements, or boot responses; anything a real CSMS would answer, it should
 decline to answer, so that local mode exercises the offline paths rather than a fake-online one.
 
-### H3d — One wiring path for both modes
+### H3d — One wiring path for both modes — **done**
 
-**Owns:** `charger/running_charger.rs`, `charger/connect.rs`, `charger/hardware_bundle.rs`, the TUI
-call site.
-**Depends on:** nothing outstanding. This is the third time the same seam has produced a gap.
+`start_local_charger(config, hardware)` now takes a `ChargerHardware` like `connect_charger` does,
+and both run `register_setup_blocks` then `register_optional_hardware` in the same order with
+`has_csms` the only difference. `NullCsms` grew the six trait impls that second function needs.
 
-`start_local_charger(config)` takes no `ChargerHardware`. It hardcodes `None` for storage and
-display, and H10b's `register_optional_hardware` is called only from `connect_ocpp_2_1` — so a local
-charger gets no persistence, no display, no firmware installer, no certificate store. H3c fixed this
-for the *functional blocks*; the optional *hardware* has exactly the same split, one layer down.
+`RunningCharger::tick` advances the whole simulation now — the meter plus any in-flight firmware
+install or file transfer — so a caller no longer has to know which pieces need ticking separately.
+That closes the gap where a CSMS-initiated firmware update sat at 0% forever in the running app.
 
-The fix is to stop having two wiring paths: both `connect_charger` and `start_local_charger` should
-take a `ChargerHardware` and run the same registration sequence, with `has_csms` the only thing that
-differs. That is a signature change to a published API, so do it once and deliberately.
+`register_setup_blocks` returns the restored `SecurityEventLog` handle, which `log_uploads` now uses
+instead of a fresh one (decision 8), so an uploaded log includes entries from before a restart.
 
-Two questions to settle while doing it, neither of which has an obvious answer:
-
-- **Should a local charger persist?** Surviving a restart is most of `FileStorage`'s value, and a
-  local charger is the one people leave running. Probably yes — but it means an unconnected
-  simulator writes to disk by default, which should be a conscious choice rather than a side effect.
-- **Should `log_uploads` share the restored `SecurityEventLog`?** Today it gets a fresh one rather
-  than the log `security_log_persisted` restores into, so an uploaded log omits everything from
-  before the restart — which rather defeats uploading it. H10b could not fix this without changing
-  `register_setup_blocks`'s return type, which its file ownership forbade.
-
-**The lesson worth carrying:** each of H4, H10b and this task hit the same failure — a task scoped
-by file ownership, whose change genuinely needed a file another task owned. File ownership
-parallelizes work only when the *change* is separable, not merely the files. When a task changes a
-shared entry point, give it the entry point.
+Two notes from doing it. `FakeFileTransfer` gained a `last_upload()` capture — outside the task's
+nominal file list, taken deliberately and reported, because proving the security-log fix end to end
+needs to observe what bytes were actually uploaded and nothing else exposed that. And test isolation
+was verified rather than assumed: the real state directory was snapshotted before and after the full
+suite, with no new files appearing.
 
 ### H7 — Surface hardware state on `ChargerState`
 
@@ -603,10 +592,16 @@ more satisfying task.
   site is the right prompt to think about what the new field should be there. Don't "fix" it with
   `..Default::default()`, which would silently absorb the next field too. Do budget for it when
   scoping a task, and don't hand the field addition and the call sites to different agents.
-- File ownership only parallelizes tasks that are genuinely separable in Rust. H4 owned `config.rs`
-  alone, but its one new field made four other files stop compiling — so its commit could not stand
-  on its own, and the integration landed here instead. When a task changes a widely-constructed
-  type, it owns the ripple too.
+- **File ownership parallelizes work only when the *change* is separable, not merely the files.**
+  This cost three integration passes before it was learned. H4 owned `config.rs` alone, but its one
+  new field made four other files stop compiling, so its commit could not stand on its own. H10b was
+  asked to reason about local mode while forbidden from touching `running_charger.rs`, and correctly
+  produced a gap rather than guessing. H3d then existed only to close that gap. A task that changes a
+  shared entry point must own that entry point — and a brief that forbids a file the change needs is
+  a bug in the brief, not in the agent that reports it.
+- Give a task permission to take a file outside its list if it says so in its report. H3d needed
+  `FakeFileTransfer::last_upload()` to prove the security-log fix end to end; taking it and saying so
+  was better than either a weaker test or a second task.
 
 ## Known gaps
 
@@ -626,13 +621,6 @@ more satisfying task.
   (all-false capabilities registers no gated block). Nothing asserts that declaring `reservation` or
   `local_auth_list` actually *does* register `reserve_now`/`send_local_list`. H9 was scoped out of
   `connect.rs` and could not add it from an integration test.
-- **Nothing drives the firmware/file-transfer fakes' `tick`.** `RunningCharger::tick` advances only
-  `FakeChargePoint`, so a registered firmware install never progresses unless the caller kept its own
-  `Arc` clone of the installer and ticks it directly (which is what H10b's progression test does).
-  In the running app, a CSMS-initiated firmware update would therefore sit at 0% forever. Either
-  `RunningCharger` should tick everything in the bundle, or `FakeChargePoint::tick` should — decide
-  which when H3d unifies the wiring, since the bundle needs to be reachable from the ticker either
-  way.
 - **`publish_firmware` and OCSP are unregistered for want of an implementation.** No
   `FirmwarePublisher` fake exists (wave 3 didn't build one — the H10a brief didn't ask), and neither
   `FileCertificateStore` nor upstream's `StoredCertificates` implements `OcspChecker`. Both are small
