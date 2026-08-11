@@ -707,6 +707,23 @@ more satisfying task.
   means an upstream change: either make `actor()` public or add a builder method that spawns the
   loop. H5b has since made the builder path permanent, so this is now a live gap rather than a
   theoretical one.
+- **A CSMS can never put a charger into discharge — V2G over OCPP is blocked upstream.**
+  `HardwareCommand` has exactly six variants: `LockConnector`, `UnlockConnector`, `CloseContactor`,
+  `OpenContactor`, `Reboot`, `SetCurrentLimit`. None can express direction. `ChargePointBuilder::der_control`
+  takes only a CSMS, updates state, and nothing projects that state onto the hardware — nor could it,
+  since no command exists to carry it. H14a's `set_discharging` is therefore reachable only
+  programmatically (a frontend, a test, a downstream consumer), never through the protocol.
+
+  So bidirectional metering is real and testable, but "CSMS tells the charger to export" cannot be
+  simulated at all today. Fixing it needs an upstream `HardwareCommand` variant plus a projection in
+  the DER block — the same shape `SetCurrentLimit` already has for smart charging, which is the
+  precedent to point at when asking.
+- **Neither `Iso15118Controller` nor `KeyStore` has a builder hook.** `grep` over `builder.rs` finds
+  no method accepting either. They are consumed instead by public module-level functions —
+  `mutual_tls::client_config<C, K>`, `certificate_renewal::run_certificate_renewal<..>`/`renew_certificate`,
+  and `iso15118`'s handler, which the docs say "supplies its own `Iso15118Controller` per call". So
+  plug-and-charge integration is real but does not run through `ChargePointBuilder`, and anyone
+  looking for a `.iso15118(..)` registration will conclude wrongly that it is impossible.
 - **A custom `Watchdog` cannot be installed at all** — same root cause as the keepalive gap, see H11.
   One upstream change (a public `actor()`, or builder methods accepting these) would unblock both,
   which is the shape the request to `ocpp-charge-point` should take.
