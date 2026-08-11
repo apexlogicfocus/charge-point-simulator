@@ -14,7 +14,7 @@ mod storage;
 pub use certificates::FileCertificateStore;
 pub use charge_point::FakeChargePoint;
 pub use connector::FakeConnector;
-pub use crypto::{RingCrypto, RingCryptoError, verify_signature};
+pub use crypto::{EcdsaCrypto, EcdsaCryptoError, verify_signature};
 pub use display::FakeDisplay;
 pub use evse::FakeEvse;
 pub use file_transfer::{FakeFileTransfer, FakeFileTransferError, TransferProfile};

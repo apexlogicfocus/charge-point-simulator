@@ -24,10 +24,18 @@ ocpp-client = { version = "0.5", default-features = false }
 # direct (non-dev) dependency even though `ocpp-charge-point` already depends on it.
 chrono = "0.4"
 # `charger/hardware/crypto.rs` implements `ocpp_charge_point::hardware::SoftwareCrypto` directly
-# against `ring`'s ECDSA primitives (`docs/hardware-roadmap.md` decision 5), so `ring` has to be a
-# direct (non-dev) dependency even though it is already present transitively via `rustls` in the
-# websocket stack.
-ring = "0.17"
+# against RustCrypto's ECDSA primitives (`docs/hardware-roadmap.md` decision 5, reversing an earlier
+# choice of `ring`, which cannot sign a pre-hashed digest without hashing it again - see that
+# module's docs). `p256` and `p384` re-export the `ecdsa` and `elliptic_curve`/`signature` crates
+# they are built on (`p256::ecdsa`, `p256::elliptic_curve`, `p256::ecdsa::signature`), so those don't
+# need to be listed here separately.
+p256 = "0.14"
+p384 = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
+# Used only by `charger/hardware/crypto.rs`'s tests, to build a digest shaped like the one
+# `certificates/csr.rs` hands to `KeyStore::sign` and to reproduce the exact "hash it twice" shape
+# that disqualified the `ring` backend, so the no-double-hash test is a faithful reproduction rather
+# than an arbitrary byte string.
+sha2 = "0.11"
