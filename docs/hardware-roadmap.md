@@ -140,6 +140,34 @@ The guiding principles, which every task should be checked against:
      routing rather than physics, and was correctly left out of scope. Until it lands, local mode is
      half-converged — which is worth fixing before anyone reads local-mode behavior as authoritative.
 
+- **H7** — `ConnectorState` gained `locked`, `contactor_closed`, `current_limit_ma`, filled by a new
+  `apply_hardware_state` next to `apply_ocpp_state` (they read different sources, so they stay
+  separate functions) and joined on `RunningCharger::apply_state`, the only place a state snapshot
+  and the hardware handle are both in scope. Plumbing only: nothing calls it yet, because the TUI's
+  `App` holds channel endpoints rather than a hardware handle. Rendering these is a TUI task with its
+  own golden review.
+- **H9** — reservations and the local authorization list, proven from outside the crate via
+  `tests/reservation_and_auth_list.rs`. Two things it could *not* prove, which matter more than the
+  three it could:
+
+  1. **The local authorization list is inert in local mode**, and that is our bug, not upstream's.
+     H3b registered an always-accept `LocalAuthorizer` whose error type is `Infallible`; upstream only
+     consults the list from the `Err(_)` arm of `plain_decision`, so that code is unreachable. A test
+     seeds a list that explicitly rejects an identifier and shows charging starts anyway. See
+     "Known gaps" — the fix is to make the local authorizer *fail*, which is also the more honest
+     simulation of a charger that cannot reach a CSMS.
+  2. **A capability flag gates handler registration, not the connector state machine.** A locally
+     injected `ConnectorEvent::Reserved` transitions `Available -> Reserved` whether or not
+     `capabilities.reservation` is declared. Defensible — without the handler a CSMS cannot issue
+     `ReserveNow` at all, so the gate is at the protocol boundary — but worth knowing that injecting
+     events locally bypasses it, and worth not mistaking for a capability check.
+- **H12a** — `FileCertificateStore` wraps upstream's `StoredCertificates<FileStorage>`, so it is
+  bounded and persistent for free. `FileKeyStore<C>` fixes the storage half and stays generic over
+  `C: SoftwareCrypto`, because **upstream ships the `SoftwareCrypto` trait and no implementation** —
+  correctly refusing to invent crypto rather than shipping something homegrown. Choosing a real
+  backend is a security decision left to H13. Moved `chrono` from a dev- to a regular dependency,
+  since `CertificateStore::expires_at` names `chrono::DateTime<Utc>` in non-test code.
+
 ## Where we are
 
 Every charger — local or connected — runs a real `ocpp_charge_point::ChargePointRuntime` (see
@@ -459,6 +487,27 @@ more satisfying task.
   type, it owns the ripple too.
 
 ## Known gaps
+
+- **The local authorization list can never reject anything (ours to fix, and worth doing soon).**
+  H3b's `LocalAuthorizer` returns `Ok(Accepted)` for everything and is `Infallible`, so upstream's
+  `offline_decision` — the only code that reads `local_authorization_list.entries` — is unreachable.
+  The fix is to give the local authorizer a real error type and return `Err`, which is what a charger
+  with no CSMS *actually* experiences: the request cannot reach anyone, so the crate falls back to
+  the local list and the auth cache. That makes local mode both more honest and more useful, since
+  offline authorization is one of the more valuable things to be able to demonstrate.
+
+  Deliberately not fixed during wave 3: H8 was mid-flight driving local chargers to `Charging`
+  through `IdTokenPresented`, and changing authorization semantics underneath it would have broken
+  its branch on merge. Do it as its own task, and expect to seed a local list in any test that
+  currently relies on everything being accepted.
+- **No positive-case test for capability-gated registration.** `connect.rs` proves only the negative
+  (all-false capabilities registers no gated block). Nothing asserts that declaring `reservation` or
+  `local_auth_list` actually *does* register `reserve_now`/`send_local_list`. H9 was scoped out of
+  `connect.rs` and could not add it from an integration test.
+- **No `SoftwareCrypto` backend ships.** `FileKeyStore` stays generic until someone picks one; H13
+  cannot do plug and charge without that decision. `ring` is already present transitively via the
+  websocket TLS stack, which makes it the obvious candidate — but it is a security choice, not a
+  convenience one.
 
 - **The keepalive ping loop is gone, and cannot be brought back from here.** Upstream's
   `connect_and_setup` spawns `keepalive::run_ping_interval_updates`, which applies a CSMS-written
