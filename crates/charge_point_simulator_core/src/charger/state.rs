@@ -111,6 +111,25 @@ pub struct ConnectorState {
     /// suspending and resuming the same session), and resets to zero once `status` returns to
     /// `Available` - the point at which the vehicle is gone and the session is genuinely over.
     pub session_duration: Duration,
+    /// Whether the connector's cable lock actuator currently reports engaged. Written exclusively
+    /// by [`super::ocpp_bridge::apply_hardware_state`], which reads
+    /// [`super::hardware::FakeConnector::is_locked`] off the running charger's hardware handle -
+    /// unlike everything else on this struct, this has no `ChargePointState` counterpart to read
+    /// instead, because the lock only exists in the hardware layer
+    /// (`docs/hardware-roadmap.md`'s H7).
+    pub locked: bool,
+    /// Whether the connector's contactor currently reports closed (energy can flow). Written
+    /// exclusively by [`super::ocpp_bridge::apply_hardware_state`], reading
+    /// [`super::hardware::FakeConnector::is_contactor_closed`] - same H7 rationale as
+    /// [`Self::locked`].
+    pub contactor_closed: bool,
+    /// The current limit last applied to this connector (e.g. by a CSMS smart charging profile),
+    /// in mA, or `None` when no limit currently applies. `Some(0)` ("suspend charging") and
+    /// `None` ("unlimited") are distinct and both round-trip. Written exclusively by
+    /// [`super::ocpp_bridge::apply_hardware_state`], reading
+    /// [`super::hardware::FakeConnector::current_limit_ma`] - same H7 rationale as
+    /// [`Self::locked`].
+    pub current_limit_ma: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +225,9 @@ impl ChargerState {
                         status: ConnectorStatus::Available,
                         vehicle: None,
                         session_duration: Duration::ZERO,
+                        locked: false,
+                        contactor_closed: false,
+                        current_limit_ma: None,
                     })
                     .collect(),
                 metrics: EvseMetrics::default(),
@@ -307,6 +329,22 @@ mod tests {
         let connector = &state.evses[0].connectors[0];
         assert_eq!(connector.status, ConnectorStatus::Available);
         assert_eq!(connector.vehicle, None);
+    }
+
+    /// H7: lock, contactor and current limit have no hardware behind them yet at construction
+    /// time, so they start unlocked/open/unlimited, exactly like a real connector that has never
+    /// been actuated.
+    #[test]
+    fn a_fresh_connector_is_unlocked_open_and_unlimited() {
+        let state = ChargerState::from_config(config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]));
+
+        let connector = &state.evses[0].connectors[0];
+        assert!(!connector.locked);
+        assert!(!connector.contactor_closed);
+        assert_eq!(connector.current_limit_ma, None);
     }
 
     #[test]

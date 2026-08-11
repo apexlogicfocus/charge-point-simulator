@@ -1219,6 +1219,9 @@ mod tests {
                     status,
                     vehicle: None,
                     session_duration: Duration::ZERO,
+                    locked: false,
+                    contactor_closed: false,
+                    current_limit_ma: None,
                 })
                 .collect(),
             metrics: Default::default(),

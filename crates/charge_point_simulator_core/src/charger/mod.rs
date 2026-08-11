@@ -22,7 +22,7 @@ pub use hardware::{
     FakeChargePoint, FakeConnector, FakeDisplay, FakeEvse, FileStorage, FileStorageError,
 };
 pub use hardware_bundle::ChargerHardware;
-pub use ocpp_bridge::{apply_ocpp_state, build_ocpp_event_for_connector};
+pub use ocpp_bridge::{apply_hardware_state, apply_ocpp_state, build_ocpp_event_for_connector};
 pub use ocpp_charge_point::ConnectAndSetupError;
 pub use ocpp_charge_point::state::{ChargePointEvent, ChargePointState};
 pub use running_charger::{RunningCharger, start_local_charger};

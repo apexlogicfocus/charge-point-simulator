@@ -14,6 +14,8 @@ use ocpp_charge_point::state::{AuthorizationStatus, IdToken};
 
 use super::config::ChargerConfig;
 use super::hardware::FakeChargePoint;
+use super::ocpp_bridge::{apply_hardware_state, apply_ocpp_state};
+use super::state::ChargerState;
 
 /// A charge point whose fake hardware is actually running against a real
 /// `ocpp_charge_point::ChargePointRuntime` - the shared result of both
@@ -60,6 +62,25 @@ impl RunningCharger {
     /// injected by the caller, never a `tokio::time::interval` owned in here).
     pub async fn tick(&self, elapsed: Duration) {
         self.hardware.tick(elapsed).await;
+    }
+
+    /// Projects this charger's full observable state onto `charger` in one call:
+    /// [`apply_ocpp_state`] against a fresh [`ChargePointRuntime::state`] snapshot, then
+    /// [`apply_hardware_state`] against [`Self::hardware`] (`docs/hardware-roadmap.md`'s H7).
+    ///
+    /// The two stay separate functions - `apply_ocpp_state` reads a `ChargePointState` snapshot,
+    /// `apply_hardware_state` reads lock/contactor/current-limit fields that live only on
+    /// [`FakeConnector`] and have no OCPP counterpart at all - so each keeps a single, legible
+    /// source of truth and either can be tested (or called) on its own. This method exists only
+    /// because `RunningCharger` is the one place both a `ChargePointState` snapshot and the
+    /// hardware handle are reachable together: `hardware` is a private field, reached by nothing
+    /// outside this type but [`Self::tick`], so no caller could otherwise drive
+    /// `apply_hardware_state` at all.
+    ///
+    /// [`FakeConnector`]: super::hardware::FakeConnector
+    pub fn apply_state(&self, charger: &mut ChargerState) {
+        apply_ocpp_state(charger, &self.state());
+        apply_hardware_state(charger, &self.hardware);
     }
 }
 
@@ -241,6 +262,38 @@ mod tests {
         assert_eq!(
             charger.state().evses[0].connectors[0],
             OcppConnectorState::Charging
+        );
+    }
+
+    /// H7: lock and contactor state live only on `FakeConnector`, not `ChargePointState`, so the
+    /// only way to prove they reach `ConnectorState` is to drive a full local session (cable
+    /// connected -> locked -> id token presented -> contactor closes once charging starts) through
+    /// a real `RunningCharger` and read `ConnectorState` back through `apply_state`, rather than
+    /// poking `FakeConnector` directly.
+    #[tokio::test]
+    async fn apply_state_surfaces_lock_and_contactor_reached_through_a_real_session() {
+        let config = config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]);
+        let charger = start_local_charger(&config).await;
+        let mut state = ChargerState::from_config(config);
+
+        // Before anything happens, both read their construction-time defaults.
+        charger.apply_state(&mut state);
+        assert!(!state.evses[0].connectors[0].locked);
+        assert!(!state.evses[0].connectors[0].contactor_closed);
+
+        charge_locally(&charger, 0, 0).await;
+
+        charger.apply_state(&mut state);
+        assert!(
+            state.evses[0].connectors[0].locked,
+            "the real hardware round trip locks the connector once a cable connects"
+        );
+        assert!(
+            state.evses[0].connectors[0].contactor_closed,
+            "the contactor closes once the session reaches Charging"
         );
     }
 
