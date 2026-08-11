@@ -233,6 +233,36 @@ The guiding principles, which every task should be checked against:
   possibility of a direction, it does not model one. Worth remembering the next time a decision is
   justified as "costs nothing now, saves a rework later".
 
+- **H13b + H14b** — the wiring half of plug and charge and V2G, done as one task since both landed
+  in the same three files. Two registrations, one carry, one honest boundary drawn:
+
+  1. **`der_control` registers** (`charger/connect.rs`'s new `register_der_control`), gated on
+     `capabilities.der_control`, called only from the connected 2.1 path — every one of the five
+     messages it answers is CSMS-initiated with no locally-observable effect, so, per the
+     established `has_csms` doctrine, it is never registered against `NullCsms` in local mode at
+     all (rather than widening that type's trait list for nothing). Registering it is real value
+     even though nothing downstream can act on it: upstream's own `der_control` module docs say
+     the block "stores and reports … rather than actuating", and `HardwareCommand`'s six variants
+     (independently confirmed, not just quoted) have no way to carry direction regardless.
+  2. **`ChargerHardware` grew a `key_store: Option<Arc<FileKeyStore<EcdsaCrypto>>>` field** — H12a's
+     `SoftwareCrypto` gap is closed now that decision 5 landed a real backend. It is carried, not
+     registered: `mutual_tls::client_config` and `certificate_renewal::run_certificate_renewal`/
+     `renew_certificate` were both investigated as the open question the brief posed, and both
+     are unreachable without contorting this crate's design — see `ChargerHardware`'s doc comment
+     for the full account (mutual TLS needs a `SecurityProfile` variant this crate doesn't have
+     plus cert/key bookkeeping the function explicitly disclaims owning; certificate renewal needs
+     a `CertificateSigningRequester` implementor, and the only ones upstream ships live behind a
+     private module with no `pub` re-export and no bare-client convenience impl by design). A
+     caller now reaches a live store the same way it already reaches `firmware_installer`/
+     `file_transfer`: clone the `Arc` before handing `ChargerHardware` away.
+  3. **Discharge is reachable through `RunningCharger::set_discharging`/`exported_energy_wh`** —
+     addressed positionally like every other method on that type. Deliberately *not* wired through
+     any OCPP path: `HardwareCommand` cannot carry direction, so no CSMS message can ever reach it,
+     confirming the "Known gaps" entry below rather than working around it. A frontend, test, or
+     downstream consumer calls it directly instead — proven end to end in
+     `charger/running_charger.rs`'s test module: setting discharge and ticking measurably raises
+     `exported_energy_wh`, the same property H14a proved one layer down at `FakeConnector` itself.
+
 ## Where we are
 
 Every charger — local or connected — runs a real `ocpp_charge_point::ChargePointRuntime` (see
@@ -605,12 +635,22 @@ that accept these) would unblock both.
 certificate. The largest task here, and the one most likely to want its own sub-plan once H12
 lands.
 
+**H13b (the wiring half) is done** — see its "Done" entry above. What's left is the actual
+plug-and-charge flow: a vehicle model that carries a contract certificate and triggers
+`Iso15118CertificateRequester::request_ev_certificate` at the right moment, which needs the vehicle
+model changes this sub-task deliberately left out of scope.
+
 ### H14 — V2G and DER control
 
 **Depends on:** H3 (signed power), H4.
 
 `with_supports_bidirectional_power`, `with_der_control`, `der_control` registration, and a
 discharge mode on the simulated meter. Cheap *if* decision 4 held; expensive if it didn't.
+
+**Done**, in the sense OCPP allows: `der_control` registers (H14b) and discharge is reachable
+programmatically (H14a + H14b) — see the "Done" entry above and the "Known gaps" entry on why a
+CSMS itself can never trigger it. Nothing further is blocked on this crate; the remaining gap is
+upstream.
 
 ## Parallelism
 
@@ -630,6 +670,7 @@ something only the current branch has is the cheap guard.
 | 3 | ~~**H8**, **H9**, **H10a**, **H12a**~~ | Done, four-way parallel with no shared files. H8/H9 became test-only tasks — the registrations already existed — and ran as integration tests under `tests/`, which also proves the published surface is usable from outside. H10/H12 split implement-then-register, as H5/H6 did. |
 | 3.5 | **H3c**, the local-authorizer fix, **H10b+H12b** | H3c and the authorizer fix first, together — both are "local mode is under-wired", and registering yet more hardware into a path local mode doesn't use only widens that gap. Then register firmware/file-transfer/certificates/keys as one task, the way H5b+H6b was. |
 | 4 | **H13**, **H14** | H13 needs H12 **and a `SoftwareCrypto` decision** — see "Known gaps". H14 needs only H3, so it can go earlier if someone is free. |
+| 4.5 | ~~**H13b + H14b**~~ | Done, as one task — see its "Done" entry. The `SoftwareCrypto` decision wave 4 was waiting on landed (decision 5's reversal to RustCrypto), which is what made the key-store half of this reachable at all. Full H13 (the plug-and-charge vehicle-model flow) and H11/the keepalive/watchdog gaps remain open. |
 
 The critical path is **H2 → H5b → H12 → H13**. Everything else has slack. If H2 slips, waves 2–4
 all slip with it, which is the argument for starting it before H1 despite H1 being the smaller,
@@ -710,9 +751,11 @@ more satisfying task.
 - **A CSMS can never put a charger into discharge — V2G over OCPP is blocked upstream.**
   `HardwareCommand` has exactly six variants: `LockConnector`, `UnlockConnector`, `CloseContactor`,
   `OpenContactor`, `Reboot`, `SetCurrentLimit`. None can express direction. `ChargePointBuilder::der_control`
-  takes only a CSMS, updates state, and nothing projects that state onto the hardware — nor could it,
-  since no command exists to carry it. H14a's `set_discharging` is therefore reachable only
-  programmatically (a frontend, a test, a downstream consumer), never through the protocol.
+  (registered by H14b's `register_der_control`, gated on `capabilities.der_control`) takes only a
+  CSMS, updates state, and nothing projects that state onto the hardware — nor could it, since no
+  command exists to carry it. H14a's `set_discharging` is therefore reachable only programmatically
+  — as of H14b, through `RunningCharger::set_discharging`/`exported_energy_wh` specifically (a
+  frontend, a test, a downstream consumer), never through the protocol.
 
   So bidirectional metering is real and testable, but "CSMS tells the charger to export" cannot be
   simulated at all today. Fixing it needs an upstream `HardwareCommand` variant plus a projection in
@@ -724,6 +767,16 @@ more satisfying task.
   and `iso15118`'s handler, which the docs say "supplies its own `Iso15118Controller` per call". So
   plug-and-charge integration is real but does not run through `ChargePointBuilder`, and anyone
   looking for a `.iso15118(..)` registration will conclude wrongly that it is impossible.
+
+  H13b investigated both module-level functions as a wiring target for `ChargerHardware`'s new
+  `key_store` field and found neither reachable: `mutual_tls::client_config` needs a
+  `SecurityProfile` variant this crate doesn't have (only `Basic` exists) plus a cert/key
+  association the function itself disclaims tracking, and `run_certificate_renewal`/
+  `renew_certificate` need a `CertificateSigningRequester` implementor — the only ones upstream
+  ships (`Ocpp2_1CertificateHandler` and its 2.0.1/1.6 counterparts) live behind a private module
+  with no `pub` re-export anywhere and, per the trait's own doc comment, are deliberately not given
+  the bare-client convenience impl `CertificateHandler` gets. So the field is carried, not
+  registered — see `ChargerHardware`'s own doc comment for the full account.
 - **A custom `Watchdog` cannot be installed at all** — same root cause as the keepalive gap, see H11.
   One upstream change (a public `actor()`, or builder methods accepting these) would unblock both,
   which is the shape the request to `ocpp-charge-point` should take.

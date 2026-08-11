@@ -10,14 +10,37 @@ use ocpp_charge_point::ChargePointBuilder;
 use ocpp_charge_point::ChargePointRuntime;
 use ocpp_charge_point::clock::{SystemClock, SystemMonotonicClock};
 use ocpp_charge_point::executor::TokioExecutor;
+use ocpp_charge_point::hardware::{ChargePoint, Evse};
 use ocpp_charge_point::provisioning::TokioBackoff;
 
 use super::config::ChargerConfig;
 use super::connect::{NullCsms, register_optional_hardware, register_setup_blocks};
-use super::hardware::{FakeChargePoint, FakeFileTransfer, FakeFirmwareInstaller};
+use super::hardware::{FakeChargePoint, FakeConnector, FakeFileTransfer, FakeFirmwareInstaller};
 use super::hardware_bundle::ChargerHardware;
 use super::ocpp_bridge::{apply_hardware_state, apply_ocpp_state};
 use super::state::ChargerState;
+
+/// Returned by [`RunningCharger::set_discharging`]/[`RunningCharger::exported_energy_wh`] when
+/// `evse_id`/`connector_id` doesn't name a connector this charger actually has - addressed
+/// positionally, exactly like [`FakeChargePoint::tick`]/[`apply_hardware_state`] (see either's own
+/// doc comment for why array position, not the YAML config's own EVSE/connector numbers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoSuchConnector {
+    pub evse_id: usize,
+    pub connector_id: usize,
+}
+
+impl std::fmt::Display for NoSuchConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no connector at evse {} connector {}",
+            self.evse_id, self.connector_id
+        )
+    }
+}
+
+impl std::error::Error for NoSuchConnector {}
 
 /// A charge point whose fake hardware is actually running against a real
 /// `ocpp_charge_point::ChargePointRuntime` - the shared result of both
@@ -119,6 +142,70 @@ impl RunningCharger {
         apply_ocpp_state(charger, &self.state());
         apply_hardware_state(charger, &self.hardware);
     }
+
+    /// Puts the connector at `evse_id`/`connector_id` into discharge (V2G export) or back to
+    /// import (`docs/hardware-roadmap.md`'s H14b) - addressed positionally, the same way
+    /// [`Self::apply_state`]/[`FakeChargePoint::tick`] address a connector.
+    ///
+    /// **This is the only way to trigger discharge, and that is deliberate, not an oversight.**
+    /// `HardwareCommand` has exactly six variants (`LockConnector`/`UnlockConnector`/
+    /// `CloseContactor`/`OpenContactor`/`Reboot`/`SetCurrentLimit`) and none of them can express
+    /// direction, so no CSMS message reaching this charger can ever flip a connector into
+    /// discharge - registering `ChargePointBuilder::der_control`
+    /// ([`super::connect::register_der_control`]) makes this charger answer DER Control messages
+    /// honestly, but stores and reports them without projecting anything onto hardware, per
+    /// upstream's own "store-and-report, not actuate" scope for that block. Inventing a fake OCPP
+    /// path here - e.g. quietly flipping direction from a stored `DERControl` - would claim a
+    /// protocol capability this simulator does not have; see `docs/hardware-roadmap.md`'s "Known
+    /// gaps" for the fuller account of why upstream blocks this. What *is* real: the metering
+    /// itself, once direction is set - see [`Self::exported_energy_wh`] and H14a's own entry.
+    ///
+    /// This is the honest alternative: a direct, programmatic entry point for a frontend, a test,
+    /// or any other downstream consumer that wants to demonstrate bidirectional metering on
+    /// purpose, mirroring [`super::hardware::FakeConnector::set_discharging`] (which this calls
+    /// directly) the same way [`Self::tick`] mirrors [`FakeChargePoint::tick`].
+    ///
+    /// Returns `Err(NoSuchConnector)` rather than panicking when `evse_id`/`connector_id` is out
+    /// of range, per this crate's "return `Err` rather than panic" working agreement.
+    pub fn set_discharging(
+        &self,
+        evse_id: usize,
+        connector_id: usize,
+        discharging: bool,
+    ) -> Result<(), NoSuchConnector> {
+        self.connector(evse_id, connector_id)?
+            .set_discharging(discharging);
+        Ok(())
+    }
+
+    /// Cumulative energy the connector at `evse_id`/`connector_id` has exported so far, in Wh -
+    /// see [`super::hardware::FakeConnector::exported_energy_wh`]. The observation counterpart of
+    /// [`Self::set_discharging`]: `MeterSample`/`ChargePointState` never carry this figure
+    /// (H14a's own decision - `energy_wh` is OCPP's *import* register and must not run
+    /// backwards), so reading it back through `RunningCharger`'s own surface, addressed the same
+    /// positional way as every other method here, is the only way to observe it.
+    pub fn exported_energy_wh(
+        &self,
+        evse_id: usize,
+        connector_id: usize,
+    ) -> Result<i64, NoSuchConnector> {
+        Ok(self.connector(evse_id, connector_id)?.exported_energy_wh())
+    }
+
+    fn connector(
+        &self,
+        evse_id: usize,
+        connector_id: usize,
+    ) -> Result<&FakeConnector, NoSuchConnector> {
+        self.hardware
+            .evses()
+            .get(evse_id)
+            .and_then(|evse| evse.connectors().get(connector_id))
+            .ok_or(NoSuchConnector {
+                evse_id,
+                connector_id,
+            })
+    }
 }
 
 impl Deref for RunningCharger {
@@ -194,6 +281,9 @@ pub async fn start_local_charger(
         firmware_verifier,
         file_transfer,
         certificate_store,
+        // `key_store`: never consumed here - see `ChargerHardware`'s own doc comment for why, and
+        // how a caller reaches it instead (clone the `Arc` out before calling this function).
+        ..
     } = hardware;
     // Cloned before being consumed by `register_optional_hardware` below - see this function's
     // own doc comment and `RunningCharger::tick`'s for why a live handle has to survive that call.
@@ -604,5 +694,102 @@ mod tests {
             "expected the install to complete once RunningCharger::tick supplied enough \
              simulated time, got {outcome:?}"
         );
+    }
+
+    // --- H14b: `RunningCharger::set_discharging`/`exported_energy_wh` --------------------------
+
+    /// The minimum the task asks for: flipping a connector into discharge programmatically (no
+    /// OCPP path exists to do this - see `set_discharging`'s own doc comment) makes the meter's
+    /// exported energy actually rise once `RunningCharger::tick` runs, exactly like H14a proved at
+    /// `FakeConnector`'s own level - this proves the same thing reached through the whole local
+    /// integration, the way `the_same_total_elapsed_time_reads_the_same_...` above does for
+    /// import.
+    #[tokio::test]
+    async fn set_discharging_makes_the_meters_exported_energy_rise_through_tick() {
+        let charger = start_local_charger(
+            &config(vec![EvseConfig {
+                id: 1,
+                connectors: 1,
+            }]),
+            ChargerHardware::default(),
+        )
+        .await;
+        charge_locally(&charger, 0, 0).await;
+
+        assert_eq!(
+            charger.exported_energy_wh(0, 0).unwrap(),
+            0,
+            "nothing has discharged yet"
+        );
+
+        charger.set_discharging(0, 0, true).unwrap();
+        charger.tick(StdDuration::from_secs(3600)).await;
+
+        assert!(
+            charger.exported_energy_wh(0, 0).unwrap() > 0,
+            "expected exported energy to rise once discharging and ticked"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_discharging_reports_no_such_connector_rather_than_panicking_out_of_range() {
+        let charger = start_local_charger(&config(vec![]), ChargerHardware::default()).await;
+
+        assert_eq!(
+            charger.set_discharging(0, 0, true),
+            Err(NoSuchConnector {
+                evse_id: 0,
+                connector_id: 0
+            })
+        );
+        assert_eq!(
+            charger.exported_energy_wh(0, 0),
+            Err(NoSuchConnector {
+                evse_id: 0,
+                connector_id: 0
+            })
+        );
+    }
+
+    // --- H13b: the key store, carried but never registered --------------------------------------
+
+    /// Proves the key-store integration this task actually achieved: `ChargerHardware.key_store`
+    /// round-trips through `start_local_charger` without being dropped or poisoned, and - the part
+    /// that matters - the caller's own `Arc` clone, taken *before* handing `hardware` away, is
+    /// still a live, independently usable `FileKeyStore<EcdsaCrypto>` afterward: it generates a
+    /// real ECDSA key pair and signs with it, through the exact composition
+    /// `crates/charge_point_simulator_core/src/charger/hardware/crypto.rs`'s own tests already
+    /// prove works. `start_local_charger` never registers a `KeyStore` against anything (see
+    /// `ChargerHardware`'s doc comment - no `ChargePointBuilder` method exists to register one
+    /// against), so this only demonstrates the store is *usable*, not that it is wired into the
+    /// running session - the honest limit of what this task could reach.
+    #[tokio::test]
+    async fn a_local_charger_given_a_real_bundle_still_leaves_the_callers_key_store_handle_usable()
+    {
+        use ocpp_charge_point::hardware::{KeyStore, SignatureAlgorithm};
+
+        use super::super::hardware::{EcdsaCrypto, FileKeyStore};
+
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let key_store = Arc::new(FileKeyStore::new(
+            FileStorage::new(dir.path()),
+            EcdsaCrypto::new(),
+        ));
+        let hardware = ChargerHardware {
+            key_store: Some(Arc::clone(&key_store)),
+            ..Default::default()
+        };
+
+        let _charger = start_local_charger(&config(vec![]), hardware).await;
+
+        let generated = key_store
+            .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
+            .await
+            .expect("the caller's own Arc clone must still be a live, working key store");
+        let signature = key_store
+            .sign(&generated.handle, b"a digest the caller already hashed")
+            .await
+            .expect("signing through the caller's retained handle must still work");
+        assert!(!signature.is_empty());
     }
 }

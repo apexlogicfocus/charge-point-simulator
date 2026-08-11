@@ -9,6 +9,10 @@ use ocpp_charge_point::certificates::CertificateHandler;
 use ocpp_charge_point::clock::{Clock, MonotonicClock, SystemClock, SystemMonotonicClock};
 use ocpp_charge_point::connection::ReconnectHandler;
 use ocpp_charge_point::cost::CostUpdatedHandler;
+use ocpp_charge_point::der_control::{
+    AfrrSignalHandler, ClearDERControlHandler, GetDERControlHandler,
+    NotifyAllowedEnergyTransferHandler, SetDERControlHandler,
+};
 use ocpp_charge_point::device_model::{GetVariablesHandler, SetVariablesHandler};
 use ocpp_charge_point::diagnostics::{GetLogHandler, LogStatusNotifier};
 use ocpp_charge_point::display_message::{
@@ -1070,6 +1074,11 @@ pub async fn connect_charger(
         firmware_verifier,
         file_transfer,
         certificate_store,
+        // `key_store`: never consumed here - no `ChargePointBuilder` method registers a
+        // `KeyStore` at all yet. See `ChargerHardware`'s own doc comment for the full
+        // investigation of why, and how a caller reaches it instead (clone the `Arc` out before
+        // calling this function).
+        ..
     } = hardware;
 
     let charge_point = FakeChargePoint::from_config(config);
@@ -1142,6 +1151,9 @@ pub async fn connect_charger(
 ///   switching (A9: move the connection when the CSMS changes the selected profile) - folded into
 ///   the one `ChargePointBuilder::network_profile_switching` call, which does both.
 ///
+/// Also, since `docs/hardware-roadmap.md`'s H14b: [`register_der_control`] - see its own doc
+/// comment for exactly what registering DER Control does and, more importantly, does not do.
+///
 /// Not reproduced: the `WebSocketPingInterval` keepalive loop
 /// (`ocpp_charge_point::keepalive::run_ping_interval_updates`) upstream also spawns here. It
 /// takes a `ChargePointActor`, which `ocpp-charge-point` only ever hands out via
@@ -1199,6 +1211,8 @@ async fn connect_ocpp_2_1(
             .await;
     }
 
+    builder = register_der_control(builder, &client).await;
+
     builder = register_optional_hardware(
         builder,
         &client,
@@ -1221,6 +1235,60 @@ async fn connect_ocpp_2_1(
         firmware_installer_handle,
         file_transfer_handle,
     ))
+}
+
+/// Registers the DER Control functional block (`docs/hardware-roadmap.md`'s H14b) when the
+/// hardware declares `capabilities.der_control`: `GetDERControl`, `SetDERControl`,
+/// `ClearDERControl`, `AFRRSignal` and `NotifyAllowedEnergyTransfer` all feed into
+/// [`ChargePointBuilder::der_control`], mirroring the `if builder.capabilities().smart_charging`
+/// gate right above this function's one call site rather than folding into
+/// [`register_setup_blocks`]'s own big trait bound - see [`ChargePointBuilder::der_control`]'s own
+/// doc comment for why upstream keeps it out of `setup()` for the same reason ("extending that
+/// bound for a block this new is a larger, riskier change than this task's scope").
+///
+/// **2.1 only** - called only from [`connect_ocpp_2_1`], never from
+/// [`super::running_charger::start_local_charger`]. Every one of the five messages this registers
+/// is CSMS-initiated (the CSMS asks about, sets, or clears a DER control, or delivers an AFRR
+/// signal or an allowed-energy-transfer notification) with no locally-observable effect of its
+/// own, the same "at best a no-op offline" reasoning [`register_setup_blocks`]'s `has_csms` doc
+/// comment gives `tariff_and_cost`/`variable_monitoring`/`periodic_event_stream`, so [`NullCsms`]
+/// does not implement these five handler traits at all and this is simply never called against it.
+///
+/// # This makes the charger answer DER Control messages. It does not make it discharge.
+///
+/// Registering this is genuinely worth doing even though nothing here can act on what it stores:
+/// it makes a declared-capable charger answer `GetDERControl`/`SetDERControl`/`ClearDERControl`
+/// honestly (accepted/rejected/not-supported, per upstream's `DERControlStore`) instead of timing
+/// out or erroring, and that stored state is real and inspectable. But upstream's own module docs
+/// for `der_control` say this functional block "**stores and reports** DER controls rather than
+/// **actuating** them" - there is nothing in this crate's `hardware` layer a DER control curve or
+/// setpoint could be applied to. Confirmed independently, not just by that doc comment:
+/// `HardwareCommand` has exactly six variants (`LockConnector`/`UnlockConnector`/
+/// `CloseContactor`/`OpenContactor`/`Reboot`/`SetCurrentLimit`), none of which can express
+/// direction, so even a future projection would have nowhere to send "discharge" through the
+/// command path DER control would need. See
+/// [`super::running_charger::RunningCharger::set_discharging`] for the actual, deliberately
+/// programmatic (not OCPP-driven) way to put a connector into discharge, and
+/// `docs/hardware-roadmap.md`'s "Known gaps" for the full account of why a CSMS cannot reach it.
+pub(crate) async fn register_der_control<T, X, N>(
+    mut builder: ChargePointBuilder<T, X>,
+    csms: &N,
+) -> ChargePointBuilder<T, X>
+where
+    X: Executor,
+    N: SetDERControlHandler
+        + ClearDERControlHandler
+        + GetDERControlHandler
+        + AfrrSignalHandler
+        + NotifyAllowedEnergyTransferHandler
+        + Send
+        + Sync
+        + 'static,
+{
+    if builder.capabilities().der_control {
+        builder = builder.der_control(csms).await;
+    }
+    builder
 }
 
 /// Registers firmware, file transfer and certificate hardware (`docs/hardware-roadmap.md`'s H10b
@@ -1299,8 +1367,12 @@ async fn connect_ocpp_2_1(
 ///   outbound path to a third-party OCSP responder, which a certificate store does not give a
 ///   charge point). So `certificate_store` "making the OCSP methods reachable" never actually
 ///   happens with what this crate has today.
-/// - **A `KeyStore`** is not a parameter of this function at all - see [`ChargerHardware`]'s doc
-///   comment for why no field exists to pass one from.
+/// - **A `KeyStore`** is not a parameter of this function at all. `ChargerHardware` grew a
+///   `key_store` field (`docs/hardware-roadmap.md` H13b), but `ChargePointBuilder` still has no
+///   method that registers one - see that field's own doc comment for the full investigation of
+///   why (`mutual_tls::client_config`/`certificate_renewal::run_certificate_renewal` were checked
+///   and found unreachable without contorting this crate's design) and how a caller reaches the
+///   store anyway.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn register_optional_hardware<T, X, N, B, K>(
     mut builder: ChargePointBuilder<T, X>,
@@ -2079,6 +2151,108 @@ mod tests {
             FF: core::future::Future<Output = ()> + Send + 'static,
         {
             self.record("reconnect");
+        }
+    }
+
+    // --- H14b: `register_der_control` -----------------------------------------------------------
+
+    #[async_trait::async_trait]
+    impl SetDERControlHandler for RecordingCsms {
+        async fn register_set_der_control_handler(&self, _actor: ChargePointActor) {
+            self.record("set_der_control");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClearDERControlHandler for RecordingCsms {
+        async fn register_clear_der_control_handler(&self, _actor: ChargePointActor) {
+            self.record("clear_der_control");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GetDERControlHandler for RecordingCsms {
+        async fn register_get_der_control_handler(&self, _actor: ChargePointActor) {
+            self.record("get_der_control");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AfrrSignalHandler for RecordingCsms {
+        async fn register_afrr_signal_handler(&self, _actor: ChargePointActor) {
+            self.record("afrr_signal");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NotifyAllowedEnergyTransferHandler for RecordingCsms {
+        async fn register_notify_allowed_energy_transfer_handler(&self, _actor: ChargePointActor) {
+            self.record("notify_allowed_energy_transfer");
+        }
+    }
+
+    fn der_control_config(der_control: bool) -> ChargerConfig {
+        ChargerConfig {
+            id: "der-control-test".into(),
+            ocpp_version: SimOcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+            capabilities: CapabilitiesConfig {
+                der_control,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_charger_declaring_der_control_registers_every_der_control_handler() {
+        let config = der_control_config(true);
+        let csms = RecordingCsms::new();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_der_control(builder, &csms).await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        for block in [
+            "set_der_control",
+            "clear_der_control",
+            "get_der_control",
+            "afrr_signal",
+            "notify_allowed_energy_transfer",
+        ] {
+            assert!(
+                csms.called(block),
+                "expected `{block}` to be registered when der_control is declared"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_charger_not_declaring_der_control_registers_no_der_control_handler() {
+        let config = der_control_config(false);
+        let csms = RecordingCsms::new();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_der_control(builder, &csms).await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        for block in [
+            "set_der_control",
+            "clear_der_control",
+            "get_der_control",
+            "afrr_signal",
+            "notify_allowed_energy_transfer",
+        ] {
+            assert!(
+                !csms.called(block),
+                "expected `{block}` not to be registered when der_control is not declared"
+            );
         }
     }
 

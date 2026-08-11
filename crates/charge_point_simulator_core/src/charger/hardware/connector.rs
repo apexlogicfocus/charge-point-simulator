@@ -28,10 +28,15 @@ pub struct FakeConnector {
     /// export, and which way it's going can change mid-transaction. Lives here next to
     /// [`Self::current_limit_ma`], the same shape, and is read by [`Self::tick`] on every call.
     ///
-    /// Nothing outside this connector's own tests flips this yet - wiring an actual OCPP trigger
-    /// (a DER control setpoint, most likely) to [`Self::set_discharging`] is H14b's job, tracked
-    /// separately in `docs/hardware-roadmap.md`. That registration work is deliberately not this
-    /// task's to do.
+    /// H14b's finding: **no OCPP trigger can ever flip this.** `HardwareCommand` has exactly six
+    /// variants (`LockConnector`/`UnlockConnector`/`CloseContactor`/`OpenContactor`/`Reboot`/
+    /// `SetCurrentLimit`) and none can express direction, so a CSMS message can never reach
+    /// [`Self::set_discharging`] no matter what functional block is registered - registering
+    /// `ChargePointBuilder::der_control` (`docs/hardware-roadmap.md` H14b) makes this charger
+    /// answer DER Control messages honestly, but that block stores and reports, it does not
+    /// actuate. [`super::super::running_charger::RunningCharger::set_discharging`] is the
+    /// deliberate, programmatic (not OCPP-driven) entry point instead - see its own doc comment
+    /// and `docs/hardware-roadmap.md`'s "Known gaps" for the full account.
     discharging: AtomicBool,
     /// This connector's simulated meter, advanced by [`Self::tick`] using
     /// [`Self::is_contactor_closed`], [`Self::current_limit_ma`] and [`Self::is_discharging`] as
