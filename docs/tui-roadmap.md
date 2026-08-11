@@ -210,9 +210,28 @@ The guiding principles, which every remaining phase should be checked against:
   snapshot. It now reports "not ready yet", which also retires H3b's "local mode is half-converged"
   note. `Command::apply_to` stays in `core` as published API; nothing in the TUI calls it.
 
+- **Phase 10 — a failed CSMS connection that stays failed.** A failed dial used to be a four-second
+  toast, over a header that then reported `booting` indefinitely — `connection_status` is written only
+  by `apply_ocpp_state`, the connection thread has exited, and no snapshot will ever arrive to correct
+  it. So the one state on this screen that nothing else will ever mention again was also the one that
+  expired fastest, and the header actively contradicted it.
+
+  `App::connection_failure` holds the error until something is genuinely done about it (a retry, a
+  successful connection, or leaving for the picker). `dashboard::LinkState` replaces
+  `header_segments`' `connecting: bool` with three states, so the header shows `✕ connection failed`
+  rather than a stale status — and a retry in flight outranks the failure it is retrying, since the
+  spinner is then the live answer. A `Connection` strip (three rows: rule, reason, next step) carries
+  the CSMS error verbatim, truncated visibly with `…` when it must be, because a URL typo, an expired
+  certificate and a rejected password are three different problems and the words are what separate
+  them. `r` reopens connection setup with every field prefilled from the profile that failed, so
+  fixing a typo is an edit; it deliberately does nothing when there is no failure, since a connected
+  charger must not be torn down by a stray keypress. The failure is also pushed to the log at `Error`
+  level via a new `LogEntry::error` — `Info` is what the level threshold hides first, and this is the
+  line that explains everything else on screen.
+
 ## Where we are
 
-Phases 0–9 have all landed; see the Done section above. Nothing is scheduled after this — the open
+Phases 0–10 have all landed; see the Done section above. Nothing is scheduled after this — the open
 decisions below are all settled, so the next move is one of the unscheduled gaps after them. (No REST
 API crate is coming here — `core` is published to crates.io and any REST API lives in a separate
 downstream repo. See `CLAUDE.md`.)

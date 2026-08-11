@@ -219,6 +219,8 @@ The built-in Ratatui dashboard provides:
 * 📈 Meter values, and the separate export register when a connector is discharging
 * 📦 Firmware installs and file transfers in flight
 * 📋 What the selected charger declares to the CSMS
+* 🔌 A failed CSMS connection, with the reason and how to retry - it stays on screen until you act
+  on it, rather than expiring
 * 📜 Live logs
 * ⌨️ Keyboard controls (`?` lists them all)
 * 🔍 Real-time protocol events

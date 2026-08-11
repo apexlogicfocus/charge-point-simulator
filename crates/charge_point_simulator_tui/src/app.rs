@@ -135,6 +135,18 @@ pub struct App {
     /// background thread has been spawned - see [`Self::spawn_local_charger`]/
     /// [`Self::confirm_connection_setup`].
     pub ocpp_tick_sender: Option<UnboundedSender<Duration>>,
+    /// Why the last CSMS connection attempt failed, kept until something is actually done about it -
+    /// rendered as the dashboard's `Connection` strip, and the reason the header stops trusting
+    /// `ChargerState::connection_status` (see [`crate::ui::dashboard::LinkState`]).
+    ///
+    /// Deliberately *not* a [`Toast`]: those expire after [`STATUS_MESSAGE_TTL`], which is right for
+    /// "command dispatched" and wrong for this. A failed dial leaves a charger that will never
+    /// connect, never report anything, and never change on its own - the one state on this screen
+    /// that has to outlive a four-second timer, because nothing else will ever mention it again.
+    ///
+    /// Cleared by the three things that genuinely address it: a retry
+    /// ([`Self::retry_connection`]), a successful connection, and leaving for the picker.
+    pub connection_failure: Option<String>,
     /// The charger-wide firmware/file-transfer activity from the most recent snapshot, rendered as
     /// the dashboard's activity strip. `CampaignProgress::default()` (everything `None`) both before
     /// any snapshot arrives and for a charger with no such hardware at all.
@@ -879,7 +891,11 @@ impl App {
                 // tree down while it's on screen.
                 let body = dashboard::body_layout(
                     layout.body,
-                    dashboard::body_strips_for(self.charger_state.as_ref(), &self.campaigns),
+                    dashboard::body_strips_for(
+                        self.charger_state.as_ref(),
+                        &self.campaigns,
+                        self.connection_failure.as_deref(),
+                    ),
                 );
                 self.handle_tree_click(body.tree, body.sidebar.is_none(), mouse_event);
             }
@@ -1180,8 +1196,33 @@ impl App {
             }
             KeyCode::Char('c') => self.open_command_palette(),
             KeyCode::Char('d') => self.toggle_discharging(),
+            KeyCode::Char('r') => self.retry_connection(),
             _ => {}
         }
+    }
+
+    /// `r`: goes back to the connection setup screen for this charger after a failed dial, with every
+    /// field prefilled from the profile that failed (they are remembered in
+    /// [`Self::connection_store`]), so retrying is `Enter` and fixing a typo'd URL is an edit.
+    ///
+    /// Only does anything while a failure is actually showing. This is not a general "reconnect":
+    /// a charger that never went through connection setup (1.6J/2.0.1 chargers go straight to the
+    /// dashboard, since `connect_charger` is 2.1-only) has no CSMS to retry against, and a charger
+    /// that *is* connected must not be torn down by a stray keypress.
+    fn retry_connection(&mut self) {
+        if self.connection_failure.is_none() {
+            return;
+        }
+        let Some(charger_id) = self
+            .charger_state
+            .as_ref()
+            .map(|state| state.config.id.clone())
+        else {
+            return;
+        };
+        // Clears `connection_failure` itself, along with the rest of the previous attempt's state.
+        self.enter_connection_setup(&charger_id);
+        self.screen = Screen::ConnectionSetup;
     }
 
     /// `d`: the shortcut for [`HardwareAction::ToggleDischarge`], which is also in the palette.
@@ -1717,6 +1758,8 @@ impl App {
             }
         }
         self.connection_focused_field = 0;
+        // A new attempt is being set up, so the previous one's failure has been acted on.
+        self.connection_failure = None;
         self.connection_url_error = None;
         self.connection_password_revealed = false;
         self.connection_url_suggestion = None;
@@ -1847,13 +1890,20 @@ impl App {
         match receiver.try_recv() {
             Ok(Ok(())) => {
                 self.set_status(StatusSeverity::Ok, "✓ connected to CSMS".to_string());
+                self.connection_failure = None;
                 self.connect_result_receiver = None;
             }
             Ok(Err(error)) => {
+                // Three places, each doing something the others can't: the toast is the immediate
+                // "that just happened", the log entry puts it in the trace with everything else that
+                // led up to it, and `connection_failure` is what is still on screen a minute later.
                 self.set_status(
                     StatusSeverity::Error,
                     format!("✗ CSMS connection failed: {error}"),
                 );
+                self.logs
+                    .push(LogEntry::error(format!("CSMS connection failed: {error}")));
+                self.connection_failure = Some(error);
                 self.connect_result_receiver = None;
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
@@ -1879,6 +1929,7 @@ impl App {
         self.ocpp_event_sender = None;
         self.ocpp_tick_sender = None;
         self.hardware_control_sender = None;
+        self.connection_failure = None;
         self.campaigns = CampaignProgress::default();
         self.live_ocpp_state = None;
         self.screen = Screen::PickCharger;
@@ -3807,6 +3858,123 @@ mod tests {
             ))
         );
         assert!(app.connect_result_receiver.is_none());
+    }
+
+    /// The point of `connection_failure`: a toast expires after `STATUS_MESSAGE_TTL`, and a charger
+    /// whose dial failed will never report anything again, so the four-second version of this message
+    /// was the only version there was.
+    #[test]
+    fn a_failed_connection_is_recorded_where_it_cannot_expire() {
+        let (sender, receiver) = oneshot::channel();
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        app.connect_result_receiver = Some(receiver);
+        sender
+            .send(Err("dns error: no such host".to_string()))
+            .unwrap();
+
+        app.poll_connect_result();
+
+        assert_eq!(
+            app.connection_failure.as_deref(),
+            Some("dns error: no such host")
+        );
+
+        // The toast goes, as every toast should; the failure stays.
+        app.expire_status_message(Instant::now() + STATUS_MESSAGE_TTL);
+        assert_eq!(status(&app), None);
+        assert_eq!(
+            app.connection_failure.as_deref(),
+            Some("dns error: no such host")
+        );
+    }
+
+    /// It also goes in the trace, at `Error` level - `Info` is what the level threshold hides first,
+    /// and this is the line that explains everything else on screen.
+    #[test]
+    fn a_failed_connection_is_logged_as_an_error() {
+        let (sender, receiver) = oneshot::channel();
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        app.connect_result_receiver = Some(receiver);
+        sender.send(Err("connection refused".to_string())).unwrap();
+
+        app.poll_connect_result();
+
+        let entry = app
+            .logs
+            .visible_lines(10)
+            .into_iter()
+            .find(|entry| entry.message.contains("connection refused"))
+            .expect("the failure should be in the log");
+        assert_eq!(entry.level, LogLevel::Error);
+    }
+
+    #[test]
+    fn a_successful_connection_clears_a_previous_failure() {
+        let (sender, receiver) = oneshot::channel();
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.connection_failure = Some("connection refused".to_string());
+        app.connect_result_receiver = Some(receiver);
+        sender.send(Ok(())).unwrap();
+
+        app.poll_connect_result();
+
+        assert!(app.connection_failure.is_none());
+    }
+
+    /// `r` is the way out of the dead end a failed dial leaves: back to the setup screen, every field
+    /// prefilled from the profile that failed, so a typo'd URL is an edit rather than a retype.
+    #[test]
+    fn r_reopens_connection_setup_prefilled_after_a_failure() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        app.connection_store.remember(
+            "CP-2.1".to_string(),
+            ConnectionProfile {
+                csms_url: "ws://typo.example/CP-2.1".into(),
+                ocpp_identity: "CP-2.1".into(),
+                security: SecurityProfile::Basic {
+                    password: "hunter2".into(),
+                },
+            },
+        );
+        app.screen = Screen::Dashboard;
+        app.connection_failure = Some("connection refused".to_string());
+
+        app.handle_key_event(key(KeyCode::Char('r')));
+
+        assert_eq!(app.screen, Screen::ConnectionSetup);
+        assert_eq!(app.connection_csms_url.value(), "ws://typo.example/CP-2.1");
+        assert_eq!(app.connection_password.value(), "hunter2");
+        assert!(
+            app.connection_failure.is_none(),
+            "the failure has been acted on"
+        );
+    }
+
+    /// Not a general reconnect: a connected charger must not be torn down by a stray keypress, and a
+    /// 1.6J/2.0.1 charger never had a CSMS to retry against in the first place.
+    #[test]
+    fn r_does_nothing_when_there_is_no_failure_to_retry() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+
+        app.handle_key_event(key(KeyCode::Char('r')));
+
+        assert_eq!(app.screen, Screen::Dashboard);
+    }
+
+    #[test]
+    fn returning_to_the_picker_forgets_the_failure() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        app.screen = Screen::Dashboard;
+        app.connection_failure = Some("connection refused".to_string());
+
+        app.handle_key_event(key(KeyCode::Esc));
+
+        assert!(app.connection_failure.is_none());
     }
 
     #[test]

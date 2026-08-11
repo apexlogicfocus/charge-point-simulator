@@ -23,12 +23,12 @@ EVSE 1  ○ available   0.00 kW  0│ q           quit (confirm)                
 Logs────────────────────────────│ Tab/←/→     focus EVSE                               █────────────────────────────────
                                 │ Ctrl+K / c  commands + hardware actions              █
                                 │ d           toggle V2G discharge (if declared)       █
+                                │ r           retry a failed CSMS connection           █
                                 │                                                      █
                                 │Logs                                                  █
-                                │ PgUp/PgDn   scroll                                   █
+                                │ PgUp/PgDn   scroll                                   ║
                                 │ g / G       jump to oldest / newest                  ║
                                 │ /           filter (Esc clears)                      ║
                                 │ l           cycle level threshold                    ║
-                                │ Ctrl+L      clear logs                               ║
                                 └──────────────────────────────────────────────────────┘
 q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help

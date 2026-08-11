@@ -101,6 +101,10 @@ pub const SECTIONS: &[Section] = &[
                 keys: "d",
                 description: "toggle V2G discharge (if declared)",
             },
+            Binding {
+                keys: "r",
+                description: "retry a failed CSMS connection",
+            },
         ],
     },
     Section {

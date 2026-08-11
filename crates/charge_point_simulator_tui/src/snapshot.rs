@@ -464,6 +464,39 @@ fn dashboard_declared_capabilities_narrow() {
     );
 }
 
+/// A CSMS connection that failed: the header refusing to repeat the `booting` it was seeded with, and
+/// the `Connection` strip holding the reason and the way out. The reason this is a scenario at all is
+/// that none of it expires - the previous version of this state was a four-second toast over a header
+/// that then claimed the charger was booting indefinitely.
+#[test]
+fn dashboard_connection_failed() {
+    let config = charger_config(
+        "CP-2.1",
+        OcppVersion::V21,
+        vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }],
+        false,
+    );
+    let mut app = App::new(vec![]);
+    app.screen = Screen::Dashboard;
+    // Deliberately *not* `dashboard_app`, which seeds `Connected`: this scenario is about the state a
+    // failed dial actually leaves - `Booting`, from `ChargerState::from_config`, with a `LiveCsms`
+    // mode naming the CSMS that could not be reached.
+    let mut state = ChargerState::from_config(config);
+    state.mode = SimulationMode::LiveCsms {
+        url: "wss://csms.example.com/CP-2.1".into(),
+    };
+    app.charger_state = Some(state);
+    app.connection_failure = Some("handshake failed: certificate has expired".to_string());
+    app.logs.push(crate::logs::LogEntry::error(
+        "CSMS connection failed: handshake failed: certificate has expired",
+    ));
+
+    assert_snapshot("dashboard_connection_failed", &render(&mut app, 120, 34));
+}
+
 /// The command palette on the full-featured preset: protocol commands and hardware actions in one
 /// list, which is the whole point of the palette carrying both. The demo charger declares
 /// bidirectional power, firmware management and diagnostics, so every kind of row is visible at

@@ -1,0 +1,34 @@
+✕ connection failed  |  CP-2.1  |  OCPP 2.1  |  wss://csms.example.com/CP-2.1  |  up 0s  ·
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Connection──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+✕ handshake failed: certificate has expired
+r: edit the connection and retry    Esc: back to the charger list
+EVSEs (1/1)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
+EVSE 1  ○ available   0.00 kW  0.0 A  0.000 kWh                                         EVSE 1 / C1
+  ▸ C1  ○ available                                                                     ○ available
+                                                                                        no vehicle
+                                                                                        session  0s
+
+                                                                                        lock     released
+                                                                                        contact  open
+                                                                                        limit    none
+
+                                                                                        0.00 kW  0.0 A  0.000 kWh
+
+
+
+
+
+
+Logs────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+             ERROR   tui            CSMS connection failed: handshake failed: certificate has expired
+
+
+
+
+
+
+
+
+
+q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help

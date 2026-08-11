@@ -102,6 +102,22 @@ impl LogEntry {
     }
 }
 
+impl LogEntry {
+    /// A TUI-generated entry at [`LogLevel::Error`], for something the app itself needs to record as
+    /// a failure rather than merely narrate.
+    ///
+    /// `From<String>`/`From<&str>` (below) produce `Info` entries, which is right for the running
+    /// commentary most `LogBuffer::push` calls carry - but wrong for a failure: `Info` is what the
+    /// level threshold hides first (`l` cycles it), and the one line explaining why a charger never
+    /// connected must not be the one filtered away.
+    pub fn error(message: impl Into<String>) -> Self {
+        LogEntry {
+            level: LogLevel::Error,
+            ..LogEntry::from(message.into())
+        }
+    }
+}
+
 impl From<&str> for LogEntry {
     fn from(message: &str) -> Self {
         LogEntry {
@@ -345,6 +361,21 @@ impl Default for LogBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure has to survive the level threshold that hides the running commentary - see
+    /// `LogEntry::error`.
+    #[test]
+    fn an_error_entry_is_not_merely_an_info_entry_with_different_words() {
+        let error = LogEntry::error("CSMS connection failed: boom");
+
+        assert_eq!(error.level, LogLevel::Error);
+        assert_eq!(error.message, "CSMS connection failed: boom");
+        assert_eq!(
+            LogEntry::from("CSMS connection failed: boom".to_string()).level,
+            LogLevel::Info,
+            "the plain conversion stays Info, which is what most pushes want"
+        );
+    }
 
     fn messages(entries: Vec<&LogEntry>) -> Vec<String> {
         entries.into_iter().map(|e| e.message.clone()).collect()

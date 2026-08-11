@@ -33,6 +33,10 @@ pub struct DashboardLayout {
 /// [`render`]/[`tree_lines`]'s `inline_detail` parameter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyLayout {
+    /// Zero height unless the last CSMS connection attempt failed - see [`BodyStrips::connection`].
+    /// First of the strips, and taller than the others: it is the only one that reports something
+    /// broken, and it has to carry the reason as well as what to do about it.
+    pub connection: Rect,
     /// Zero height when the charger has no display - see [`BodyStrips::display`].
     pub display: Rect,
     /// Zero height for a charger that declares no capabilities at all - see
@@ -60,6 +64,9 @@ const DISPLAY_HEIGHT: u16 = 2;
 const CAMPAIGNS_HEIGHT: u16 = 2;
 /// Likewise: one row listing what the charger declares, under its own rule.
 const CAPABILITIES_HEIGHT: u16 = 2;
+/// Three rows, not two: a rule, the reason the connection failed, and what to do about it. The extra
+/// row is the point - an error with no next step leaves the user reading a dead end.
+const CONNECTION_HEIGHT: u16 = 3;
 const LOG_HEIGHT: u16 = 11;
 const COMMAND_BAR_HEIGHT: u16 = 1;
 
@@ -114,6 +121,9 @@ pub fn dashboard_layout(area: Rect) -> DashboardLayout {
 /// every charger most of the time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BodyStrips {
+    /// The last CSMS connection attempt failed and hasn't been retried - see
+    /// `App::connection_failure`.
+    pub connection: bool,
     /// The charger has a display (`ChargerConfig::has_display`), so there is a message - or a
     /// deliberate `(blank)` - to show.
     pub display: bool,
@@ -130,8 +140,10 @@ pub struct BodyStrips {
 pub(crate) fn body_strips_for(
     charger: Option<&ChargerState>,
     campaigns: &CampaignProgress,
+    connection_failure: Option<&str>,
 ) -> BodyStrips {
     BodyStrips {
+        connection: connection_failure.is_some(),
         display: charger.is_some_and(|state| state.config.has_display),
         capabilities: charger.is_some_and(|state| !capability_labels(&state.config).is_empty()),
         campaigns: campaigns.is_active(),
@@ -144,7 +156,8 @@ pub(crate) fn body_strips_for(
 /// caller renders the same detail inline instead (see [`render`]).
 pub fn body_layout(body: Rect, strips: BodyStrips) -> BodyLayout {
     let height = |wanted: bool, height: u16| if wanted { height } else { 0 };
-    let [display, capabilities, campaigns, rest] = Layout::vertical([
+    let [connection, display, capabilities, campaigns, rest] = Layout::vertical([
+        Constraint::Length(height(strips.connection, CONNECTION_HEIGHT)),
         Constraint::Length(height(strips.display, DISPLAY_HEIGHT)),
         Constraint::Length(height(strips.capabilities, CAPABILITIES_HEIGHT)),
         Constraint::Length(height(strips.campaigns, CAMPAIGNS_HEIGHT)),
@@ -156,6 +169,7 @@ pub fn body_layout(body: Rect, strips: BodyStrips) -> BodyLayout {
         let [tree, sidebar] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(SIDEBAR_WIDTH)]).areas(rest);
         BodyLayout {
+            connection,
             display,
             capabilities,
             campaigns,
@@ -164,6 +178,7 @@ pub fn body_layout(body: Rect, strips: BodyStrips) -> BodyLayout {
         }
     } else {
         BodyLayout {
+            connection,
             display,
             capabilities,
             campaigns,
@@ -250,6 +265,25 @@ fn mode_text(state: &ChargerState) -> String {
     }
 }
 
+/// What the header's status slot should say about the CSMS link, which is not always what
+/// `ChargerState::connection_status` holds.
+///
+/// [`Self::Failed`] exists because a charger whose dial failed keeps whatever status it was seeded
+/// with - `Booting` - forever: the connection thread exited, so no snapshot will ever arrive to
+/// correct it, and `apply_ocpp_state` is the only thing that writes that field. Rendering it would
+/// mean showing "booting" for a charger that is not booting and never will be, which is the exact
+/// "truth in the status bar" failure this enum exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkState {
+    /// A connection attempt is in flight (`App::connect_result_receiver` is `Some`).
+    Connecting,
+    /// The last attempt failed and nothing has been done about it yet - see
+    /// `App::connection_failure`.
+    Failed,
+    /// Whatever the charger itself reports. The normal case, including a local charger's `Offline`.
+    Reported,
+}
+
 /// Builds the header line's content as `(text, style)` segments, laid out left to right and
 /// trimmed to fit `width` columns.
 ///
@@ -259,23 +293,31 @@ fn mode_text(state: &ChargerState) -> String {
 ///    important addition this header makes, so it's kept as long as there's any room for it.
 /// 3. **status glyph/label, charger id, and OCPP version** - the floor, never dropped. Without
 ///    these there's no way to tell which charger is even on screen or whether it's healthy.
-fn header_segments(state: &ChargerState, connecting: bool, width: usize) -> Vec<(String, Style)> {
+fn header_segments(state: &ChargerState, link: LinkState, width: usize) -> Vec<(String, Style)> {
     // While a connection attempt is pending, an animated spinner (driven by simulated
     // `uptime`, never wall-clock time - see `connecting_spinner_frame`) replaces the normal
     // status glyph: `connection_status` itself is still `Booting` at this point (the OCPP
     // bridge hasn't reported anything yet), so without this the header would sit static and
     // give no feedback that anything is happening.
-    let status: Vec<(String, Style)> = if connecting {
-        let connecting_style = theme::connection_style(ConnectionStatus::Booting);
-        vec![
-            (
-                theme::glyph_field(connecting_spinner_frame(state.uptime)),
-                connecting_style,
-            ),
-            ("connecting...".to_string(), connecting_style),
-        ]
-    } else {
-        vec![
+    let status: Vec<(String, Style)> = match link {
+        LinkState::Connecting => {
+            let connecting_style = theme::connection_style(ConnectionStatus::Booting);
+            vec![
+                (
+                    theme::glyph_field(connecting_spinner_frame(state.uptime)),
+                    connecting_style,
+                ),
+                ("connecting...".to_string(), connecting_style),
+            ]
+        }
+        // Never `state.connection_status` here - see `LinkState::Failed`. The `✕` glyph is the one
+        // `Offline` uses, since both mean "there is no link", and the error color plus the word
+        // separate a dial that failed from a charger that never tried.
+        LinkState::Failed => vec![
+            (theme::glyph_field("✕"), theme::error()),
+            ("connection failed".to_string(), theme::error()),
+        ],
+        LinkState::Reported => vec![
             (
                 theme::glyph_field(theme::connection_glyph(state.connection_status)),
                 theme::connection_style(state.connection_status),
@@ -284,7 +326,7 @@ fn header_segments(state: &ChargerState, connecting: bool, width: usize) -> Vec<
                 state.connection_status.to_string(),
                 theme::connection_style(state.connection_status),
             ),
-        ]
+        ],
     };
 
     let mut base = status;
@@ -817,6 +859,47 @@ fn render_scrollbar(frame: &mut Frame, area: Rect, max_offset: usize, position: 
     );
 }
 
+/// The `Connection` strip's two content lines: why the last CSMS connection attempt failed, and what
+/// can be done about it.
+///
+/// The reason comes straight from `connect_charger`'s error, unabridged apart from fitting the width -
+/// a CSMS URL typo, a refused TLS handshake and a rejected password are three different problems and
+/// the words are what tell them apart. The second line is the part a bare error message leaves out:
+/// after a failed dial nothing else will happen on this screen, so if it doesn't say `r` and `Esc`,
+/// the user is looking at a dead end.
+fn connection_failure_lines(error: &str, width: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("✕ ", theme::error()),
+            Span::styled(
+                truncate_to_width(error, width.saturating_sub(2)),
+                theme::error(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("r", theme::accent()),
+            Span::styled(": edit the connection and retry    ", theme::text_dim()),
+            Span::styled("Esc", theme::accent()),
+            Span::styled(": back to the charger list", theme::text_dim()),
+        ]),
+    ]
+}
+
+/// Cuts `text` to `width` columns, marking the cut with `…` so a truncated CSMS error can't be read
+/// as the whole of it. Same rule as the picker's column truncation, which has its own copy for the
+/// same reason: a silent clip is worse than a visible one.
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut truncated: String = text.chars().take(width - 1).collect();
+    truncated.push('…');
+    truncated
+}
+
 /// Short labels for every capability `config` declares, in a deliberate order: the ones whose
 /// behavior a user can watch happen on this screen first, then the ones that only change what the
 /// charger tells a CSMS.
@@ -1019,7 +1102,7 @@ fn focused_connector(
 }
 
 pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
-    let strips = body_strips_for(view.charger, &view.campaigns);
+    let strips = body_strips_for(view.charger, &view.campaigns, view.connection_failure);
     let has_display = strips.display;
     let layout = dashboard_layout(frame.area());
     let body = body_layout(layout.body, strips);
@@ -1040,6 +1123,17 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
         frame.render_widget(
             Paragraph::new(line).block(theme::section("Display", focused)),
             body.display,
+        );
+    }
+
+    if let Some(error) = view.connection_failure.filter(|_| strips.connection) {
+        frame.render_widget(
+            Paragraph::new(connection_failure_lines(
+                error,
+                body.connection.width as usize,
+            ))
+            .block(theme::section("Connection", focused)),
+            body.connection,
         );
     }
 
@@ -1066,9 +1160,16 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
         );
     }
 
+    // A pending attempt outranks a previous failure: if one is in flight, the spinner is the true
+    // answer to "what is this link doing", and the strip below still carries the failure it replaced.
+    let link = match (view.connecting, view.connection_failure) {
+        (true, _) => LinkState::Connecting,
+        (false, Some(_)) => LinkState::Failed,
+        (false, None) => LinkState::Reported,
+    };
     let header_line = match view.charger {
         Some(state) => {
-            let segments = header_segments(state, view.connecting, layout.header.width as usize);
+            let segments = header_segments(state, link, layout.header.width as usize);
             Line::from(
                 segments
                     .into_iter()
@@ -1520,7 +1621,7 @@ mod tests {
     #[test]
     fn header_segments_show_local_simulation_for_a_local_charger() {
         let state = charger_state_for_header("CP-CHARGE");
-        let text = segments_text(&header_segments(&state, false, 120));
+        let text = segments_text(&header_segments(&state, LinkState::Reported, 120));
 
         assert!(text.contains("CP-CHARGE"));
         assert!(text.contains("local simulation"));
@@ -1532,7 +1633,7 @@ mod tests {
         state.mode = SimulationMode::LiveCsms {
             url: "wss://csms.example.com".to_string(),
         };
-        let text = segments_text(&header_segments(&state, false, 120));
+        let text = segments_text(&header_segments(&state, LinkState::Reported, 120));
 
         assert!(text.contains("wss://csms.example.com"));
         assert!(!text.contains("local simulation"));
@@ -1541,7 +1642,7 @@ mod tests {
     #[test]
     fn header_segments_show_a_spinner_and_connecting_while_a_connect_attempt_is_pending() {
         let state = charger_state_for_header("CP-CHARGE");
-        let text = segments_text(&header_segments(&state, true, 120));
+        let text = segments_text(&header_segments(&state, LinkState::Connecting, 120));
 
         assert!(text.contains("connecting..."));
         // The normal connection-status label (the fresh charger is `Booting`) is replaced,
@@ -1553,7 +1654,7 @@ mod tests {
     fn header_segments_show_the_heartbeat_pulse_alongside_uptime_when_there_is_room() {
         let mut state = charger_state_for_header("CP-CHARGE");
         state.uptime = Duration::from_millis(600);
-        let text = segments_text(&header_segments(&state, false, 120));
+        let text = segments_text(&header_segments(&state, LinkState::Reported, 120));
 
         assert!(text.contains("up 0s"));
         assert!(text.contains(heartbeat_pulse_frame(state.uptime)));
@@ -1569,7 +1670,7 @@ mod tests {
         state.uptime = Duration::from_secs(4 * 60 + 12);
 
         // A width of 0 always returns just the never-dropped floor.
-        let base = header_segments(&state, false, 0);
+        let base = header_segments(&state, LinkState::Reported, 0);
         let base_width: usize = base.iter().map(|(text, _)| text.chars().count()).sum();
 
         let mode_only_width =
@@ -1582,11 +1683,19 @@ mod tests {
                 .chars()
                 .count();
 
-        let everything = segments_text(&header_segments(&state, false, with_uptime_width));
+        let everything = segments_text(&header_segments(
+            &state,
+            LinkState::Reported,
+            with_uptime_width,
+        ));
         assert!(everything.contains("local simulation"));
         assert!(everything.contains("up 4m 12s"));
 
-        let mode_only = segments_text(&header_segments(&state, false, with_uptime_width - 1));
+        let mode_only = segments_text(&header_segments(
+            &state,
+            LinkState::Reported,
+            with_uptime_width - 1,
+        ));
         assert!(
             mode_only.contains("local simulation"),
             "mode should still fit: {mode_only:?}"
@@ -1596,7 +1705,11 @@ mod tests {
             "uptime should have been dropped: {mode_only:?}"
         );
 
-        let floor_only = segments_text(&header_segments(&state, false, mode_only_width - 1));
+        let floor_only = segments_text(&header_segments(
+            &state,
+            LinkState::Reported,
+            mode_only_width - 1,
+        ));
         assert!(
             !floor_only.contains("local simulation"),
             "mode should have been dropped: {floor_only:?}"
@@ -1605,6 +1718,85 @@ mod tests {
             floor_only.contains("CP-CHARGE"),
             "the id/status floor must never be dropped: {floor_only:?}"
         );
+    }
+
+    // --- a failed CSMS connection -----------------------------------------------------------
+
+    /// The bug this fixes: after a failed dial the connection thread is gone, so nothing will ever
+    /// write `connection_status` again and the charger sits there reporting the `Booting` it was
+    /// seeded with. The header must not repeat it.
+    #[test]
+    fn the_header_says_the_connection_failed_rather_than_repeating_a_stale_booting() {
+        let state = charger_state_for_header("CP-2.1");
+        assert_eq!(
+            state.connection_status,
+            ConnectionStatus::Booting,
+            "the state a failed dial leaves behind"
+        );
+
+        let failed = segments_text(&header_segments(&state, LinkState::Failed, 120));
+        assert!(failed.contains("connection failed"), "{failed}");
+        assert!(!failed.contains("booting"), "{failed}");
+
+        // And the charger id and mode are still there: which charger, and which CSMS it was.
+        assert!(failed.contains("CP-2.1"), "{failed}");
+    }
+
+    /// A retry in flight outranks the failure it is retrying: the spinner is the live answer.
+    #[test]
+    fn a_pending_retry_shows_the_spinner_rather_than_the_previous_failure() {
+        let state = charger_state_for_header("CP-2.1");
+        let connecting = segments_text(&header_segments(&state, LinkState::Connecting, 120));
+
+        assert!(connecting.contains("connecting..."), "{connecting}");
+        assert!(!connecting.contains("connection failed"), "{connecting}");
+    }
+
+    #[test]
+    fn the_connection_strip_is_only_allotted_rows_when_something_failed() {
+        let state = charger_state_for_header("CP-2.1");
+        let campaigns = CampaignProgress::default();
+
+        let healthy = body_strips_for(Some(&state), &campaigns, None);
+        assert!(!healthy.connection);
+        assert_eq!(body_layout(area(120, 30), healthy).connection.height, 0);
+
+        let failed = body_strips_for(Some(&state), &campaigns, Some("connection refused"));
+        assert!(failed.connection);
+        assert!(body_layout(area(120, 30), failed).connection.height > 0);
+    }
+
+    /// The strip carries the reason *and* the way out. An error with no next step is a dead end, and
+    /// after a failed dial nothing else on this screen will ever change on its own.
+    #[test]
+    fn the_connection_strip_names_the_error_and_what_to_do_about_it() {
+        let text = lines_text(&connection_failure_lines(
+            "handshake failed: certificate has expired",
+            120,
+        ));
+
+        assert!(
+            text.contains("handshake failed: certificate has expired"),
+            "{text}"
+        );
+        assert!(text.contains("retry"), "{text}");
+        assert!(text.contains("Esc"), "{text}");
+    }
+
+    /// A truncated error must say it was truncated: three different CSMS problems can share a prefix,
+    /// and a silently clipped one reads as the whole message.
+    #[test]
+    fn a_long_error_is_truncated_visibly_and_never_overflows_the_strip() {
+        let error = "x".repeat(200);
+        let lines = connection_failure_lines(&error, 40);
+        let first = lines_text(&lines[..1]);
+
+        assert!(
+            first.chars().count() <= 40,
+            "{} columns",
+            first.chars().count()
+        );
+        assert!(first.ends_with('…'), "{first}");
     }
 
     // --- the power sparkline (settled decision 2) ------------------------------------------
@@ -1714,7 +1906,7 @@ mod tests {
         assert!(capability_labels(&config).is_empty());
 
         let state = ChargerState::from_config(config);
-        let strips = body_strips_for(Some(&state), &CampaignProgress::default());
+        let strips = body_strips_for(Some(&state), &CampaignProgress::default(), None);
         assert!(!strips.capabilities);
         assert_eq!(
             body_layout(area(120, 30), strips).capabilities.height,

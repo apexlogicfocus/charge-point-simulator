@@ -35,6 +35,10 @@ pub struct DashboardView<'a> {
     /// with the prompt closed is read from `logs` instead.
     pub log_filter_input: Option<&'a str>,
     pub status_message: Option<(StatusSeverity, &'a str)>,
+    /// Why the last CSMS connection attempt failed, if it did and nothing has been done about it -
+    /// see `App::connection_failure`. Drives both the `Connection` strip and the header's refusal to
+    /// keep reporting a `connection_status` that can no longer change.
+    pub connection_failure: Option<&'a str>,
     /// Charger-wide firmware/file-transfer activity - see `App::campaigns`. Copied rather than
     /// borrowed: it is a handful of `Copy` fields, unlike the `ChargerState` above.
     pub campaigns: CampaignProgress,
@@ -53,6 +57,7 @@ impl<'a> DashboardView<'a> {
                 .as_ref()
                 .map(|toast| (toast.severity, toast.message.as_str())),
             campaigns: app.campaigns,
+            connection_failure: app.connection_failure.as_deref(),
         }
     }
 }
