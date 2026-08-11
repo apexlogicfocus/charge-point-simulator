@@ -10,8 +10,11 @@ use ocpp_charge_point::clock::{Clock, MonotonicClock, SystemClock, SystemMonoton
 use ocpp_charge_point::connection::ReconnectHandler;
 use ocpp_charge_point::cost::CostUpdatedHandler;
 use ocpp_charge_point::device_model::{GetVariablesHandler, SetVariablesHandler};
+use ocpp_charge_point::display_message::{
+    ClearDisplayMessageHandler, GetDisplayMessagesHandler, SetDisplayMessageHandler,
+};
 use ocpp_charge_point::executor::{Executor, TokioExecutor};
-use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
+use ocpp_charge_point::hardware::{ChargePoint, Connector, Display, Evse, Storage};
 use ocpp_charge_point::local_authorization_list::{
     GetLocalListVersionHandler, SendLocalListHandler,
 };
@@ -23,6 +26,7 @@ use ocpp_charge_point::periodic_event_stream::{
     AdjustPeriodicEventStreamHandler, ClosePeriodicEventStreamHandler,
     GetPeriodicEventStreamHandler, OpenPeriodicEventStreamHandler, PeriodicEventStreamNotifier,
 };
+use ocpp_charge_point::persistence::{QueueStore, SecurityLogStore};
 use ocpp_charge_point::provisioning::{Backoff, BootNotifier, HeartbeatSender, TokioBackoff};
 use ocpp_charge_point::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, TriggerMessageHandler,
@@ -33,7 +37,7 @@ use ocpp_charge_point::reservation::{
     CancelReservationHandler, ReservationStatusNotifier, ReserveNowHandler,
 };
 use ocpp_charge_point::reset::ResetHandler;
-use ocpp_charge_point::security::SecurityEventNotifier;
+use ocpp_charge_point::security::{SecurityEventLog, SecurityEventNotifier};
 use ocpp_charge_point::smart_charging::{
     ChargingLimitProjection, ClearChargingProfileHandler, GetChargingProfilesHandler,
     GetCompositeScheduleHandler, SetChargingProfileHandler,
@@ -50,7 +54,7 @@ use ocpp_client::{ConnectOptions, NegotiatedClient, OcppVersion};
 
 use super::config::ChargerConfig;
 use super::connection::{ConnectionProfile, SecurityProfile};
-use super::hardware::FakeChargePoint;
+use super::hardware::{FakeChargePoint, FakeDisplay, FileStorage};
 use super::hardware_bundle::ChargerHardware;
 
 /// Builds the WebSocket URL to dial for `ocpp_identity`, given the CSMS's configured base
@@ -74,24 +78,64 @@ pub fn websocket_url(base_url: &str, ocpp_identity: &str) -> String {
 /// gated in six `if capabilities.*` blocks (reservation +
 /// reservation_status_updates; local_authorization_list; cost + tariffs; smart_charging +
 /// charging_profile_reports; variable_monitoring + monitoring_reports +
-/// variable_monitor_events; periodic_event_streams).
+/// variable_monitor_events; periodic_event_streams) - plus, beyond what `setup()` itself knows how
+/// to do at all (see below), storage-backed persistence and display messages, each gated on its
+/// own `Capabilities` flag and on `hardware` actually supplying the matching object.
 ///
 /// Unlike `setup()`, this stops short of `offline_queue_retries`/`build()`: the whole reason
 /// `connect_charger` drives the builder by hand instead of calling `setup()` is that `setup()`
 /// seals the builder into a [`ChargePointRuntime`] before returning, with no hook left to add a
 /// registration afterwards. Returning the still-open builder is what lets `connect_charger` add
-/// OCPP 2.1's extra blocks `setup()` cannot know about (see its caller), and lets future
-/// [`ChargerHardware`] fields (H5b/H6b) add their own registrations before the builder is
-/// finally sealed - without another breaking signature change.
+/// OCPP 2.1's extra blocks `setup()` cannot know about (see its caller).
+///
+/// # Persistence (H5b) and display (H6b)
+///
+/// `setup()` has no `Storage`/`Display` parameter at all - it cannot persist anything or drive a
+/// screen, on any capability. Reaching either is the entire reason this function exists instead of
+/// calling `setup()` directly (H2). `storage`/`display` come from [`ChargerHardware`]; each
+/// persistence/display registration only fires when **both** the matching `Capabilities` flag is
+/// set and the object is actually present - `storage`/`display` are pre-filtered by capability
+/// once, at the top, specifically so every call site below can just check `is_some()` without
+/// re-deriving that combination. A capability declared `true` with nothing behind it logs a
+/// warning and registers nothing, rather than panicking on a method call it has no value to make.
+///
+/// Three of the nine storage-backed registrations upstream exposes -
+/// `status_notifications`/`transaction_events`/`security_events` each have a `_persisted`
+/// sibling - are **not** simply added alongside the plain calls above: each plain/persisted pair
+/// consumes the same single-use broadcast subscription (`take_status_changes`/
+/// `take_transaction_events`/`take_security_events` on the builder), so calling both would not
+/// double-register anything loud - the second call finds the subscription already taken and
+/// silently no-ops, which is a *worse* failure than a compile error, because persistence would
+/// appear registered and simply never run. `setup()` itself only ever calls the plain form (it has
+/// no storage to hand a `_persisted` call anyway), so this function keeps that as the default and
+/// switches to the `_persisted` form - never both - exactly when persistence is available, per
+/// block. The other six storage-backed methods
+/// (`boot_reason_persistence`/`transaction_persistence`/`authorization_cache_persistence`/
+/// `network_profile_persistence`/`device_model_persistence`/`security_log_persisted`) and the
+/// three that are additionally gated behind their own functional block's capability
+/// (`reservation_persistence`/`local_authorization_list_persistence`/
+/// `charging_profile_persistence`) have no such conflict - each is documented as safe to call
+/// alongside its sibling registration, independent of every other `*_persistence` method - so they
+/// are simply added, ordered per each method's own "call this before ..." doc requirement (e.g.
+/// `boot_reason_persistence` before `provisioning`, `authorization_cache_persistence` before
+/// `authorization`).
 ///
 /// Generic over the CSMS client `N`, exactly like `setup()` is, so this same function - not a
-/// reimplementation of it - is what the equivalence test below runs against a fake CSMS.
-async fn register_setup_blocks<T, E, C, N, X, B, M, K>(
+/// reimplementation of it - is what the equivalence test below runs against a fake CSMS. Also
+/// generic over the storage/display types (`S`/`D`), rather than fixed to `FileStorage`/
+/// `FakeDisplay`, for the same reason: the equivalence tests below substitute a call-recording
+/// fake storage to observe *which* persistence blocks actually registered, the same way
+/// `RecordingCsms` does for CSMS-facing ones - a signal plain vs. `_persisted` registration has no
+/// other way to expose, since neither ever calls a `register_*` method distinguishable from the
+/// other (see the doc comment above).
+async fn register_setup_blocks<T, E, C, N, X, B, M, K, S, D>(
     mut builder: ChargePointBuilder<T, X>,
     csms: &N,
     backoff: B,
     monotonic: M,
     clock: K,
+    storage: Option<&S>,
+    display: Option<D>,
 ) -> ChargePointBuilder<T, X>
 where
     T: ChargePoint<E, C>,
@@ -142,6 +186,9 @@ where
         + GetPeriodicEventStreamHandler
         + PeriodicEventStreamNotifier
         + ReconnectHandler
+        + SetDisplayMessageHandler
+        + GetDisplayMessagesHandler
+        + ClearDisplayMessageHandler
         + Clone
         + Send
         + Sync
@@ -150,22 +197,90 @@ where
     B: Backoff + Clone + Send + Sync + 'static,
     M: MonotonicClock + Clone + Send + Sync + 'static,
     K: Clock + Clone + Send + Sync + 'static,
+    S: Storage + Clone + Send + Sync + 'static,
+    D: Display + Send + Sync + 'static,
 {
+    // C3.1 upstream: each of these blocks only registers when the hardware actually declared the
+    // matching capability - an absent capability means the CSMS gets `NotImplemented` rather than
+    // a handler backed by hardware that can't do the thing. Read once, up front: `capabilities()`
+    // only reads a field the builder cached at `start()`, so nothing below it needs to have run
+    // yet for this to be accurate.
+    let capabilities = builder.capabilities();
+    if capabilities.has_persistent_storage && storage.is_none() {
+        tracing::warn!(
+            "the charger declares has_persistent_storage but ChargerHardware has no storage - \
+             persistence will not be registered"
+        );
+    }
+    if capabilities.has_display && display.is_none() {
+        tracing::warn!(
+            "the charger declares has_display but ChargerHardware has no display - display \
+             messages will not be registered"
+        );
+    }
+    // Pre-filtered by capability, once - see the doc comment above. Every later `if let
+    // Some(storage) = storage` below is therefore already "declared and backed", with no
+    // capability check duplicated at the call site.
+    let storage = storage.filter(|_| capabilities.has_persistent_storage);
+    let display = display.filter(|_| capabilities.has_display);
+
+    if let Some(storage) = storage {
+        builder = builder.boot_reason_persistence(storage.clone()).await;
+    }
+    builder = builder.provisioning(csms, backoff.clone(), monotonic).await;
+
+    if let Some(storage) = storage {
+        builder = builder
+            .transaction_persistence(storage.clone(), clock.clone())
+            .await;
+    }
+    builder = if let Some(storage) = storage {
+        builder
+            .status_notifications_persisted(csms, QueueStore::new(storage.clone(), "status"))
+            .await
+    } else {
+        builder.status_notifications(csms).await
+    };
+    builder = if let Some(storage) = storage {
+        builder
+            .transaction_events_persisted(csms, QueueStore::new(storage.clone(), "transaction"))
+            .await
+    } else {
+        builder.transaction_events(csms).await
+    };
+
+    if let Some(storage) = storage {
+        builder = builder
+            .authorization_cache_persistence(storage.clone())
+            .await;
+    }
+    builder = builder.authorization(csms, clock.clone()).await;
+
+    builder = builder.clear_cache(csms).await;
+
+    if let Some(storage) = storage {
+        builder = builder.network_profile_persistence(storage.clone()).await;
+    }
+    builder = builder.network_profiles(csms).await;
+
+    builder = if let Some(storage) = storage {
+        builder
+            .security_events_persisted(csms, QueueStore::new(storage.clone(), "security"))
+            .await
+    } else {
+        builder.security_events(csms).await
+    };
+    if let Some(storage) = storage {
+        builder = builder
+            .security_log_persisted(
+                Arc::new(SecurityEventLog::new()),
+                SecurityLogStore::new(storage.clone()),
+                clock.clone(),
+            )
+            .await;
+    }
+
     builder = builder
-        .provisioning(csms, backoff.clone(), monotonic)
-        .await
-        .status_notifications(csms)
-        .await
-        .transaction_events(csms)
-        .await
-        .authorization(csms, clock.clone())
-        .await
-        .clear_cache(csms)
-        .await
-        .network_profiles(csms)
-        .await
-        .security_events(csms)
-        .await
         .remote_control(csms)
         .await
         .trigger_message(csms)
@@ -173,17 +288,23 @@ where
         .availability_control(csms)
         .await
         .reset(csms)
-        .await
+        .await;
+
+    if let Some(storage) = storage {
+        builder = builder.device_model_persistence(storage.clone()).await;
+    }
+    builder = builder
         .device_model(csms)
         .await
         .meter_values(csms, backoff.clone(), clock.clone())
         .await;
 
-    // C3.1 upstream: each of these blocks only registers when the hardware actually declared the
-    // matching capability - an absent capability means the CSMS gets `NotImplemented` rather than
-    // a handler backed by hardware that can't do the thing.
-    let capabilities = builder.capabilities();
     if capabilities.reservation {
+        if let Some(storage) = storage {
+            builder = builder
+                .reservation_persistence(storage.clone(), clock.clone())
+                .await;
+        }
         builder = builder.reservation(csms).await.reservation_status_updates(
             csms,
             clock.clone(),
@@ -192,12 +313,22 @@ where
         );
     }
     if capabilities.local_auth_list {
+        if let Some(storage) = storage {
+            builder = builder
+                .local_authorization_list_persistence(storage.clone())
+                .await;
+        }
         builder = builder.local_authorization_list(csms).await;
     }
     if capabilities.tariff_and_cost {
         builder = builder.cost(csms).await.tariffs(csms).await;
     }
     if capabilities.smart_charging {
+        if let Some(storage) = storage {
+            builder = builder
+                .charging_profile_persistence(storage.clone(), clock.clone())
+                .await;
+        }
         builder = builder
             .smart_charging(
                 csms,
@@ -223,6 +354,10 @@ where
             .await;
     }
 
+    if let Some(display) = display {
+        builder = builder.display_messages(csms, display).await;
+    }
+
     builder
 }
 
@@ -238,16 +373,14 @@ where
 /// `connect_and_setup` calls for a 2.1 session) returns an already-sealed
 /// [`ChargePointRuntime`], with no way to register anything - including optional hardware like
 /// `Storage`/`Display` - afterwards. Driving the builder ourselves keeps it open long enough to
-/// add both OCPP 2.1's own extra blocks and, once `ChargerHardware` grows fields, the simulator's
-/// optional hardware.
+/// add both OCPP 2.1's own extra blocks and `hardware`'s storage/display registrations (H5b/H6b) -
+/// see [`register_setup_blocks`]'s doc comment for how those are gated.
 pub async fn connect_charger(
     config: &ChargerConfig,
     profile: &ConnectionProfile,
     hardware: ChargerHardware,
 ) -> Result<ChargePointRuntime<FakeChargePoint>, ConnectAndSetupError<Infallible>> {
-    // No fields yet - see `ChargerHardware`'s docs for why it exists ahead of them anyway. Named
-    // (rather than `_hardware`) so a future field lands here as a used binding, not a warning.
-    let ChargerHardware {} = hardware;
+    let ChargerHardware { storage, display } = hardware;
 
     let charge_point = FakeChargePoint::from_config(config);
     let url = websocket_url(&profile.csms_url, &profile.ocpp_identity);
@@ -281,7 +414,7 @@ pub async fn connect_charger(
     match negotiated {
         NegotiatedClient::V2_1(client) => {
             target.set_version(OcppVersion::V2_1);
-            connect_ocpp_2_1(charge_point, client, target).await
+            connect_ocpp_2_1(charge_point, client, target, storage, display).await
         }
         NegotiatedClient::V2_0_1(_) => Err(ConnectAndSetupError::UnsupportedNegotiatedVersion(
             OcppVersion::V2_0_1,
@@ -319,6 +452,8 @@ async fn connect_ocpp_2_1(
     charge_point: FakeChargePoint,
     client: ocpp_client::ocpp_2_1::OCPP2_1Client,
     target: Arc<ConnectionTarget>,
+    storage: Option<FileStorage>,
+    display: Option<FakeDisplay>,
 ) -> Result<ChargePointRuntime<FakeChargePoint>, ConnectAndSetupError<Infallible>> {
     let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
         .await
@@ -330,6 +465,8 @@ async fn connect_ocpp_2_1(
         TokioBackoff,
         SystemMonotonicClock,
         SystemClock,
+        storage.as_ref(),
+        display,
     )
     .await;
 
@@ -348,7 +485,7 @@ async fn connect_ocpp_2_1(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::charger::config::OcppVersion as SimOcppVersion;
+    use crate::charger::config::{CapabilitiesConfig, OcppVersion as SimOcppVersion};
     use ocpp_charge_point::actor::ChargePointActor;
     use ocpp_charge_point::provisioning::BootNotificationOutcome;
     use ocpp_charge_point::state::{
@@ -841,6 +978,31 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl SetDisplayMessageHandler for RecordingCsms {
+        async fn register_set_display_message_handler(
+            &self,
+            _actor: ChargePointActor,
+            _supported_formats: Vec<ocpp_charge_point::state::MessageFormat>,
+        ) {
+            self.record("set_display_message");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GetDisplayMessagesHandler for RecordingCsms {
+        async fn register_get_display_messages_handler(&self, _actor: ChargePointActor) {
+            self.record("get_display_messages");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClearDisplayMessageHandler for RecordingCsms {
+        async fn register_clear_display_message_handler(&self, _actor: ChargePointActor) {
+            self.record("clear_display_message");
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ReconnectHandler for RecordingCsms {
         async fn register_reconnect_handler<F, FF>(&self, _callback: F)
         where
@@ -848,6 +1010,77 @@ mod tests {
             FF: core::future::Future<Output = ()> + Send + 'static,
         {
             self.record("reconnect");
+        }
+    }
+
+    // --- `RecordingStorage`: the persistence-side counterpart of `RecordingCsms` --------------
+    //
+    // None of the nine storage-backed registrations (`boot_reason_persistence`,
+    // `transaction_persistence`, ...) ever call a `register_*` method on the CSMS - they only
+    // touch storage, restoring on registration and persisting on every subsequent change. So
+    // `RecordingCsms`'s call log can't see whether one fired at all, and for the three blocks
+    // with a `_persisted` sibling (`status_notifications`/`transaction_events`/
+    // `security_events`), it's the *only* way to prove the persisted form actually ran rather
+    // than the plain form (both register exactly one `reconnect` handler - see
+    // `register_setup_blocks`'s doc comment for why that count alone can't distinguish them).
+    // `RecordingStorage` logs every `get` call's key - every restore calls `get` at least once,
+    // even to find nothing there - so a key showing up here is direct proof its registration
+    // executed.
+    #[derive(Clone, Default)]
+    struct RecordingStorage {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingStorage {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn get_calls(&self) -> Vec<String> {
+            self.calls.lock().expect("lock poisoned").clone()
+        }
+
+        fn was_queried(&self, needle: &str) -> bool {
+            self.get_calls().iter().any(|key| key.contains(needle))
+        }
+
+        fn query_count(&self, needle: &str) -> usize {
+            self.get_calls()
+                .iter()
+                .filter(|key| key.contains(needle))
+                .count()
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingStorageError;
+
+    impl std::fmt::Display for RecordingStorageError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "recording storage never actually fails")
+        }
+    }
+
+    impl std::error::Error for RecordingStorageError {}
+
+    #[async_trait::async_trait]
+    impl Storage for RecordingStorage {
+        type Error = RecordingStorageError;
+
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.calls
+                .lock()
+                .expect("lock poisoned")
+                .push(key.to_string());
+            Ok(None)
+        }
+
+        async fn set(&self, _key: &str, _value: &[u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn remove(&self, _key: &str) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 
@@ -869,12 +1102,18 @@ mod tests {
             ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
                 .await
                 .expect("starting the fake hardware never fails");
+        // Real hardware is supplied, but every capability is false - `register_setup_blocks` must
+        // produce exactly the same session as if `storage`/`display` were `None`, proving hardware
+        // presence alone never registers anything the charger didn't declare (H5b/H6b's gating
+        // requirement).
         let our_builder = register_setup_blocks(
             our_builder,
             &RecordingCsms::new(),
             TokioBackoff,
             SystemMonotonicClock,
             SystemClock,
+            Some(&RecordingStorage::new()),
+            Some(FakeDisplay::new()),
         )
         .await;
         let our_runtime = our_builder.offline_queue_retries(TokioBackoff, 60).build();
@@ -904,6 +1143,7 @@ mod tests {
      {
         let config = all_false_capabilities_config();
         let csms = RecordingCsms::new();
+        let storage = RecordingStorage::new();
 
         let builder =
             ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
@@ -915,6 +1155,8 @@ mod tests {
             TokioBackoff,
             SystemMonotonicClock,
             SystemClock,
+            Some(&storage),
+            Some(FakeDisplay::new()),
         )
         .await;
         let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
@@ -983,5 +1225,190 @@ mod tests {
                 "expected `{block}` to stay unregistered when its capability is false"
             );
         }
+
+        // H5b/H6b: real storage and display were supplied above, but nothing was declared, so
+        // neither persistence nor display messages should have registered anything either.
+        assert!(
+            storage.get_calls().is_empty(),
+            "expected no storage reads at all when has_persistent_storage is false, got {:?}",
+            storage.get_calls()
+        );
+        for block in [
+            "set_display_message",
+            "get_display_messages",
+            "clear_display_message",
+        ] {
+            assert!(
+                !csms.called(block),
+                "expected `{block}` to stay unregistered when has_display is false"
+            );
+        }
+    }
+
+    /// A charger declaring `has_persistent_storage` must additionally register every
+    /// storage-backed block: the six independent ones plus the two gated behind their own
+    /// functional-block capability - but neither of those two here, since `reservation`/
+    /// `local_auth_list`/`smart_charging` are still false. `security_log_persisted` and the three
+    /// dual-form blocks (`status_notifications`/`transaction_events`/`security_events`, each
+    /// switched to their `_persisted` sibling) are the ones most at risk of the "silently
+    /// no-ops" trap `register_setup_blocks`'s doc comment describes, since none of them are
+    /// observable via `RecordingCsms` - only `RecordingStorage` can prove they actually ran.
+    #[tokio::test]
+    async fn a_charger_declaring_has_persistent_storage_registers_the_persistence_blocks() {
+        let config = ChargerConfig {
+            id: "storage-capability-test".into(),
+            ocpp_version: SimOcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+            capabilities: CapabilitiesConfig {
+                has_persistent_storage: true,
+                ..Default::default()
+            },
+        };
+        let storage = RecordingStorage::new();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_setup_blocks(
+            builder,
+            &RecordingCsms::new(),
+            TokioBackoff,
+            SystemMonotonicClock,
+            SystemClock,
+            Some(&storage),
+            None::<FakeDisplay>,
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        for key in [
+            "boot-reason",
+            "txn",
+            "auth-cache",
+            "network-profiles",
+            "device-model",
+            "security-log",
+            "queue/status",
+            "queue/transaction",
+            "queue/security",
+        ] {
+            assert!(
+                storage.was_queried(key),
+                "expected a storage read touching `{key}` when has_persistent_storage is true, \
+                 got {:?}",
+                storage.get_calls()
+            );
+        }
+        // `reservation`/`local_auth_list`/`smart_charging` are still false, so their
+        // persistence must not have run even though storage is available.
+        for key in ["reservations", "local-auth-list", "charging-profiles"] {
+            assert!(
+                !storage.was_queried(key),
+                "expected no storage read touching `{key}` while its own capability is false, \
+                 got {:?}",
+                storage.get_calls()
+            );
+        }
+    }
+
+    /// A charger declaring `has_display` must register the Display Message functional block -
+    /// and, symmetrically with the storage test above, must not when it doesn't (already covered
+    /// by `every_unconditional_block_registers...` above).
+    #[tokio::test]
+    async fn a_charger_declaring_has_display_registers_display_messages() {
+        let config = ChargerConfig {
+            id: "display-capability-test".into(),
+            ocpp_version: SimOcppVersion::V21,
+            evses: vec![],
+            has_display: true,
+            capabilities: Default::default(),
+        };
+        let csms = RecordingCsms::new();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_setup_blocks(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemMonotonicClock,
+            SystemClock,
+            None::<&RecordingStorage>,
+            Some(FakeDisplay::new()),
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        for block in [
+            "set_display_message",
+            "get_display_messages",
+            "clear_display_message",
+        ] {
+            assert!(
+                csms.called(block),
+                "expected `{block}` to be registered when has_display is true"
+            );
+        }
+    }
+
+    /// The trap `register_setup_blocks`'s doc comment calls out: `status_notifications`/
+    /// `transaction_events`/`security_events` each have a `_persisted` sibling that shares the
+    /// same single-use subscription with the plain form, so calling both would leave the second
+    /// one silently doing nothing. Each of the three storage keys below must be read **exactly
+    /// once** - not zero (the plain form ran and persistence was skipped) and not two-or-more (a
+    /// bug called both forms, one of which no-op'd).
+    #[tokio::test]
+    async fn each_dual_form_block_persists_exactly_once_when_storage_is_available() {
+        let config = ChargerConfig {
+            id: "dual-form-test".into(),
+            ocpp_version: SimOcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+            capabilities: CapabilitiesConfig {
+                has_persistent_storage: true,
+                ..Default::default()
+            },
+        };
+        let csms = RecordingCsms::new();
+        let storage = RecordingStorage::new();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_setup_blocks(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemMonotonicClock,
+            SystemClock,
+            Some(&storage),
+            None::<FakeDisplay>,
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        for key in ["queue/status", "queue/transaction", "queue/security"] {
+            assert_eq!(
+                storage.query_count(key),
+                1,
+                "expected exactly one storage read touching `{key}`, got {:?}",
+                storage.get_calls()
+            );
+        }
+        // The plain/`_persisted` choice is mutually exclusive per block, but both forms register
+        // exactly one reconnect-flush handler either way - this stays 4 regardless of which form
+        // ran, and is not by itself proof persistence happened (see the storage assertions
+        // above), just a sanity check that switching forms didn't also drop the reconnect wiring.
+        assert_eq!(
+            csms.call_count("reconnect"),
+            4,
+            "expected the same four reconnect-flush registrations regardless of whether the \
+             plain or `_persisted` form of status/transaction/security notifications ran"
+        );
     }
 }
