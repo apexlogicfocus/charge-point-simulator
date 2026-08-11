@@ -19,10 +19,11 @@ pub use connect::{connect_charger, websocket_url};
 pub use connection::{ConnectionProfile, PasswordTooLong, SecurityProfile};
 pub use connection_store::ConnectionStore;
 pub use hardware::{
-    FakeChargePoint, FakeConnector, FakeDisplay, FakeEvse, FakeFileTransfer, FakeFileTransferError,
-    FakeFirmwareInstaller, FakeFirmwareInstallerError, FakeFirmwareVerifier,
-    FakeFirmwareVerifierError, FileCertificateStore, FileKeyStore, FileStorage, FileStorageError,
-    FirmwareInstallStage, TransferProfile,
+    ContractCertificate, FakeChargePoint, FakeConnector, FakeDisplay, FakeEvse, FakeFileTransfer,
+    FakeFileTransferError, FakeFirmwareInstaller, FakeFirmwareInstallerError, FakeFirmwareVerifier,
+    FakeFirmwareVerifierError, FakeIso15118Controller, FakeIso15118ControllerError,
+    FileCertificateStore, FileKeyStore, FileStorage, FileStorageError, FirmwareInstallStage,
+    RingCrypto, RingCryptoError, TransferProfile, verify_signature,
 };
 pub use hardware_bundle::ChargerHardware;
 pub use ocpp_bridge::{apply_hardware_state, apply_ocpp_state, build_ocpp_event_for_connector};

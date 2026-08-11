@@ -260,6 +260,7 @@ dependencies = [
  "dirs",
  "ocpp-charge-point",
  "ocpp-client",
+ "ring",
  "serde",
  "serde_yaml",
  "tempfile",
