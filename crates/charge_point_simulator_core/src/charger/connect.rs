@@ -5,15 +5,22 @@ use ocpp_charge_point::ChargePointBuilder;
 use ocpp_charge_point::ConnectAndSetupError;
 use ocpp_charge_point::authorization::{Authorizer, ClearCacheHandler};
 use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
+use ocpp_charge_point::certificates::CertificateHandler;
 use ocpp_charge_point::clock::{Clock, MonotonicClock, SystemClock, SystemMonotonicClock};
 use ocpp_charge_point::connection::ReconnectHandler;
 use ocpp_charge_point::cost::CostUpdatedHandler;
 use ocpp_charge_point::device_model::{GetVariablesHandler, SetVariablesHandler};
+use ocpp_charge_point::diagnostics::{GetLogHandler, LogStatusNotifier};
 use ocpp_charge_point::display_message::{
     ClearDisplayMessageHandler, GetDisplayMessagesHandler, SetDisplayMessageHandler,
 };
 use ocpp_charge_point::executor::{Executor, TokioExecutor};
-use ocpp_charge_point::hardware::{ChargePoint, Connector, Display, Evse, Storage};
+use ocpp_charge_point::firmware::{
+    FirmwareStatusNotifier, SignedUpdateFirmwareHandler, UpdateFirmwareHandler,
+};
+use ocpp_charge_point::hardware::{
+    ChargePoint, Connector, Display, Evse, NoFirmwareVerifier, Storage,
+};
 use ocpp_charge_point::local_authorization_list::{
     GetLocalListVersionHandler, SendLocalListHandler,
 };
@@ -53,7 +60,10 @@ use ocpp_client::{ConnectOptions, NegotiatedClient, OcppVersion};
 
 use super::config::ChargerConfig;
 use super::connection::{ConnectionProfile, SecurityProfile};
-use super::hardware::{FakeChargePoint, FakeDisplay, FileStorage};
+use super::hardware::{
+    FakeChargePoint, FakeDisplay, FakeFileTransfer, FakeFirmwareInstaller, FakeFirmwareVerifier,
+    FileCertificateStore, FileStorage,
+};
 use super::hardware_bundle::ChargerHardware;
 use super::running_charger::RunningCharger;
 
@@ -963,7 +973,14 @@ pub async fn connect_charger(
     profile: &ConnectionProfile,
     hardware: ChargerHardware,
 ) -> Result<RunningCharger, ConnectAndSetupError<Infallible>> {
-    let ChargerHardware { storage, display } = hardware;
+    let ChargerHardware {
+        storage,
+        display,
+        firmware_installer,
+        firmware_verifier,
+        file_transfer,
+        certificate_store,
+    } = hardware;
 
     let charge_point = FakeChargePoint::from_config(config);
     let url = websocket_url(&profile.csms_url, &profile.ocpp_identity);
@@ -997,7 +1014,18 @@ pub async fn connect_charger(
     match negotiated {
         NegotiatedClient::V2_1(client) => {
             target.set_version(OcppVersion::V2_1);
-            connect_ocpp_2_1(charge_point, client, target, storage, display).await
+            connect_ocpp_2_1(
+                charge_point,
+                client,
+                target,
+                storage,
+                display,
+                firmware_installer,
+                firmware_verifier,
+                file_transfer,
+                certificate_store,
+            )
+            .await
         }
         NegotiatedClient::V2_0_1(_) => Err(ConnectAndSetupError::UnsupportedNegotiatedVersion(
             OcppVersion::V2_0_1,
@@ -1031,12 +1059,21 @@ pub async fn connect_charger(
 /// `ChargePointBuilder` either. A CSMS that writes `WebSocketPingInterval` on a simulated charger
 /// therefore won't see the connection's keepalive cadence change until reconnect; everything else
 /// this function registers is unaffected.
+///
+/// Also adds [`register_optional_hardware`] (H10b/H12b: firmware, file transfer and certificate
+/// registrations) after the smart-charging extras above - see that function's own doc comment for
+/// why it is a second call here rather than folded into [`register_setup_blocks`] itself.
+#[allow(clippy::too_many_arguments)]
 async fn connect_ocpp_2_1(
     charge_point: FakeChargePoint,
     client: ocpp_client::ocpp_2_1::OCPP2_1Client,
     target: Arc<ConnectionTarget>,
     storage: Option<FileStorage>,
     display: Option<FakeDisplay>,
+    firmware_installer: Option<Arc<FakeFirmwareInstaller>>,
+    firmware_verifier: Option<Arc<FakeFirmwareVerifier>>,
+    file_transfer: Option<Arc<FakeFileTransfer>>,
+    certificate_store: Option<FileCertificateStore>,
 ) -> Result<RunningCharger, ConnectAndSetupError<Infallible>> {
     // Cloned before `charge_point` is moved into `ChargePointBuilder::start` below - that call
     // wraps it in an `Arc` this function can never reach again (see `RunningCharger`'s doc
@@ -1066,6 +1103,20 @@ async fn connect_ocpp_2_1(
             .dynamic_charging_profiles(&client, SystemClock, TokioBackoff, 30)
             .await;
     }
+
+    builder = register_optional_hardware(
+        builder,
+        &client,
+        TokioBackoff,
+        SystemClock,
+        firmware_installer,
+        firmware_verifier,
+        file_transfer,
+        certificate_store,
+        true, // has_csms: a real CSMS is dialed on this path - see the function's own doc comment.
+    )
+    .await;
+
     builder = builder.network_profile_switching(&target, client.clone(), TokioBackoff);
 
     Ok(RunningCharger::new(
@@ -1074,11 +1125,199 @@ async fn connect_ocpp_2_1(
     ))
 }
 
+/// Registers firmware, file transfer and certificate hardware (`docs/hardware-roadmap.md`'s H10b
+/// (firmware/file transfer) and H12b (certificates)): [`ChargePointBuilder::firmware_updates`],
+/// [`ChargePointBuilder::log_uploads`] and [`ChargePointBuilder::certificates`], each gated on the
+/// matching [`Capabilities`](ocpp_charge_point::hardware::Capabilities) flag
+/// (`firmware_management`, `diagnostics`, `certificate_management`) and on `hardware` actually
+/// supplying the object it needs - the same "declared but not backed logs a warning and registers
+/// nothing" contract [`register_setup_blocks`] uses for storage/display.
+///
+/// # Why this is not part of `register_setup_blocks`
+///
+/// `register_setup_blocks` is called from two places: [`connect_ocpp_2_1`] (a real CSMS is always
+/// dialed) and [`super::running_charger::start_local_charger`] (no CSMS, no hardware bundle at
+/// all - `start_local_charger` takes only a `&ChargerConfig`, so `register_setup_blocks`'s own
+/// `storage`/`display` arguments are hardcoded `None` on that call site today). Adding parameters
+/// to `register_setup_blocks` for the hardware this function registers would require updating both
+/// call sites, including the one inside `charger/running_charger.rs` - a file this task does not
+/// own (see `docs/hardware-roadmap.md`'s H10b/H12b task notes). Keeping this as a second,
+/// independent function - generic over the CSMS type exactly like `register_setup_blocks` is, so
+/// `RecordingCsms` can drive it in tests without a live CSMS - means `register_setup_blocks`'s
+/// signature (and therefore `start_local_charger`) never has to change; [`connect_ocpp_2_1`] simply
+/// calls both.
+///
+/// One real consequence: a local (unconnected) charger cannot get firmware/file-transfer/
+/// certificate hardware through this change, exactly as it already cannot get persistent storage
+/// or a display today (`start_local_charger` passes `None`/`None` for those, unconditionally). This
+/// is not a new gap this function introduces, just the existing one extended to three more kinds
+/// of hardware - wiring a `ChargerHardware` into local mode at all is its own, `running_charger.rs`
+/// -owning task.
+///
+/// # `has_csms`
+///
+/// Only ever called with `true` today (`connect_ocpp_2_1`'s one call site), but the parameter
+/// exists - matching `register_setup_blocks`'s own convention - so the reasoning below is
+/// executable and testable now, ready to gate a future call from local mode once it gains a
+/// `ChargerHardware` of its own:
+///
+/// - **`firmware_updates` (has_csms-gated):** a firmware *campaign* - `UpdateFirmware`/
+///   `SignedUpdateFirmware` inbound, `FirmwareStatusNotification` outbound - is a CSMS round trip
+///   from end to end. With no CSMS, nothing could ever send the request that starts one, and
+///   `FirmwareStatusNotifier::notify_firmware_status` would have nobody to report to. Installing
+///   firmware is itself local hardware behavior (see [`FakeFirmwareInstaller`]'s own docs, and the
+///   roadmap task notes) - which is why the fakes remain fully constructible and tickable in tests
+///   regardless of `has_csms` - but the OCPP-level campaign this method registers is not.
+/// - **`log_uploads` (has_csms-gated):** a log upload needs somewhere to upload to - the URL is
+///   supplied by the CSMS's own `GetLog`/`GetDiagnostics` request. With no CSMS, no such request
+///   can arrive, so registering it would spawn a background task that awaits an empty queue
+///   forever - harmless (the queue's `recv` suspends rather than busy-loops or retries against
+///   `has_csms`'s absence), but pointless, the same "at best a no-op offline" reasoning
+///   `register_setup_blocks` gives `status_notifications`/`meter_values`.
+/// - **`certificates` (ungated by has_csms):** `InstallCertificate`/`DeleteCertificate`/
+///   `GetInstalledCertificateIds`/`CertificateSigned` are a single non-blocking
+///   `register_certificate_handlers` call with no spawned loop - the same "cheap enough to keep
+///   the functional-block shape complete even though nothing ever dials in to trigger it locally"
+///   reasoning `register_setup_blocks` gives `clear_cache`/`remote_control`/... . Registering it
+///   costs nothing regardless of whether a CSMS exists to ever call it.
+///
+/// # Not registered here (and why)
+///
+/// - **`publish_firmware`** needs a `hardware::FirmwarePublisher`, which wave 3 (H10a) did not
+///   build - only `FirmwareInstaller`/`FirmwareVerifier`/`FileTransfer` fakes exist. Upstream ships
+///   no usable implementation either, only `NoFirmwarePublisher` (always `Err`). Registering it
+///   against `NoFirmwarePublisher` while `Capabilities::firmware_publishing` reads `true` would be
+///   exactly the "a `true` with nothing behind it is worse than a `false`" mistake the roadmap's
+///   working agreements warn against, so this is left unregistered - implementing a
+///   `FirmwarePublisher` fake is its own task.
+/// - **`ocsp_status`/`ocsp_chain_status`** need a `hardware::OcspChecker`. Neither
+///   [`FileCertificateStore`] nor the upstream [`StoredCertificates`](ocpp_charge_point::hardware::StoredCertificates)
+///   it wraps implements that trait - `OcspChecker` is deliberately not folded into
+///   `CertificateStore` upstream (see `Capabilities::ocsp_checking`'s own doc comment: it needs an
+///   outbound path to a third-party OCSP responder, which a certificate store does not give a
+///   charge point). So `certificate_store` "making the OCSP methods reachable" never actually
+///   happens with what this crate has today.
+/// - **A `KeyStore`** is not a parameter of this function at all - see [`ChargerHardware`]'s doc
+///   comment for why no field exists to pass one from.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn register_optional_hardware<T, X, N, B, K>(
+    mut builder: ChargePointBuilder<T, X>,
+    csms: &N,
+    backoff: B,
+    clock: K,
+    firmware_installer: Option<Arc<FakeFirmwareInstaller>>,
+    firmware_verifier: Option<Arc<FakeFirmwareVerifier>>,
+    file_transfer: Option<Arc<FakeFileTransfer>>,
+    certificate_store: Option<FileCertificateStore>,
+    has_csms: bool,
+) -> ChargePointBuilder<T, X>
+where
+    X: Executor,
+    N: UpdateFirmwareHandler
+        + SignedUpdateFirmwareHandler
+        + FirmwareStatusNotifier
+        + GetLogHandler
+        + LogStatusNotifier
+        + CertificateHandler
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    B: Backoff + Clone + Send + Sync + 'static,
+    K: Clock + Clone + Send + Sync + 'static,
+{
+    let capabilities = builder.capabilities();
+
+    if has_csms && capabilities.firmware_management {
+        match (&firmware_installer, &file_transfer) {
+            (Some(installer), Some(transfer)) => {
+                builder = if let Some(verifier) = &firmware_verifier {
+                    builder
+                        .firmware_updates(
+                            csms,
+                            Arc::clone(transfer),
+                            Arc::clone(installer),
+                            clock.clone(),
+                            backoff.clone(),
+                            Arc::clone(verifier),
+                        )
+                        .await
+                } else {
+                    // No verifier configured: `NoFirmwareVerifier` fails closed on a *signed*
+                    // update (per its own docs, mirroring `NoFirmwareInstaller`) while an unsigned
+                    // update is unaffected - see `run_one_update`'s own "an update carrying neither
+                    // field is unsigned by OCPP's own design" branch. The sensible default for a
+                    // charger that declared `firmware_management` but not signature checking.
+                    builder
+                        .firmware_updates(
+                            csms,
+                            Arc::clone(transfer),
+                            Arc::clone(installer),
+                            clock.clone(),
+                            backoff.clone(),
+                            NoFirmwareVerifier,
+                        )
+                        .await
+                };
+            }
+            _ => {
+                tracing::warn!(
+                    "the charger declares firmware_management but ChargerHardware has no \
+                     firmware_installer/file_transfer - firmware updates will not be registered"
+                );
+            }
+        }
+    }
+
+    if has_csms && capabilities.diagnostics {
+        if let Some(transfer) = &file_transfer {
+            // A fresh, empty log - not the same handle `register_setup_blocks`'s
+            // `security_log_persisted` restores into (that Arc is created and consumed entirely
+            // inside that function, which this one does not have access to without changing
+            // `register_setup_blocks`'s signature - see this function's own doc comment on why
+            // that is out of scope). A `GetLog` for the security log therefore reports only what
+            // happens on this connection, not history that survived an earlier restart, until that
+            // plumbing is unified.
+            builder = builder
+                .log_uploads(
+                    csms,
+                    Arc::clone(transfer),
+                    Arc::new(SecurityEventLog::new()),
+                    backoff.clone(),
+                )
+                .await;
+        } else {
+            tracing::warn!(
+                "the charger declares diagnostics but ChargerHardware has no file_transfer - log \
+                 upload will not be registered"
+            );
+        }
+    }
+
+    if capabilities.certificate_management {
+        if let Some(store) = certificate_store {
+            builder = builder.certificates(csms, store).await;
+        } else {
+            tracing::warn!(
+                "the charger declares certificate_management but ChargerHardware has no \
+                 certificate_store - certificate management will not be registered"
+            );
+        }
+    }
+
+    builder
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::charger::config::{CapabilitiesConfig, OcppVersion as SimOcppVersion};
     use ocpp_charge_point::actor::ChargePointActor;
+    use ocpp_charge_point::diagnostics::{LogUploadQueue, LogUploadState, LogUploadStatus};
+    use ocpp_charge_point::firmware::{
+        FirmwareStatus, FirmwareUpdateQueue, FirmwareUpdateRequest, FirmwareUpdateState,
+        handle_update_firmware,
+    };
     use ocpp_charge_point::provisioning::BootNotificationOutcome;
     use ocpp_charge_point::state::{
         AuthorizationStatus, BootReasonCause, ConnectorState, ConnectorStatus, IdToken,
@@ -1086,6 +1325,7 @@ mod tests {
         TransactionEventKind, TriggeredMonitor,
     };
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[tokio::test]
     #[ignore = "hits a real local CSMS, run manually with --ignored"]
@@ -1177,9 +1417,26 @@ mod tests {
     // client, not a generic CSMS bound) - RecordingCsms can't stand in for one. Those are only
     // exercised by `can_connect_to_the_local_dev_csms` above, run manually against a real CSMS.
 
+    /// What `register_update_firmware_handler` captures - see `RecordingCsms::firmware_update_handle`'s
+    /// own doc comment. A named alias purely to keep clippy's `type_complexity` lint quiet; the
+    /// three-tuple itself carries no meaning beyond "what `firmware_updates` handed the CSMS".
+    type FirmwareUpdateHandle = (
+        ChargePointActor,
+        FirmwareUpdateQueue,
+        Arc<FirmwareUpdateState>,
+    );
+
     #[derive(Clone, Default)]
     struct RecordingCsms {
-        calls: Arc<Mutex<Vec<&'static str>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+        // H10b: `firmware_updates` hands `register_update_firmware_handler` the
+        // `FirmwareUpdateQueue`/`FirmwareUpdateState` `run_firmware_updates` (spawned inside that
+        // same builder call) reads from - the only way anything outside `ocpp-charge-point` can
+        // reach either is to capture them here when they arrive, so a test can later call the
+        // crate's own public `handle_update_firmware` to feed a synthetic request into the queue
+        // that `run_firmware_updates` is already awaiting, driving the *registered* path rather
+        // than a hand-built substitute for it.
+        firmware_update_handle: Arc<Mutex<Option<FirmwareUpdateHandle>>>,
     }
 
     impl RecordingCsms {
@@ -1187,12 +1444,16 @@ mod tests {
             Self::default()
         }
 
-        fn record(&self, name: &'static str) {
-            self.calls.lock().expect("lock poisoned").push(name);
+        fn record(&self, name: impl Into<String>) {
+            self.calls.lock().expect("lock poisoned").push(name.into());
         }
 
-        fn called(&self, name: &'static str) -> bool {
-            self.calls.lock().expect("lock poisoned").contains(&name)
+        fn called(&self, name: &str) -> bool {
+            self.calls
+                .lock()
+                .expect("lock poisoned")
+                .iter()
+                .any(|call| call == name)
         }
 
         fn call_count(&self, name: &str) -> usize {
@@ -1200,8 +1461,103 @@ mod tests {
                 .lock()
                 .expect("lock poisoned")
                 .iter()
-                .filter(|call| **call == name)
+                .filter(|call| call.as_str() == name)
                 .count()
+        }
+
+        /// Takes the handle `register_update_firmware_handler` captured, if any - `None` if
+        /// `firmware_updates` was never registered against this CSMS. See the field's own doc
+        /// comment.
+        fn take_firmware_update_handle(&self) -> Option<FirmwareUpdateHandle> {
+            self.firmware_update_handle
+                .lock()
+                .expect("lock poisoned")
+                .take()
+        }
+    }
+
+    /// Maps every [`FirmwareStatus`] to a fixed, `&'static str` name `RecordingCsms::record` can
+    /// log - keeps `RecordingCsms.calls` a flat list of names the way every other registration
+    /// records itself, rather than adding a second, differently-shaped log just for firmware
+    /// status transitions.
+    fn firmware_status_name(status: FirmwareStatus) -> &'static str {
+        match status {
+            FirmwareStatus::Idle => "firmware_status_idle",
+            FirmwareStatus::DownloadScheduled => "firmware_status_download_scheduled",
+            FirmwareStatus::Downloading => "firmware_status_downloading",
+            FirmwareStatus::Downloaded => "firmware_status_downloaded",
+            FirmwareStatus::DownloadFailed => "firmware_status_download_failed",
+            FirmwareStatus::InstallScheduled => "firmware_status_install_scheduled",
+            FirmwareStatus::Installing => "firmware_status_installing",
+            FirmwareStatus::Installed => "firmware_status_installed",
+            FirmwareStatus::InstallationFailed => "firmware_status_installation_failed",
+            FirmwareStatus::InstallRebooting => "firmware_status_install_rebooting",
+            FirmwareStatus::SignatureVerified => "firmware_status_signature_verified",
+            FirmwareStatus::InvalidSignature => "firmware_status_invalid_signature",
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UpdateFirmwareHandler for RecordingCsms {
+        async fn register_update_firmware_handler(
+            &self,
+            actor: ChargePointActor,
+            updates: FirmwareUpdateQueue,
+            state: Arc<FirmwareUpdateState>,
+        ) {
+            self.record("update_firmware");
+            *self.firmware_update_handle.lock().expect("lock poisoned") =
+                Some((actor, updates, state));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SignedUpdateFirmwareHandler for RecordingCsms {}
+
+    #[async_trait::async_trait]
+    impl FirmwareStatusNotifier for RecordingCsms {
+        type Error = Infallible;
+        async fn notify_firmware_status(
+            &self,
+            _request_id: Option<i64>,
+            status: FirmwareStatus,
+        ) -> Result<(), Self::Error> {
+            self.record(firmware_status_name(status));
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GetLogHandler for RecordingCsms {
+        async fn register_get_log_handler(
+            &self,
+            _actor: ChargePointActor,
+            _uploads: LogUploadQueue,
+            _state: Arc<LogUploadState>,
+        ) {
+            self.record("get_log");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LogStatusNotifier for RecordingCsms {
+        type Error = Infallible;
+        async fn notify_log_status(
+            &self,
+            _request_id: Option<i64>,
+            _status: LogUploadStatus,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CertificateHandler for RecordingCsms {
+        async fn register_certificate_handlers<S>(&self, _actor: ChargePointActor, _store: S)
+        where
+            S: ocpp_charge_point::hardware::CertificateStore + Send + Sync + 'static,
+        {
+            self.record("certificate_handlers");
         }
     }
 
@@ -2006,6 +2362,417 @@ mod tests {
             4,
             "expected the same four reconnect-flush registrations regardless of whether the \
              plain or `_persisted` form of status/transaction/security notifications ran"
+        );
+    }
+
+    // --- `register_optional_hardware` (H10b/H12b) ---------------------------------------------
+    //
+    // Mirrors the `register_setup_blocks` equivalence tests above: an all-false-capabilities
+    // charger registers none of these blocks even with real hardware supplied, each capability
+    // adds exactly its own block, and a missing-but-declared piece of hardware warns and skips
+    // rather than panicking - the same contract `register_setup_blocks` gives storage/display.
+    // `a_registered_firmware_install_progresses_and_completes_through_the_registered_path` below
+    // is the reason this task exists at all: it proves a firmware install driven through this
+    // registration function's `firmware_updates` call actually progresses and completes, not
+    // merely that registration happened.
+
+    use super::super::hardware::{FirmwareInstallStage, TransferProfile};
+
+    fn optional_hardware_config(capabilities: CapabilitiesConfig) -> ChargerConfig {
+        ChargerConfig {
+            id: "optional-hardware-test".into(),
+            ocpp_version: SimOcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+            capabilities,
+        }
+    }
+
+    fn instant_file_transfer() -> Arc<FakeFileTransfer> {
+        Arc::new(FakeFileTransfer::new(
+            TransferProfile::instant(0),
+            TransferProfile::instant(0),
+        ))
+    }
+
+    fn certificate_store_over_temp_dir() -> (tempfile::TempDir, FileCertificateStore) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let store = FileCertificateStore::new(FileStorage::new(dir.path()));
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn optional_hardware_registers_nothing_when_capabilities_are_false_even_with_hardware_present()
+     {
+        let config = optional_hardware_config(CapabilitiesConfig::default());
+        let csms = RecordingCsms::new();
+        let installer = Arc::new(FakeFirmwareInstaller::new(Duration::ZERO));
+        let verifier = Arc::new(FakeFirmwareVerifier::new());
+        let transfer = instant_file_transfer();
+        let (_dir, store) = certificate_store_over_temp_dir();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            Some(installer),
+            Some(verifier),
+            Some(transfer),
+            Some(store),
+            true, // has_csms: proving hardware presence alone never registers anything undeclared.
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        for block in ["update_firmware", "get_log", "certificate_handlers"] {
+            assert!(
+                !csms.called(block),
+                "expected `{block}` to stay unregistered when its capability is false, even with \
+                 real hardware supplied"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn firmware_management_registers_firmware_updates_when_hardware_is_present() {
+        let config = optional_hardware_config(CapabilitiesConfig {
+            firmware_management: true,
+            ..Default::default()
+        });
+        let csms = RecordingCsms::new();
+        let installer = Arc::new(FakeFirmwareInstaller::new(Duration::ZERO));
+        let transfer = instant_file_transfer();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            Some(installer),
+            None, // no verifier - `NoFirmwareVerifier` should stand in.
+            Some(transfer),
+            None,
+            true,
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        assert!(
+            csms.called("update_firmware"),
+            "expected firmware_updates to register an UpdateFirmware handler"
+        );
+        for block in ["get_log", "certificate_handlers"] {
+            assert!(
+                !csms.called(block),
+                "expected `{block}` to stay unregistered - only firmware_management is declared"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn firmware_management_without_backing_hardware_registers_nothing() {
+        let config = optional_hardware_config(CapabilitiesConfig {
+            firmware_management: true,
+            ..Default::default()
+        });
+        let csms = RecordingCsms::new();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        assert!(
+            !csms.called("update_firmware"),
+            "expected no registration when firmware_management is declared but no \
+             firmware_installer/file_transfer was supplied"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_registers_log_uploads_when_file_transfer_is_present() {
+        let config = optional_hardware_config(CapabilitiesConfig {
+            diagnostics: true,
+            ..Default::default()
+        });
+        let csms = RecordingCsms::new();
+        let transfer = instant_file_transfer();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            None,
+            None,
+            Some(transfer),
+            None,
+            true,
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        assert!(
+            csms.called("get_log"),
+            "expected log_uploads to register a GetLog handler"
+        );
+        for block in ["update_firmware", "certificate_handlers"] {
+            assert!(
+                !csms.called(block),
+                "expected `{block}` to stay unregistered - only diagnostics is declared"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_without_file_transfer_registers_nothing() {
+        let config = optional_hardware_config(CapabilitiesConfig {
+            diagnostics: true,
+            ..Default::default()
+        });
+        let csms = RecordingCsms::new();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        assert!(
+            !csms.called("get_log"),
+            "expected no registration when diagnostics is declared but no file_transfer was \
+             supplied"
+        );
+    }
+
+    #[tokio::test]
+    async fn certificate_management_registers_certificates_when_store_is_present() {
+        let config = optional_hardware_config(CapabilitiesConfig {
+            certificate_management: true,
+            ..Default::default()
+        });
+        let csms = RecordingCsms::new();
+        let (_dir, store) = certificate_store_over_temp_dir();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            None,
+            None,
+            None,
+            Some(store),
+            true,
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        assert!(
+            csms.called("certificate_handlers"),
+            "expected certificates to register InstallCertificate/DeleteCertificate/... handlers"
+        );
+        for block in ["update_firmware", "get_log"] {
+            assert!(
+                !csms.called(block),
+                "expected `{block}` to stay unregistered - only certificate_management is \
+                 declared"
+            );
+        }
+    }
+
+    /// H3c's `has_csms` reasoning, applied to these three blocks (see
+    /// `register_optional_hardware`'s own doc comment): `firmware_updates`/`log_uploads` are
+    /// CSMS-driven and skip when there is no CSMS, while `certificates` is a single non-blocking
+    /// registration that costs nothing to keep regardless - exactly like `clear_cache`/
+    /// `remote_control`/... in `register_setup_blocks`. Not reachable from any call site today
+    /// (`connect_ocpp_2_1` always passes `true`), but the behavior is real and worth locking down
+    /// ahead of local mode gaining a `ChargerHardware` of its own.
+    #[tokio::test]
+    async fn has_csms_false_skips_firmware_and_diagnostics_but_registers_certificates_regardless() {
+        let config = optional_hardware_config(CapabilitiesConfig {
+            firmware_management: true,
+            diagnostics: true,
+            certificate_management: true,
+            ..Default::default()
+        });
+        let csms = RecordingCsms::new();
+        let installer = Arc::new(FakeFirmwareInstaller::new(Duration::ZERO));
+        let transfer = instant_file_transfer();
+        let (_dir, store) = certificate_store_over_temp_dir();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            Some(installer),
+            None,
+            Some(transfer),
+            Some(store),
+            false, // has_csms: no CSMS is dialed.
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        for block in ["update_firmware", "get_log"] {
+            assert!(
+                !csms.called(block),
+                "expected `{block}` to stay unregistered with no CSMS, even with capability and \
+                 hardware both present"
+            );
+        }
+        assert!(
+            csms.called("certificate_handlers"),
+            "expected certificates to register regardless of has_csms - a single non-blocking \
+             call, the same reasoning register_setup_blocks gives clear_cache/remote_control/..."
+        );
+    }
+
+    /// The reason H10b exists: proves a firmware install, once registered through
+    /// `register_optional_hardware`, actually progresses through simulated time and completes via
+    /// the *registered* path rather than a hand-built stand-in for it - `handle_update_firmware`
+    /// (the same public entry point a real 1.6J/2.x wire adapter calls) feeds the queue
+    /// `firmware_updates` spawned internally, `FakeFirmwareInstaller::tick` paces the install, and
+    /// `RecordingCsms::notify_firmware_status` observes the CSMS-facing result.
+    #[tokio::test]
+    async fn a_registered_firmware_install_progresses_and_completes_through_the_registered_path() {
+        let config = optional_hardware_config(CapabilitiesConfig {
+            firmware_management: true,
+            ..Default::default()
+        });
+        let csms = RecordingCsms::new();
+        let installer = Arc::new(FakeFirmwareInstaller::new(Duration::from_secs(90)));
+        let transfer = instant_file_transfer();
+
+        let builder =
+            ChargePointBuilder::start(FakeChargePoint::from_config(&config), TokioExecutor)
+                .await
+                .expect("starting the fake hardware never fails");
+        let builder = register_optional_hardware(
+            builder,
+            &csms,
+            TokioBackoff,
+            SystemClock,
+            Some(Arc::clone(&installer)),
+            None,
+            Some(transfer),
+            None,
+            true,
+        )
+        .await;
+        let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
+
+        let (actor, updates, state) = csms
+            .take_firmware_update_handle()
+            .expect("register_update_firmware_handler must have captured a handle");
+
+        // Feed a synthetic `UpdateFirmware` through the same public entry point a real wire
+        // adapter calls - this drives the *registered* `run_firmware_updates` worker
+        // `firmware_updates` spawned above, not a hand-built substitute for it.
+        let outcome = handle_update_firmware(
+            &actor,
+            &updates,
+            &state,
+            FirmwareUpdateRequest {
+                request_id: Some(1),
+                location: "https://example.invalid/firmware.bin".into(),
+                retrieve_at: None,
+                install_at: None,
+                signature: None,
+                signing_certificate: None,
+                retries: 0,
+                retry_interval_secs: 30,
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ocpp_charge_point::firmware::UpdateFirmwareOutcome::Accepted
+        );
+
+        // The transfer is instant, so the worker reaches `Installing` as soon as it is scheduled -
+        // wait for that rather than assuming a fixed number of yields.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while installer.stage() != FirmwareInstallStage::Installing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the firmware install never reached Installing");
+
+        installer.tick(Duration::from_secs(45));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            installer.stage(),
+            FirmwareInstallStage::Installing,
+            "half the required duration must not complete the install - this must be genuinely \
+             paced by tick, not instantaneous"
+        );
+
+        installer.tick(Duration::from_secs(45));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while installer.stage() != FirmwareInstallStage::Installed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the firmware install never completed");
+
+        assert!(
+            csms.called(firmware_status_name(FirmwareStatus::Installing)),
+            "expected a FirmwareStatusNotification reporting Installing"
+        );
+        assert!(
+            csms.called(firmware_status_name(FirmwareStatus::Installed)),
+            "expected a FirmwareStatusNotification reporting Installed"
         );
     }
 }
