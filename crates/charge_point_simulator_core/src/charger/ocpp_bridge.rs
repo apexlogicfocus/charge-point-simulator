@@ -9,7 +9,9 @@ use ocpp_charge_point::state::{
 };
 
 use super::command::Command;
-use super::state::{ChargerState, ConnectionStatus, ConnectorStatus, Vehicle};
+use super::state::{
+    ChargerState, ConnectionStatus, ConnectorStatus, EvseMetrics, SimulationMode, Vehicle,
+};
 
 /// Maps a connector's real OCPP protocol state (the full lock/authorize/charge lifecycle) down
 /// to the simulator's coarse display status.
@@ -48,16 +50,29 @@ pub fn map_connection_status(registration: Option<RegistrationStatus>) -> Connec
     }
 }
 
-/// Overwrites `charger`'s connection/connector status from a live `ChargePointState` snapshot,
-/// keyed positionally (charger and OCPP EVSEs/connectors are built from the same config, in the
-/// same order). Synthesizes a placeholder vehicle the first time a connector reports a
-/// plugged-in state, and clears it once free again; a vehicle already known locally (e.g. named
-/// via a "Plug in vehicle" parameter prompt) is left alone rather than overwritten every
-/// snapshot.
+/// Overwrites `charger`'s connection/connector status and per-EVSE meter reading from a live
+/// `ChargePointState` snapshot, keyed positionally (charger and OCPP EVSEs/connectors are built
+/// from the same config, in the same order). The single path into `ChargerState` from a real
+/// `ChargePointState`, for a local (unconnected) charger and a live-CSMS one alike
+/// (`docs/hardware-roadmap.md`'s H3b) - `ChargerState`/`EvseState::tick` no longer simulate
+/// anything electrical or drive `connection_status` themselves.
+///
+/// Synthesizes a placeholder vehicle the first time a connector reports a plugged-in state, and
+/// clears it once free again; a vehicle already known locally (e.g. named via a "Plug in
+/// vehicle" parameter prompt) is left alone rather than overwritten every snapshot.
 pub fn apply_ocpp_state(charger: &mut ChargerState, ocpp_state: &ChargePointState) {
-    charger.connection_status = map_connection_status(ocpp_state.registration);
+    charger.connection_status = match &charger.mode {
+        // No CSMS was ever dialed, so `ocpp_state.registration` stays `None` forever - reading
+        // that (the way `map_connection_status` does for a live connection) as "still booting"
+        // would report booting forever, which is the bug this branch exists to avoid (H3b). A
+        // charger with no CSMS in the picture at all is honestly `Offline`.
+        SimulationMode::Local => ConnectionStatus::Offline,
+        SimulationMode::LiveCsms { .. } => map_connection_status(ocpp_state.registration),
+    };
 
     for (evse, ocpp_evse) in charger.evses.iter_mut().zip(ocpp_state.evses.iter()) {
+        evse.metrics = evse_metrics_from_samples(&ocpp_evse.latest_meter_samples);
+
         for (connector, &ocpp_connector) in
             evse.connectors.iter_mut().zip(ocpp_evse.connectors.iter())
         {
@@ -76,6 +91,33 @@ pub fn apply_ocpp_state(charger: &mut ChargerState, ocpp_state: &ChargePointStat
                 });
             }
         }
+    }
+}
+
+/// Aggregates one EVSE's per-connector meter samples into the coarser [`EvseMetrics`] the
+/// dashboard renders - this simulator has no EVSE-level meter of its own any more (H3b moved the
+/// only meter down to `SimulatedMeter`, one per connector), so an EVSE's reading is always the
+/// sum of what its connectors report, the same way multiple charging connectors on one EVSE used
+/// to simply add up in the old `EvseState::tick` accumulator.
+///
+/// A connector that hasn't reported a sample yet (`None` - nothing has ticked since this charger
+/// started) contributes zero rather than being skipped or treated as "unknown": that is the same
+/// "measured zero, not unmeasurable" stance `SimulatedMeter` itself takes once it *has* ticked
+/// (`Some(0)`, never `None`, for an idle connector - see `docs/hardware-roadmap.md`'s H3b), and a
+/// connector nothing has ticked yet is idle in exactly the same sense.
+fn evse_metrics_from_samples(samples: &[Option<MeterSample>]) -> EvseMetrics {
+    let mut power_w = 0i64;
+    let mut current_ma = 0i64;
+    let mut energy_wh = 0i64;
+    for sample in samples.iter().flatten() {
+        power_w += sample.power_w.unwrap_or(0);
+        current_ma += sample.current_ma.unwrap_or(0);
+        energy_wh += sample.energy_wh;
+    }
+    EvseMetrics {
+        power_kw: power_w as f64 / 1000.0,
+        current_a: current_ma as f64 / 1000.0,
+        energy_kwh: energy_wh as f64 / 1000.0,
     }
 }
 
@@ -152,39 +194,6 @@ pub fn build_ocpp_event_for_connector(
             event,
         },
     })
-}
-
-/// Builds a `MeterValueSampled` event for every currently-`Charging` connector, carrying its
-/// EVSE's simulated cumulative energy reading (see [`super::state::EvseState::tick`]). Real
-/// meter values are per-connector; this simulator's energy simulation is aggregated per EVSE
-/// (there's no per-connector meter), so every charging connector on the same EVSE reports that
-/// EVSE's shared total - a known simplification, harmless for the common single-connector EVSE
-/// case this crate's presets use.
-pub fn meter_sample_events(charger: &ChargerState) -> Vec<ChargePointEvent> {
-    charger
-        .evses
-        .iter()
-        .enumerate()
-        .flat_map(|(evse_id, evse)| {
-            let energy_wh = (evse.metrics.energy_kwh * 1000.0).round() as i64;
-            evse.connectors
-                .iter()
-                .enumerate()
-                .filter(|(_, connector)| connector.status == ConnectorStatus::Charging)
-                .map(move |(connector_id, _)| ChargePointEvent::Evse {
-                    evse_id,
-                    event: EvseEvent::Connector {
-                        connector_id,
-                        // Only cumulative energy is simulated today; every other quantity is
-                        // left `None` rather than fabricated (see `MeterSample`'s docs).
-                        event: ConnectorEvent::MeterValueSampled(MeterSample {
-                            energy_wh,
-                            ..Default::default()
-                        }),
-                    },
-                })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -344,6 +353,9 @@ mod tests {
     #[test]
     fn apply_ocpp_state_updates_connection_and_connector_status() {
         let mut charger = charger_state();
+        charger.mode = SimulationMode::LiveCsms {
+            url: "ws://csms.example/CP001".into(),
+        };
         let ocpp = ocpp_state_with(vec![
             OcppConnectorState::Locked,
             OcppConnectorState::Available,
@@ -360,6 +372,104 @@ mod tests {
             charger.evses[0].connectors[1].status,
             ConnectorStatus::Available
         );
+    }
+
+    /// H3b: with no CSMS at all, `ChargePointState::registration` never becomes `Some(..)` - a
+    /// `Local` charger must read `Offline`, not the endlessly-retried `Booting`/`Reconnecting` an
+    /// unanswered *real* CSMS registration would mean. This holds even if the snapshot happens to
+    /// carry a `registration` value (it never will in practice for a local runtime, but the
+    /// mapping must not depend on that not happening).
+    #[test]
+    fn a_local_chargers_connection_status_is_always_offline_regardless_of_registration() {
+        let mut charger = charger_state();
+        assert_eq!(charger.mode, SimulationMode::Local);
+        let ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Available,
+            OcppConnectorState::Available,
+        ]);
+
+        apply_ocpp_state(&mut charger, &ocpp);
+
+        assert_eq!(charger.connection_status, ConnectionStatus::Offline);
+    }
+
+    #[test]
+    fn apply_ocpp_state_populates_evse_metrics_from_a_connectors_meter_sample() {
+        let mut charger = charger_state();
+        let mut ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Charging,
+            OcppConnectorState::Available,
+        ]);
+        ocpp.evses[0].latest_meter_samples[0] = Some(MeterSample {
+            energy_wh: 1_500,
+            power_w: Some(7_400),
+            current_ma: Some(32_174),
+            voltage_v: Some(230),
+            soc_percent: None,
+        });
+
+        apply_ocpp_state(&mut charger, &ocpp);
+
+        let metrics = charger.evses[0].metrics;
+        assert!((metrics.energy_kwh - 1.5).abs() < 1e-9);
+        assert!((metrics.power_kw - 7.4).abs() < 1e-9);
+        assert!((metrics.current_a - 32.174).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_ocpp_state_sums_meter_samples_across_every_connector_on_an_evse() {
+        let mut charger = charger_state();
+        let mut ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Charging,
+            OcppConnectorState::Charging,
+        ]);
+        ocpp.evses[0].latest_meter_samples[0] = Some(MeterSample {
+            energy_wh: 1_000,
+            power_w: Some(7_400),
+            current_ma: Some(32_000),
+            voltage_v: Some(230),
+            soc_percent: None,
+        });
+        ocpp.evses[0].latest_meter_samples[1] = Some(MeterSample {
+            energy_wh: 500,
+            power_w: Some(3_700),
+            current_ma: Some(16_000),
+            voltage_v: Some(230),
+            soc_percent: None,
+        });
+
+        apply_ocpp_state(&mut charger, &ocpp);
+
+        let metrics = charger.evses[0].metrics;
+        assert!((metrics.energy_kwh - 1.5).abs() < 1e-9);
+        assert!((metrics.power_kw - 11.1).abs() < 1e-9);
+        assert!((metrics.current_a - 48.0).abs() < 1e-9);
+    }
+
+    /// A connector nothing has ticked yet reports no sample at all (`None`, distinct from the
+    /// hardware's own `Some(0)` for an idle-but-ticked connector - see
+    /// `docs/hardware-roadmap.md`'s H3b). It must contribute zero, not be treated as unknown or
+    /// panic the aggregation, and must not suppress a sibling connector's real reading.
+    #[test]
+    fn apply_ocpp_state_reads_a_connector_with_no_sample_yet_as_zero_not_unknown() {
+        let mut charger = charger_state();
+        let mut ocpp = ocpp_state_with(vec![
+            OcppConnectorState::Available,
+            OcppConnectorState::Charging,
+        ]);
+        ocpp.evses[0].latest_meter_samples[1] = Some(MeterSample {
+            energy_wh: 500,
+            power_w: Some(3_700),
+            current_ma: Some(16_000),
+            voltage_v: Some(230),
+            soc_percent: None,
+        });
+
+        apply_ocpp_state(&mut charger, &ocpp);
+
+        let metrics = charger.evses[0].metrics;
+        assert!((metrics.energy_kwh - 0.5).abs() < 1e-9);
+        assert!((metrics.power_kw - 3.7).abs() < 1e-9);
     }
 
     #[test]
@@ -544,60 +654,5 @@ mod tests {
             build_ocpp_event_for_connector(&ocpp, 0, 5, Command::PlugInVehicle, ""),
             None
         );
-    }
-
-    #[test]
-    fn meter_sample_events_reports_only_charging_connectors() {
-        let mut charger = charger_state();
-        charger.evses[0].connectors[0].status = ConnectorStatus::Charging;
-        charger.evses[0].connectors[1].status = ConnectorStatus::Available;
-        charger.evses[0].metrics.energy_kwh = 1.5;
-
-        let events = meter_sample_events(&charger);
-
-        assert_eq!(
-            events,
-            vec![ChargePointEvent::Evse {
-                evse_id: 0,
-                event: EvseEvent::Connector {
-                    connector_id: 0,
-                    event: ConnectorEvent::MeterValueSampled(MeterSample {
-                        energy_wh: 1500,
-                        ..Default::default()
-                    }),
-                },
-            }]
-        );
-    }
-
-    #[test]
-    fn meter_sample_events_is_empty_when_nothing_is_charging() {
-        let charger = charger_state();
-        assert_eq!(meter_sample_events(&charger), Vec::new());
-    }
-
-    #[test]
-    fn meter_sample_events_reports_every_charging_connector_on_an_evse() {
-        let mut charger = charger_state();
-        charger.evses[0].connectors[0].status = ConnectorStatus::Charging;
-        charger.evses[0].connectors[1].status = ConnectorStatus::Charging;
-        charger.evses[0].metrics.energy_kwh = 2.0;
-
-        let events = meter_sample_events(&charger);
-
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|event| matches!(
-            event,
-            ChargePointEvent::Evse {
-                event: EvseEvent::Connector {
-                    event: ConnectorEvent::MeterValueSampled(MeterSample {
-                        energy_wh: 2000,
-                        ..
-                    }),
-                    ..
-                },
-                ..
-            }
-        )));
     }
 }

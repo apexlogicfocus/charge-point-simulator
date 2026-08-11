@@ -7,6 +7,7 @@ mod connection_store;
 mod hardware;
 mod hardware_bundle;
 mod ocpp_bridge;
+mod running_charger;
 mod state;
 
 pub use catalog::{
@@ -21,9 +22,10 @@ pub use hardware::{
     FakeChargePoint, FakeConnector, FakeDisplay, FakeEvse, FileStorage, FileStorageError,
 };
 pub use hardware_bundle::ChargerHardware;
-pub use ocpp_bridge::{apply_ocpp_state, build_ocpp_event_for_connector, meter_sample_events};
+pub use ocpp_bridge::{apply_ocpp_state, build_ocpp_event_for_connector};
+pub use ocpp_charge_point::ConnectAndSetupError;
 pub use ocpp_charge_point::state::{ChargePointEvent, ChargePointState};
-pub use ocpp_charge_point::{ChargePointRuntime, ConnectAndSetupError};
+pub use running_charger::{RunningCharger, start_local_charger};
 pub use state::{
     ChargerState, ConnectionStatus, ConnectorState, ConnectorStatus, EvseMetrics, EvseState,
     SimulationMode, Vehicle,

@@ -77,11 +77,13 @@ cargo fmt --all
 model, fake hardware, and a live OCPP 2.1 bridge (`connect_charger` + `apply_ocpp_state`); the
 TUI has a working picker → connection setup → dashboard flow.
 
-Two things worth knowing before touching the dashboard:
+One thing worth knowing before touching the dashboard:
 
-- A charger's `connection_status` is only ever advanced by the live OCPP 2.1 bridge
-  (`ocpp_bridge.rs`). A local (1.6J / unconnected) simulation is seeded `Booting` by
-  `ChargerState::from_config` and stays there, so the dashboard currently reports `booting`
-  forever for those.
 - `LogBuffer::set_filter`/`clear_filter` are implemented and tested but no key binding reaches
   them yet — that's the source of the workspace's one `dead_code` warning.
+
+A local (unconnected) charger runs a real `ocpp_charge_point::ChargePointRuntime` too (see
+`charger::RunningCharger`/`start_local_charger`), just with no CSMS ever dialed and no
+`register`/`register_until_accepted` call — `apply_ocpp_state` is the single path into
+`ChargerState` for both a local and a live-CSMS charger, and reports a local charger's
+`connection_status` as `Offline` rather than the `Booting` it used to get stuck on forever.

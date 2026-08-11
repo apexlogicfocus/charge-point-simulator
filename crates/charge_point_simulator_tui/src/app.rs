@@ -2,10 +2,10 @@ use crate::logs::{LogBuffer, LogEntry};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
-    ChargePointEvent, ChargePointState, ChargerEntry, ChargerHardware, ChargerState, Command,
-    CommandParameter, ConnectionProfile, ConnectionStore, OcppVersion, SecurityProfile,
-    SimulationMode, apply_ocpp_state, build_ocpp_event_for_connector, connect_charger,
-    meter_sample_events,
+    ChargePointEvent, ChargePointState, ChargerConfig, ChargerEntry, ChargerHardware, ChargerState,
+    Command, CommandParameter, ConnectionProfile, ConnectionStore, OcppVersion, RunningCharger,
+    SecurityProfile, SimulationMode, apply_ocpp_state, build_ocpp_event_for_connector,
+    connect_charger, start_local_charger,
 };
 use color_eyre::Result;
 use crossterm::event::{
@@ -24,12 +24,6 @@ use tokio::sync::oneshot;
 /// externally-sourced log lines (tracing output from the simulator, and
 /// eventually `ocpp-charge-point`) show up promptly even with no input.
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// How often to forward simulated meter readings to a connected CSMS as real
-/// `MeterValueSampled` events. Real deployments typically use ~60s+ (configurable via
-/// `SetVariables`); shorter here so a demo session actually sees TransactionEvent traffic
-/// without waiting a minute for it.
-const METER_VALUE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How a status message in the command bar should read: [`theme::ok`] or [`theme::error`].
 /// Carried alongside the message text itself rather than left for the renderer to infer from
@@ -124,12 +118,19 @@ pub struct App {
     /// longer point at the same suggestion once the (filtered) list changes.
     pub connection_url_suggestion: Option<usize>,
     pub connect_result_receiver: Option<oneshot::Receiver<Result<(), String>>>,
-    /// Live protocol state snapshots forwarded from a connected OCPP 2.1 charger's
-    /// background connection thread, drained each frame by [`Self::drain_ocpp_state_receiver`].
+    /// Live protocol state snapshots forwarded from a running charger's background thread -
+    /// dialed against a real CSMS, or (H3b) running entirely locally with none at all - drained
+    /// each frame by [`Self::drain_ocpp_state_receiver`].
     pub ocpp_state_receiver: Option<UnboundedReceiver<ChargePointState>>,
-    /// Where dispatched commands go instead of the local simulation, once connected to a
-    /// real CSMS (see [`Self::apply_command`]).
+    /// Where dispatched commands go once a charger's background thread is running, whether that
+    /// charger has a live CSMS on the other end or not (see [`Self::apply_command`]).
     pub ocpp_event_sender: Option<UnboundedSender<ChargePointEvent>>,
+    /// Forwards this frame's simulated `elapsed` to the running charger's background thread, so
+    /// it can call `RunningCharger::tick` - the single entry point through which a charger's
+    /// meter moves, for a local charger and a live-CSMS one alike (H3b). `None` until a charger's
+    /// background thread has been spawned - see [`Self::spawn_local_charger`]/
+    /// [`Self::confirm_connection_setup`].
+    pub ocpp_tick_sender: Option<UnboundedSender<Duration>>,
     /// The most recent snapshot from `ocpp_state_receiver`, used to decide what event a
     /// dispatched command maps to (see [`charge_point_simulator_core::charger::build_ocpp_event`]).
     pub live_ocpp_state: Option<ChargePointState>,
@@ -137,9 +138,6 @@ pub struct App {
     /// frames rather than assuming a fixed interval (the main loop's actual cadence varies
     /// with input activity).
     pub last_metrics_tick: Option<Instant>,
-    /// When a `MeterValueSampled` event was last sent to a connected CSMS, throttling
-    /// against [`METER_VALUE_INTERVAL`].
-    pub last_meter_value_sent: Option<Instant>,
     /// The terminal area the last frame was drawn into, stashed by [`Self::draw`] so
     /// [`Self::handle_mouse_event`] can hit-test clicks against the exact layout that frame
     /// used, without an extra `crossterm::terminal::size()` call (and the "no real terminal in
@@ -196,6 +194,53 @@ fn resolve_simulation_mode(csms_url: &str) -> SimulationMode {
             url: csms_url.to_string(),
         }
     }
+}
+
+/// Runs a [`RunningCharger`] to completion: publishes every state snapshot to `state_sender`,
+/// applies every dispatched command from `event_receiver`, and calls `RunningCharger::tick` for
+/// every simulated `elapsed` forwarded on `tick_receiver` - the one driving loop a charger's
+/// background thread runs, identical whether `running` came from [`connect_charger`] (a real
+/// CSMS on the other end) or [`start_local_charger`] (nothing at all). That sameness is the
+/// point of `docs/hardware-roadmap.md`'s H3b: a local and a connected charger differ only in how
+/// `running` was built, never in how it's driven afterwards.
+///
+/// Returns once every one of `state_sender`/`event_receiver`/`tick_receiver`'s `App`-side
+/// counterpart has been dropped (see [`App::return_to_picker`]), which is what lets the spawning
+/// thread exit instead of running forever against a charger that's no longer shown.
+async fn drive_running_charger(
+    running: RunningCharger,
+    state_sender: UnboundedSender<ChargePointState>,
+    mut event_receiver: UnboundedReceiver<ChargePointEvent>,
+    mut tick_receiver: UnboundedReceiver<Duration>,
+) {
+    // Published proactively rather than waiting for the first `changed()`: `subscribe()` only
+    // yields *future* changes, and a charger nothing has happened to yet (freshly started, no
+    // commands, no ticks) might never produce one on its own - which would leave
+    // `apply_ocpp_state` never having run at all. A `Local` charger's `Offline` status (H3b)
+    // depends on it having run at least once, even for a charger sitting idle.
+    let _ = state_sender.send(running.state());
+
+    let mut states = running.subscribe();
+    let forward_states = async {
+        loop {
+            states.changed().await;
+            let state = states.borrow();
+            if state_sender.send(state).is_err() {
+                break;
+            }
+        }
+    };
+    let forward_commands = async {
+        while let Some(event) = event_receiver.recv().await {
+            let _ = running.send(event).await;
+        }
+    };
+    let forward_ticks = async {
+        while let Some(elapsed) = tick_receiver.recv().await {
+            running.tick(elapsed).await;
+        }
+    };
+    tokio::join!(forward_states, forward_commands, forward_ticks);
 }
 
 /// Where `charger_id`'s persisted hardware state (in-flight transaction, boot reason, cached
@@ -1065,15 +1110,52 @@ impl App {
             // Reset so the first tick on the new charger sees zero elapsed time instead of
             // however long was spent idling on the picker.
             self.last_metrics_tick = None;
-            self.last_meter_value_sent = None;
 
             if charger.config.ocpp_version == OcppVersion::V21 {
                 self.enter_connection_setup(&charger.config.id);
                 self.screen = Screen::ConnectionSetup;
             } else {
+                // 1.6J/2.0.1 chargers never go through the connection setup screen at all - see
+                // `selecting_a_1_6j_or_2_0_1_charger_still_goes_straight_to_the_dashboard` - so
+                // this is the only place their (always-local; `connect_charger` is 2.1-only)
+                // runtime ever gets started.
+                self.spawn_local_charger(charger.config);
                 self.screen = Screen::Dashboard;
             }
         }
+    }
+
+    /// Starts `config` running locally - no CSMS, no dial, no registration - on a dedicated
+    /// background thread built the same way [`Self::confirm_connection_setup`]'s connected path
+    /// is, wiring up the same state/command/tick channels (see [`drive_running_charger`]).
+    ///
+    /// A dedicated OS thread with its own single-threaded runtime isn't strictly required here
+    /// the way it is for [`connect_charger`] (whose future isn't `Send` - see
+    /// `confirm_connection_setup`'s own comment); [`start_local_charger`]'s future is `Send`; a
+    /// `tokio::spawn` onto the app's own runtime would work too. Using the identical thread shape
+    /// anyway is deliberate: `docs/hardware-roadmap.md`'s H3b is about a local and a connected
+    /// charger being driven the same way, and that includes the TUI-side plumbing, not only the
+    /// `core` types underneath it.
+    fn spawn_local_charger(&mut self, config: ChargerConfig) {
+        let (state_sender, state_receiver) = mpsc::unbounded_channel();
+        self.ocpp_state_receiver = Some(state_receiver);
+
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        self.ocpp_event_sender = Some(event_sender);
+
+        let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
+        self.ocpp_tick_sender = Some(tick_sender);
+
+        std::thread::spawn(move || {
+            let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build a runtime for the local charger");
+            tokio_runtime.block_on(async move {
+                let running = start_local_charger(&config).await;
+                drive_running_charger(running, state_sender, event_receiver, tick_receiver).await;
+            });
+        });
     }
 
     /// Prefills the connection setup fields from the last-remembered profile for
@@ -1156,59 +1238,54 @@ impl App {
 
         self.screen = Screen::Dashboard;
 
-        if !profile.csms_url.trim().is_empty() {
-            let (result_sender, result_receiver) = oneshot::channel();
-            self.connect_result_receiver = Some(result_receiver);
-
-            let (state_sender, state_receiver) = mpsc::unbounded_channel();
-            self.ocpp_state_receiver = Some(state_receiver);
-
-            let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
-            self.ocpp_event_sender = Some(event_sender);
-
-            // `connect_and_setup`'s future isn't `Send` (upstream uses non-Send sync
-            // primitives internally), so it can't go through `tokio::spawn`. A dedicated
-            // thread with its own single-threaded runtime sidesteps that: `block_on`
-            // doesn't require `Send`. Unlike a one-shot connect attempt, this thread
-            // outlives the initial handshake: once connected, it forwards every live state
-            // snapshot and every dispatched command for as long as the App's receiver/sender
-            // ends of these channels stay alive (dropped in `return_to_picker`, which ends
-            // both loops and lets the thread exit).
-            std::thread::spawn(move || {
-                let tokio_runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build a runtime for the CSMS connection attempt");
-                tokio_runtime.block_on(async move {
-                    let hardware = ChargerHardware::new(charger_storage_dir(&config.id));
-                    match connect_charger(&config, &profile, hardware).await {
-                        Ok(charge_point_runtime) => {
-                            let _ = result_sender.send(Ok(()));
-
-                            let mut ocpp_states = charge_point_runtime.subscribe();
-                            let forward_states = async {
-                                loop {
-                                    ocpp_states.changed().await;
-                                    let state = ocpp_states.borrow();
-                                    if state_sender.send(state).is_err() {
-                                        break;
-                                    }
-                                }
-                            };
-                            let forward_commands = async {
-                                while let Some(event) = event_receiver.recv().await {
-                                    let _ = charge_point_runtime.send(event).await;
-                                }
-                            };
-                            tokio::join!(forward_states, forward_commands);
-                        }
-                        Err(error) => {
-                            let _ = result_sender.send(Err(error.to_string()));
-                        }
-                    }
-                });
-            });
+        if profile.csms_url.trim().is_empty() {
+            // Local was chosen on the connection setup screen itself - same runtime, same
+            // channels, same background-thread shape as a 1.6J/2.0.1 charger going straight to
+            // the dashboard (see [`Self::spawn_local_charger`]), just reached from here instead.
+            self.spawn_local_charger(config);
+            return;
         }
+
+        let (result_sender, result_receiver) = oneshot::channel();
+        self.connect_result_receiver = Some(result_receiver);
+
+        let (state_sender, state_receiver) = mpsc::unbounded_channel();
+        self.ocpp_state_receiver = Some(state_receiver);
+
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        self.ocpp_event_sender = Some(event_sender);
+
+        let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
+        self.ocpp_tick_sender = Some(tick_sender);
+
+        // `connect_and_setup`'s future isn't `Send` (upstream uses non-Send sync
+        // primitives internally), so it can't go through `tokio::spawn`. A dedicated
+        // thread with its own single-threaded runtime sidesteps that: `block_on`
+        // doesn't require `Send`. Unlike a one-shot connect attempt, this thread
+        // outlives the initial handshake: once connected, it forwards every live state
+        // snapshot, every dispatched command and every simulated-time tick for as long as the
+        // App's receiver/sender ends of these channels stay alive (dropped in
+        // `return_to_picker`, which ends every loop in `drive_running_charger` and lets the
+        // thread exit).
+        std::thread::spawn(move || {
+            let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build a runtime for the CSMS connection attempt");
+            tokio_runtime.block_on(async move {
+                let hardware = ChargerHardware::new(charger_storage_dir(&config.id));
+                match connect_charger(&config, &profile, hardware).await {
+                    Ok(running) => {
+                        let _ = result_sender.send(Ok(()));
+                        drive_running_charger(running, state_sender, event_receiver, tick_receiver)
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = result_sender.send(Err(error.to_string()));
+                    }
+                }
+            });
+        });
     }
 
     /// Checks whether a background CSMS connection attempt has resolved, and if so
@@ -1250,6 +1327,7 @@ impl App {
         self.status_message = None;
         self.ocpp_state_receiver = None;
         self.ocpp_event_sender = None;
+        self.ocpp_tick_sender = None;
         self.live_ocpp_state = None;
         self.screen = Screen::PickCharger;
     }
@@ -1280,10 +1358,11 @@ impl App {
         }
     }
 
-    /// Advances the focused charger's simulated meter reading by the real time elapsed since
-    /// the last call (not a fixed per-frame amount, since the main loop's cadence varies with
-    /// input activity), then forwards a `MeterValueSampled` event per charging connector to a
-    /// connected CSMS if [`METER_VALUE_INTERVAL`] has elapsed since the last one was sent.
+    /// Advances the focused charger's session/SoC bookkeeping (see [`ChargerState::tick`]) by the
+    /// real time elapsed since the last call (not a fixed per-frame amount, since the main
+    /// loop's cadence varies with input activity), and forwards that same `elapsed` to the
+    /// charger's background thread so it can call `RunningCharger::tick` - the only thing that
+    /// actually advances the meter, for a local charger and a live-CSMS one alike (H3b).
     fn tick_metrics(&mut self) {
         let now = Instant::now();
         let elapsed = self
@@ -1299,7 +1378,9 @@ impl App {
             state.tick(elapsed);
         }
         self.expire_status_message(now);
-        self.maybe_send_meter_values(now);
+        if let Some(sender) = &self.ocpp_tick_sender {
+            let _ = sender.send(elapsed);
+        }
     }
 
     /// Shows `message` in the command bar, stamped so it expires. Always go through this
@@ -1318,27 +1399,6 @@ impl App {
             && now.duration_since(toast.shown_at) >= STATUS_MESSAGE_TTL
         {
             self.status_message = None;
-        }
-    }
-
-    fn maybe_send_meter_values(&mut self, now: Instant) {
-        let Some(sender) = &self.ocpp_event_sender else {
-            return;
-        };
-        let due = match self.last_meter_value_sent {
-            Some(last) => now.duration_since(last) >= METER_VALUE_INTERVAL,
-            None => true,
-        };
-        if !due {
-            return;
-        }
-        self.last_meter_value_sent = Some(now);
-
-        let Some(state) = &self.charger_state else {
-            return;
-        };
-        for event in meter_sample_events(state) {
-            let _ = sender.send(event);
         }
     }
 }
@@ -1631,6 +1691,42 @@ mod tests {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
         assert_eq!(log_messages(&app.logs), vec!["CP001 booting"]);
+    }
+
+    /// End-to-end proof of the bug `CLAUDE.md` used to record and `docs/hardware-roadmap.md`'s
+    /// H3b fixes: a locally-driven charger's `connection_status` no longer reports `Booting`
+    /// forever. `confirm_charger_selection` really does spawn a background thread running a real
+    /// `RunningCharger` (see `spawn_local_charger`) - unlike every other test in this module,
+    /// this one lets that thread actually run rather than injecting `ocpp_state_receiver`/
+    /// `ocpp_tick_sender` by hand, so it is deliberately the one place this suite waits on real
+    /// (if very short-lived) background-thread timing. The thread does no I/O - it only starts
+    /// the fake hardware and an authorization worker - so polling is bounded well under what
+    /// would ever be a flake risk in practice; a genuine regression (the thread never sending
+    /// anything, or `apply_ocpp_state` never reaching `Offline`) fails this test rather than
+    /// hanging it.
+    #[test]
+    fn a_locally_selected_charger_reports_offline_rather_than_booting_forever() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        assert_eq!(
+            app.charger_state.as_ref().unwrap().connection_status,
+            ConnectionStatus::Booting,
+            "the freshly seeded state reads Booting until the background thread's first \
+             snapshot is drained"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.drain_ocpp_state_receiver();
+            if app.charger_state.as_ref().unwrap().connection_status == ConnectionStatus::Offline {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never received a snapshot from the local charger's background thread"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -2675,6 +2771,39 @@ mod tests {
         assert_eq!(app.screen, Screen::PickCharger);
     }
 
+    /// The other entry point into [`App::spawn_local_charger`] (see
+    /// `a_locally_selected_charger_reports_offline_rather_than_booting_forever` for the
+    /// 1.6J/2.0.1 one): a 2.1 charger that reaches the connection setup screen but is confirmed
+    /// with a blank CSMS URL. Same real background thread, same bounded poll for its first
+    /// snapshot - see that test's doc comment for why this isn't flaky in practice.
+    #[test]
+    fn confirming_connection_setup_with_a_blank_url_runs_locally_and_reports_offline() {
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
+        app.confirm_charger_selection();
+        assert_eq!(app.connection_csms_url.value(), "");
+
+        app.confirm_connection_setup();
+
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert_eq!(
+            app.charger_state.as_ref().unwrap().mode,
+            SimulationMode::Local
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.drain_ocpp_state_receiver();
+            if app.charger_state.as_ref().unwrap().connection_status == ConnectionStatus::Offline {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never received a snapshot from the local charger's background thread"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn confirming_with_a_url_remembers_the_profile_and_starts_a_connect_attempt() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
@@ -3035,20 +3164,6 @@ mod tests {
     }
 
     #[test]
-    fn tick_metrics_advances_the_focused_chargers_simulated_meter_by_the_given_elapsed_time() {
-        let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
-            ConnectorStatus::Charging;
-
-        app.tick_metrics_with(Duration::from_secs(3600), Instant::now());
-
-        let metrics = app.charger_state.as_ref().unwrap().evses[0].metrics;
-        assert!(metrics.power_kw > 0.0);
-        assert!(metrics.energy_kwh > 0.0);
-    }
-
-    #[test]
     fn tick_metrics_does_nothing_without_a_selected_charger() {
         let mut app = App::new(vec![]);
         // Just proving this doesn't panic with no charger selected.
@@ -3056,65 +3171,62 @@ mod tests {
         assert!(app.charger_state.is_none());
     }
 
+    /// H3b: the meter itself lives in `core`'s hardware layer now, driven by
+    /// `RunningCharger::tick` on the charger's background thread - `tick_metrics_with` only
+    /// forwards the elapsed duration there. Injects `ocpp_tick_sender` directly (the same style
+    /// `apply_command`'s connected-mode tests inject `ocpp_event_sender`/`live_ocpp_state`)
+    /// rather than exercising the real spawned thread, so this stays a fast, deterministic test
+    /// of the wiring - the physics themselves are `core`'s to test.
     #[test]
-    fn maybe_send_meter_values_sends_immediately_the_first_time_a_csms_is_connected() {
+    fn tick_metrics_forwards_the_elapsed_duration_to_the_running_chargers_tick_channel() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
-            ConnectorStatus::Charging;
-        app.charger_state.as_mut().unwrap().evses[0]
-            .metrics
-            .energy_kwh = 1.0;
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        app.ocpp_event_sender = Some(sender);
+        app.ocpp_tick_sender = Some(sender);
 
-        app.tick_metrics_with(Duration::ZERO, Instant::now());
-
-        assert!(receiver.try_recv().is_ok());
-    }
-
-    #[test]
-    fn maybe_send_meter_values_is_throttled_until_the_interval_elapses() {
-        let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
-            ConnectorStatus::Charging;
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        app.ocpp_event_sender = Some(sender);
-
-        let start = Instant::now();
-        app.tick_metrics_with(Duration::ZERO, start);
-        receiver.try_recv().unwrap(); // drain the first, immediate send
-
-        app.tick_metrics_with(Duration::ZERO, start + Duration::from_secs(1));
-        assert!(
-            receiver.try_recv().is_err(),
-            "resent before the interval elapsed"
-        );
-
-        app.tick_metrics_with(Duration::ZERO, start + METER_VALUE_INTERVAL);
-        assert!(
-            receiver.try_recv().is_ok(),
-            "did not resend once the interval elapsed"
-        );
-    }
-
-    #[test]
-    fn maybe_send_meter_values_does_nothing_without_a_live_csms_sender() {
-        let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
-        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
-            ConnectorStatus::Charging;
-
-        // No panic and nothing queued, since there's no `ocpp_event_sender` to send through.
         app.tick_metrics_with(Duration::from_secs(3600), Instant::now());
-        assert!(app.ocpp_event_sender.is_none());
+
+        assert_eq!(receiver.try_recv().unwrap(), Duration::from_secs(3600));
+    }
+
+    /// Every tick forwards, with no throttling - unlike the old `MeterValueSampled` push this
+    /// replaced, there is no reason to hold anything back: `RunningCharger::tick` is meant to be
+    /// called on exactly the cadence the app already ticks at (H3b).
+    #[test]
+    fn tick_metrics_forwards_every_tick_with_no_throttling() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.ocpp_tick_sender = Some(sender);
+
+        let now = Instant::now();
+        app.tick_metrics_with(Duration::from_millis(100), now);
+        app.tick_metrics_with(Duration::from_millis(100), now);
+
+        assert_eq!(receiver.try_recv().unwrap(), Duration::from_millis(100));
+        assert_eq!(receiver.try_recv().unwrap(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn tick_metrics_does_nothing_without_a_running_chargers_tick_channel() {
+        let mut app = App::new(vec![]);
+
+        // No panic and nothing to send through, since there's no `ocpp_tick_sender` at all.
+        app.tick_metrics_with(Duration::from_secs(3600), Instant::now());
+        assert!(app.ocpp_tick_sender.is_none());
     }
 
     #[test]
     fn drain_ocpp_state_receiver_applies_incoming_snapshots_and_remembers_the_latest() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
         app.confirm_charger_selection();
+        // H3b: `apply_ocpp_state` only reads `registration` for a `LiveCsms` charger - a `Local`
+        // one (what `confirm_charger_selection` alone leaves this charger as, since it hasn't
+        // gone through `confirm_connection_setup` yet) always reads `Offline` regardless. This
+        // test is specifically about the connected path, so give it a CSMS to be connected to.
+        app.charger_state.as_mut().unwrap().mode = SimulationMode::LiveCsms {
+            url: "ws://csms.example/CP-2.1".into(),
+        };
         let (sender, receiver) = mpsc::unbounded_channel();
         app.ocpp_state_receiver = Some(receiver);
 

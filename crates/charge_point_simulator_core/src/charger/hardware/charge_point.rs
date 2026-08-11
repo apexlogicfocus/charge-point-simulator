@@ -12,24 +12,42 @@ use crate::charger::config::ChargerConfig;
 use super::connector::FakeConnector;
 use super::evse::FakeEvse;
 
-/// Fake hardware for a charger: an EVSE/connector layout with no physical backing,
-/// built to match a [`ChargerConfig`] so the shape the OCPP stack sees lines up with
-/// what the picker/dashboard shows.
-pub struct FakeChargePoint {
+/// The data behind a [`FakeChargePoint`], shared via an `Arc` rather than owned directly by it -
+/// see that type's doc comment for why.
+struct Inner {
     vendor_name: String,
     model_name: String,
     evses: Vec<FakeEvse>,
     capabilities: Capabilities,
-    /// The [`HardwareEventSender`] handed to [`Self::start`], stashed so [`Self::tick`] can push
-    /// meter samples after `start` returns. `None` until `start` runs - a charge point that's
-    /// never been started (e.g. a unit test that only checks `capabilities()`) simply has nowhere
-    /// to send a tick's samples, and `tick` treats that as a no-op rather than a panic.
+    /// The [`HardwareEventSender`] handed to [`FakeChargePoint::start`], stashed so
+    /// [`FakeChargePoint::tick`] can push meter samples after `start` returns. `None` until
+    /// `start` runs - a charge point that's never been started (e.g. a unit test that only
+    /// checks `capabilities()`) simply has nowhere to send a tick's samples, and `tick` treats
+    /// that as a no-op rather than a panic.
     events: Mutex<Option<HardwareEventSender>>,
 }
 
+/// Fake hardware for a charger: an EVSE/connector layout with no physical backing,
+/// built to match a [`ChargerConfig`] so the shape the OCPP stack sees lines up with
+/// what the picker/dashboard shows.
+///
+/// Cheaply [`Clone`] - every clone shares the same [`Inner`] via an internal `Arc`, rather than
+/// each clone getting its own independent (and therefore out-of-sync) hardware state. This is
+/// what lets a caller keep a handle onto this charge point for calling [`Self::tick`] after
+/// handing another clone's *ownership* to `ocpp_charge_point::ChargePointBuilder::start`/
+/// `ocpp_charge_point::ChargePointRuntime::new` - both take their hardware binding `T` by value
+/// and wrap it in their own internal `Arc<T>` that nothing outside that crate can ever reach
+/// again (`ChargePointRuntime::hardware_handle` is `pub(crate)` there). See
+/// `docs/hardware-roadmap.md`'s H3b and [`super::super::running_charger::RunningCharger`], which
+/// this makes possible: every clone's [`Inner::events`] is the exact same [`Mutex`], so whichever
+/// clone's [`Self::start`] actually runs is the one every other clone's [`Self::tick`] pushes
+/// samples through.
+#[derive(Clone)]
+pub struct FakeChargePoint(Arc<Inner>);
+
 impl FakeChargePoint {
     pub fn from_config(config: &ChargerConfig) -> Self {
-        Self {
+        Self(Arc::new(Inner {
             vendor_name: "Flowion".to_string(),
             model_name: config.id.clone(),
             evses: config
@@ -48,7 +66,7 @@ impl FakeChargePoint {
             // in a config once hardware here actually backs it.
             capabilities: config.capabilities(),
             events: Mutex::new(None),
-        }
+        }))
     }
 
     /// Advances every connector's simulated meter by `elapsed` and reports each one's sample to
@@ -60,23 +78,22 @@ impl FakeChargePoint {
     /// for tracing - the runtime's `ChargePointState` is built with one EVSE/connector slot per
     /// position in the `connector_counts` this charge point's shape produced (see
     /// `ChargePointRuntime::new`), so that position is the addressing scheme the actor actually
-    /// understands. `charger/ocpp_bridge.rs`'s `meter_sample_events` addresses the same way, for
-    /// the same reason.
+    /// understands.
     ///
     /// Simulated time only, injected by the caller (decision 2 in `docs/hardware-roadmap.md`'s
     /// "Decisions taken") - this type never owns a `tokio::time::interval` or reads a wall clock.
-    /// Nothing calls this yet: it exists so the physics-convergence task (the second half of H3)
-    /// has a driving entry point to wire up in place of `EvseState::tick`'s accumulator in
-    /// `charger/state.rs`, once a local (unconnected) simulation has a hardware layer to route
-    /// its meter samples through. Calling this before [`Self::start`] has run is a silent no-op -
-    /// there is no sender yet to push a sample through.
+    /// This is the single entry point through which a charger's meter moves, for both a local and
+    /// a live-CSMS charger alike (H3b) - `charge_point_simulator_tui`'s `App` calls it on its own
+    /// tick cadence, in place of the physics that used to live in `charger/state.rs`'s
+    /// `EvseState::tick`. Calling this before [`Self::start`] has run is a silent no-op - there is
+    /// no sender yet to push a sample through.
     pub async fn tick(&self, elapsed: Duration) {
-        let events = self.events.lock().expect("lock poisoned").clone();
+        let events = self.0.events.lock().expect("lock poisoned").clone();
         let Some(events) = events else {
             return;
         };
 
-        for (evse_id, evse) in self.evses.iter().enumerate() {
+        for (evse_id, evse) in self.0.evses.iter().enumerate() {
             for (connector_id, connector) in evse.connectors().iter().enumerate() {
                 let sample = connector.tick(elapsed);
                 if let Err(error) = events
@@ -101,19 +118,19 @@ impl ChargePoint<FakeEvse, FakeConnector> for FakeChargePoint {
     type StartError = core::convert::Infallible;
 
     fn vendor_name(&self) -> &str {
-        &self.vendor_name
+        &self.0.vendor_name
     }
 
     fn model_name(&self) -> &str {
-        &self.model_name
+        &self.0.model_name
     }
 
     fn evses(&self) -> &[FakeEvse] {
-        &self.evses
+        &self.0.evses
     }
 
     fn capabilities(&self) -> Capabilities {
-        self.capabilities
+        self.0.capabilities
     }
 
     /// `setup()` (in `ocpp-charge-point`) awaits `start()` directly before registering with the
@@ -125,7 +142,7 @@ impl ChargePoint<FakeEvse, FakeConnector> for FakeChargePoint {
         events: HardwareEventSender,
         mut commands: HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
-        *self.events.lock().expect("lock poisoned") = Some(events.clone());
+        *self.0.events.lock().expect("lock poisoned") = Some(events.clone());
         tokio::spawn(async move {
             while let Ok(command) = commands.recv().await {
                 execute_hardware_command(self.evses(), command, &events).await;

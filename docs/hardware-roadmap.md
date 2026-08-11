@@ -71,6 +71,34 @@ The guiding principles, which every task should be checked against:
   `Never`/`Cleared`/`Message` enum rather than an `Option`, because upstream defines `show(None)` as
   "clear the screen", not "no change". `supported_formats` deliberately omits `Html`/`Uri`/`QrCode`
   so the handler's `NotSupportedMessageFormat` path stays exercisable.
+- **H3b** — the convergence: `EvseState::tick` no longer computes anything electrical (only
+  `session_duration`/SoC remain, per decision — no vehicle model exists down in the hardware layer
+  yet); `apply_ocpp_state` is now the single path into `ChargerState`, for a local charger and a
+  live-CSMS one alike, both `connection_status` (via `SimulationMode`) and `EvseMetrics` (summed
+  from `ChargePointState`'s per-connector `latest_meter_samples`). `ocpp_bridge::meter_sample_events`
+  and the TUI's `maybe_send_meter_values` are gone; the TUI forwards its own tick cadence straight
+  into `RunningCharger::tick` instead.
+
+  **The handle problem.** `connect_charger` moves a `FakeChargePoint` into `ChargePointBuilder`,
+  which wraps it in its own internal `Arc` nothing outside `ocpp_charge_point` can reach again — so
+  the caller loses the only handle that could tick it afterwards. Fixed at the source:
+  `FakeChargePoint` is now a cheap `Clone` (an `Arc`-backed newtype internally), so both
+  `connect_charger` and the new `start_local_charger` clone it *before* handing one clone's
+  ownership away, and bundle the surviving clone with the runtime in a new `RunningCharger`
+  (`Deref`s to `ChargePointRuntime` for everything but `tick`). One type, either constructor.
+
+  **Local mode needed an Authorizer, not just a runtime.** A bare `ChargePointRuntime::new` has no
+  functional blocks at all — including Authorization — so a connector presenting an identifier
+  would sit in `Authorizing` forever with nothing to answer it, and the meter (gated on the
+  contactor, which only closes once a connector reaches `Charging`) would never move. `start_local_charger`
+  goes through `ChargePointBuilder` after all, registering only `authorization()` against a trivial
+  always-accept `LocalAuthorizer` — the same stance `ocpp-charge-point`'s own
+  `examples/simulated_charge_point.rs` takes for its no-CSMS mode. No dial, no `register`/
+  `register_until_accepted` call, so `ChargePointState::registration` stays `None` forever and
+  `apply_ocpp_state` reads that (via `SimulationMode::Local`) as `Offline`.
+
+  Decision made: idle meter fields read `Some(0)` (the hardware's answer), never `None` — settled
+  by construction once `meter_sample_events` (the only caller of the `None` convention) was deleted.
 
 - **H5b + H6b** — done as one task, since both are registrations into the same two files and
   splitting them would only have manufactured a conflict. `ChargerHardware` grew
@@ -93,20 +121,20 @@ The guiding principles, which every task should be checked against:
 
 ## Where we are
 
-The baseline, after moving from the `ocpp-charge-point` git dependency to the published 0.1.0:
+Every charger — local or connected — runs a real `ocpp_charge_point::ChargePointRuntime` (see
+`charger::RunningCharger`), driving the exact same connector state machine and hardware layer:
 
 - `FakeChargePoint` / `FakeEvse` / `FakeConnector` implement `ChargePoint`, `Evse`, and
-  `Connector` — the three required traits, and nothing else.
+  `Connector` — the three required traits, plus a per-connector `SimulatedMeter`.
 - `capabilities()` returns `Capabilities::default().with_has_display(config.has_display)`: every
   other flag is `false`, so the CSMS is told nothing the simulator can't do.
-- `set_current_limit` records its argument and is otherwise inert. Nothing consumes it.
+- `set_current_limit` clamps `SimulatedMeter`'s simulated current draw.
 - `Evse::reboot` logs and returns `Ok`.
-- The charging physics live somewhere else entirely: `EvseState::tick` in `charger/state.rs`
-  accumulates energy, power, current, session duration, and SoC, and the TUI pushes the result
-  into the OCPP stack as `MeterSample { energy_wh, .. }` via `meter_sample_events`. The hardware
-  layer contributes nothing to it.
+- `charger/state.rs` no longer simulates anything electrical or drives `connection_status` itself;
+  `ocpp_bridge::apply_ocpp_state` is the only thing that writes either, from a real
+  `ChargePointState` snapshot.
 
-So there are two simulations that don't know about each other, and the hardware one is empty.
+One simulation, as the guiding principle at the top of this document says.
 
 ## Decisions taken
 
@@ -377,7 +405,7 @@ something only the current branch has is the cheap guard.
 | --- | --- | --- |
 | 0 | ~~**H1**, **H2**~~ | Done. Different files, so both at once. H1 was hours; H2 was the long pole, as expected. |
 | 1 | ~~**H3**, **H4**, **H5a**, **H6a**~~ | Done, four-way parallel. H5a and H6a were the cheapest to hand off, exactly as predicted — pure trait impls, no dependency on H2. |
-| 2 | ~~**H5b+H6b**~~, **H3b**, **H7** | H5b+H6b done as one task. H3b then H7, sequenced — both own `state.rs`, and H3b is large enough without absorbing it. H11 turned out to be blocked upstream; see its section. |
+| 2 | ~~**H5b+H6b**~~, ~~**H3b**~~, **H7** | H5b+H6b done as one task. H3b followed, and ended up owning `charger/connect.rs` too for the handle problem — see its "Done" entry. H7 is what's left. H11 turned out to be blocked upstream; see its section. |
 | 3 | **H8**, **H9**, **H10**, **H12** | The widest wave: four independent functional blocks. H8 and H9 share `hardware_bundle.rs`, so sequence those two or split the file by block first. |
 | 4 | **H13**, **H14** | H13 needs H12; H14 needs only H3, so H14 can be pulled into wave 3 if someone is free. |
 
