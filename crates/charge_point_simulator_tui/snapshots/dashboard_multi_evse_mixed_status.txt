@@ -7,11 +7,11 @@ EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh                               
 EVSE 2  ✕ faulted   0.00 kW  0.0 A  0.000 kWh                                           soc      100% ██████████
     C1  ✕ faulted                                                                       session  10m 00s
 
+                                                                                        lock     engaged
+                                                                                        contact  closed
+                                                                                        limit    none
+
                                                                                         7.40 kW  32.2 A  1.233 kWh
-
-
-
-
 
 
 

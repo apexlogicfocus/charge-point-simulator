@@ -3,9 +3,11 @@ use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargePointEvent, ChargePointState, ChargerConfig, ChargerEntry, ChargerHardware, ChargerState,
-    Command, CommandParameter, ConnectionProfile, ConnectionStore, OcppVersion, RunningCharger,
-    SecurityProfile, SimulationMode, apply_ocpp_state, build_ocpp_event_for_connector,
-    connect_charger, start_local_charger,
+    Command, CommandParameter, ConnectionProfile, ConnectionStore, ConnectorHardwareSnapshot,
+    ConnectorStatus, FakeFileTransfer, FakeFirmwareInstaller, FakeFirmwareVerifier,
+    FileCertificateStore, FileStorage, FirmwareInstallStage, InFlightTransfer, OcppVersion,
+    RunningCharger, SecurityProfile, SimulationMode, TransferProfile, apply_hardware_snapshot,
+    apply_ocpp_state, build_ocpp_event_for_connector, connect_charger, start_local_charger,
 };
 use color_eyre::Result;
 use crossterm::event::{
@@ -16,6 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -118,10 +121,10 @@ pub struct App {
     /// longer point at the same suggestion once the (filtered) list changes.
     pub connection_url_suggestion: Option<usize>,
     pub connect_result_receiver: Option<oneshot::Receiver<Result<(), String>>>,
-    /// Live protocol state snapshots forwarded from a running charger's background thread -
-    /// dialed against a real CSMS, or (H3b) running entirely locally with none at all - drained
-    /// each frame by [`Self::drain_ocpp_state_receiver`].
-    pub ocpp_state_receiver: Option<UnboundedReceiver<ChargePointState>>,
+    /// Live snapshots forwarded from a running charger's background thread - dialed against a real
+    /// CSMS, or (H3b) running entirely locally with none at all - drained each frame by
+    /// [`Self::drain_charger_snapshots`].
+    pub charger_snapshot_receiver: Option<UnboundedReceiver<ChargerSnapshot>>,
     /// Where dispatched commands go once a charger's background thread is running, whether that
     /// charger has a live CSMS on the other end or not (see [`Self::apply_command`]).
     pub ocpp_event_sender: Option<UnboundedSender<ChargePointEvent>>,
@@ -131,8 +134,17 @@ pub struct App {
     /// background thread has been spawned - see [`Self::spawn_local_charger`]/
     /// [`Self::confirm_connection_setup`].
     pub ocpp_tick_sender: Option<UnboundedSender<Duration>>,
-    /// The most recent snapshot from `ocpp_state_receiver`, used to decide what event a
-    /// dispatched command maps to (see [`charge_point_simulator_core::charger::build_ocpp_event`]).
+    /// The charger-wide firmware/file-transfer activity from the most recent snapshot, rendered as
+    /// the dashboard's activity strip. `CampaignProgress::default()` (everything `None`) both before
+    /// any snapshot arrives and for a charger with no such hardware at all.
+    pub campaigns: CampaignProgress,
+    /// Sends direct hardware actions to the running charger's background thread - today only V2G
+    /// discharge, which no OCPP message can express. `None` until a charger's thread has been
+    /// spawned, the same as [`Self::ocpp_tick_sender`]. See [`HardwareControl`].
+    pub hardware_control_sender: Option<UnboundedSender<HardwareControl>>,
+    /// The most recent protocol state out of `charger_snapshot_receiver`, used to decide what event
+    /// a dispatched command maps to (see
+    /// [`charge_point_simulator_core::charger::build_ocpp_event_for_connector`]).
     pub live_ocpp_state: Option<ChargePointState>,
     /// When [`Self::tick_metrics`] last ran, so it can compute real elapsed time between
     /// frames rather than assuming a fixed interval (the main loop's actual cadence varies
@@ -196,36 +208,247 @@ fn resolve_simulation_mode(csms_url: &str) -> SimulationMode {
     }
 }
 
-/// Runs a [`RunningCharger`] to completion: publishes every state snapshot to `state_sender`,
-/// applies every dispatched command from `event_receiver`, and calls `RunningCharger::tick` for
-/// every simulated `elapsed` forwarded on `tick_receiver` - the one driving loop a charger's
-/// background thread runs, identical whether `running` came from [`connect_charger`] (a real
-/// CSMS on the other end) or [`start_local_charger`] (nothing at all). That sameness is the
-/// point of `docs/hardware-roadmap.md`'s H3b: a local and a connected charger differ only in how
-/// `running` was built, never in how it's driven afterwards.
+/// Everything about a running charger the dashboard can observe, as one owned value that crosses
+/// the thread boundary between the charger and the UI.
 ///
-/// Returns once every one of `state_sender`/`event_receiver`/`tick_receiver`'s `App`-side
+/// Two halves, because they come from two different places and only one of them exists in the OCPP
+/// protocol at all:
+///
+/// - `ocpp` is a `ChargePointState` snapshot, applied with `apply_ocpp_state`.
+/// - `hardware` is [`RunningCharger::hardware_snapshot`], applied with `apply_hardware_snapshot` -
+///   per-connector lock, contactor, applied current limit (`docs/hardware-roadmap.md`'s H7), power
+///   direction and exported-energy register (H14). None of these appear in a `ChargePointState`.
+///
+/// A caller on the charger's own thread would just call `RunningCharger::apply_state` and get both
+/// at once. The TUI can't: `connect_charger`'s future isn't `Send`, so the charger runs on its own
+/// thread (see [`App::spawn_local_charger`]) and the hardware handle never leaves it. Forwarding
+/// this is what stands in for that call - see [`RunningCharger::hardware_snapshot`]'s own doc
+/// comment, and `core`'s `a_hardware_snapshot_carries_what_apply_state_would_have_written` for the
+/// proof that the two paths agree.
+#[derive(Debug, Clone)]
+pub struct ChargerSnapshot {
+    pub ocpp: ChargePointState,
+    pub hardware: Vec<Vec<ConnectorHardwareSnapshot>>,
+    /// Charger-wide firmware/file-transfer activity, read off the bundle handles the charger's own
+    /// thread keeps - see [`CampaignProgress`] and [`CampaignHandles`].
+    pub campaigns: CampaignProgress,
+}
+
+impl ChargerSnapshot {
+    fn of(running: &RunningCharger, campaigns: &CampaignHandles) -> Self {
+        Self {
+            ocpp: running.state(),
+            hardware: running.hardware_snapshot(),
+            campaigns: campaigns.progress(),
+        }
+    }
+}
+
+/// The charger-wide hardware activity the dashboard shows: a firmware campaign
+/// (`docs/hardware-roadmap.md`'s H10) and the file transfers behind a firmware download or a
+/// diagnostics log upload.
+///
+/// Charger-wide rather than per-connector because that is what the hardware is: one installer, one
+/// file transfer per charger. Every field is `None` when the charger has no such hardware at all -
+/// which is most chargers, since [`charger_hardware`] only builds a piece the charger's own
+/// `capabilities:` block declares. `Some(FirmwareInstallStage::Idle)` is therefore meaningfully
+/// different from `None`: the first is an installer with nothing to do, the second is a charger that
+/// cannot install firmware.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CampaignProgress {
+    pub firmware_install: Option<FirmwareInstallStage>,
+    pub firmware_download: Option<InFlightTransfer>,
+    pub log_upload: Option<InFlightTransfer>,
+}
+
+impl CampaignProgress {
+    /// Whether anything is actually happening - a campaign in flight, or one that has finished with
+    /// an outcome still worth showing. An installer sitting `Idle` is not activity.
+    pub fn is_active(&self) -> bool {
+        self.firmware_download.is_some()
+            || self.log_upload.is_some()
+            || matches!(
+                self.firmware_install,
+                Some(
+                    FirmwareInstallStage::Installing
+                        | FirmwareInstallStage::Installed
+                        | FirmwareInstallStage::Failed
+                )
+            )
+    }
+}
+
+/// The `Arc`s the charger's background thread keeps on the two pieces of its hardware bundle whose
+/// progress is worth rendering.
+///
+/// Cloned out of the bundle *before* it is handed to `connect_charger`/`start_local_charger`, which
+/// consume it whole - the "clone before handing ownership away" pattern `ChargerHardware`'s own doc
+/// comment prescribes, and the only way to still have a handle afterwards. `RunningCharger` keeps
+/// its own clones to tick, but exposes neither, so this is not redundant with anything reachable
+/// through it.
+#[derive(Default)]
+struct CampaignHandles {
+    firmware_installer: Option<Arc<FakeFirmwareInstaller>>,
+    file_transfer: Option<Arc<FakeFileTransfer>>,
+}
+
+impl CampaignHandles {
+    fn of(hardware: &ChargerHardware) -> Self {
+        Self {
+            firmware_installer: hardware.firmware_installer.clone(),
+            file_transfer: hardware.file_transfer.clone(),
+        }
+    }
+
+    fn progress(&self) -> CampaignProgress {
+        CampaignProgress {
+            firmware_install: self
+                .firmware_installer
+                .as_ref()
+                .map(|installer| installer.stage()),
+            firmware_download: self
+                .file_transfer
+                .as_ref()
+                .and_then(|transfer| transfer.download_in_flight()),
+            log_upload: self
+                .file_transfer
+                .as_ref()
+                .and_then(|transfer| transfer.upload_in_flight()),
+        }
+    }
+}
+
+/// How long a simulated firmware installation takes. A deliberate product choice, not a physical
+/// one: long enough that `Installing` is a state a CSMS developer can actually watch (and that a
+/// `FirmwareStatusNotification` sequence has time to be observed in order), short enough that a demo
+/// isn't spent waiting. Simulated time, forwarded by [`App::tick_metrics`] at the frame cadence, so
+/// in the running app it works out to roughly this much wall clock.
+const SIMULATED_FIRMWARE_INSTALL: Duration = Duration::from_secs(30);
+
+/// The firmware image a simulated download claims to fetch. Sized and paced to read like a real
+/// charger firmware image over a slow link, for the same reason as above - nothing here transfers
+/// real bytes (see `FakeFileTransfer`'s module docs).
+const SIMULATED_FIRMWARE_DOWNLOAD: TransferProfile = TransferProfile {
+    duration: Duration::from_secs(20),
+    total_bytes: 8 * 1024 * 1024,
+};
+
+/// The diagnostics bundle a simulated log upload claims to send - smaller and quicker than a
+/// firmware image, as a real log archive is. Independently configured because a CSMS developer needs
+/// to watch an upload and a download at once, which is exactly what `FakeFileTransfer` supports.
+const SIMULATED_LOG_UPLOAD: TransferProfile = TransferProfile {
+    duration: Duration::from_secs(10),
+    total_bytes: 2 * 1024 * 1024,
+};
+
+/// The hardware bundle `config`'s charger runs with: storage and a display as before
+/// (`ChargerHardware::new`, H5b/H6b), plus a firmware installer/verifier, a file transfer and a
+/// certificate store for a charger whose `capabilities:` block declares the matching functional
+/// block.
+///
+/// Gated on the declaration rather than handed over unconditionally, because each of these is a
+/// scenario-specific choice `ChargerHardware::new` deliberately refuses to make a default for (see
+/// its doc comment) - an install duration, a transfer size, a certificate limit. Passing hardware a
+/// charger didn't declare registers nothing anyway (`register_optional_hardware` reads the same
+/// capabilities), so the gate here is about not inventing a configuration nobody asked for, and
+/// about the state directory staying empty for a charger that declares no persistence.
+///
+/// Which flag reaches which piece, matching `register_optional_hardware`'s own gating:
+///
+/// - `firmware_management` → the installer *and* the verifier. Without a verifier upstream refuses
+///   signed updates outright (`NoFirmwareVerifier` fails closed), so a charger that can install
+///   firmware but can't check a signature would only ever be able to demonstrate half the flow.
+/// - `firmware_management` or `diagnostics` → the file transfer, which backs both a firmware
+///   download and a log upload; one instance serves both, and both can be in flight at once.
+/// - `certificate_management` → the certificate store, under its own subdirectory of the charger's
+///   state directory so certificate keys can never collide with the runtime's own persisted keys.
+///
+/// `key_store` is deliberately left `None`: nothing registers a `KeyStore` (see `ChargerHardware`'s
+/// doc comment - no `ChargePointBuilder` method takes one), so the only value a store here could
+/// have is to a caller keeping its own `Arc` clone for TLS or certificate-renewal wiring of its own.
+/// The TUI has none, and populating the field would suggest the charger does something with it.
+fn charger_hardware(config: &ChargerConfig) -> ChargerHardware {
+    let state_dir = charger_storage_dir(&config.id);
+    let capabilities = &config.capabilities;
+
+    let mut hardware = ChargerHardware::new(&state_dir);
+
+    if capabilities.firmware_management {
+        hardware.firmware_installer = Some(Arc::new(FakeFirmwareInstaller::new(
+            SIMULATED_FIRMWARE_INSTALL,
+        )));
+        hardware.firmware_verifier = Some(Arc::new(FakeFirmwareVerifier::new()));
+    }
+    if capabilities.firmware_management || capabilities.diagnostics {
+        hardware.file_transfer = Some(Arc::new(FakeFileTransfer::new(
+            SIMULATED_FIRMWARE_DOWNLOAD,
+            SIMULATED_LOG_UPLOAD,
+        )));
+    }
+    if capabilities.certificate_management {
+        hardware.certificate_store = Some(FileCertificateStore::new(FileStorage::new(
+            state_dir.join("certificates"),
+        )));
+    }
+
+    hardware
+}
+
+/// A direct action on a running charger's fake hardware, dispatched to its background thread
+/// alongside (but separately from) the `ChargePointEvent`s [`App::apply_command`] sends.
+///
+/// Separate because these do not go through the protocol at all, and can't: `HardwareCommand` has
+/// six variants and none of them can carry a power direction, so no CSMS message reaching this
+/// charger could ever produce one (see `RunningCharger::set_discharging`'s own doc comment, and
+/// `docs/hardware-roadmap.md`'s "Known gaps"). Keeping them in their own channel, with their own
+/// type, is what stops a reader from assuming the dashboard's V2G control is something OCPP did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareControl {
+    /// Put one connector into export (V2G discharge), or back to import. Addressed positionally -
+    /// indices into `ChargerState::evses`/`EvseState::connectors` - exactly as
+    /// `RunningCharger::set_discharging` addresses it.
+    SetDischarging {
+        evse: usize,
+        connector: usize,
+        discharging: bool,
+    },
+}
+
+/// Runs a [`RunningCharger`] to completion: publishes a [`ChargerSnapshot`] to `snapshot_sender`
+/// whenever anything observable moves, applies every dispatched command from `event_receiver`, and
+/// calls `RunningCharger::tick` for every simulated `elapsed` forwarded on `tick_receiver` - the
+/// one driving loop a charger's background thread runs, identical whether `running` came from
+/// [`connect_charger`] (a real CSMS on the other end) or [`start_local_charger`] (nothing at all).
+/// That sameness is the point of `docs/hardware-roadmap.md`'s H3b: a local and a connected charger
+/// differ only in how `running` was built, never in how it's driven afterwards.
+///
+/// Returns once every one of `snapshot_sender`/`event_receiver`/`tick_receiver`'s `App`-side
 /// counterpart has been dropped (see [`App::return_to_picker`]), which is what lets the spawning
 /// thread exit instead of running forever against a charger that's no longer shown.
 async fn drive_running_charger(
     running: RunningCharger,
-    state_sender: UnboundedSender<ChargePointState>,
+    snapshot_sender: UnboundedSender<ChargerSnapshot>,
     mut event_receiver: UnboundedReceiver<ChargePointEvent>,
     mut tick_receiver: UnboundedReceiver<Duration>,
+    mut control_receiver: UnboundedReceiver<HardwareControl>,
+    campaigns: CampaignHandles,
 ) {
     // Published proactively rather than waiting for the first `changed()`: `subscribe()` only
     // yields *future* changes, and a charger nothing has happened to yet (freshly started, no
     // commands, no ticks) might never produce one on its own - which would leave
     // `apply_ocpp_state` never having run at all. A `Local` charger's `Offline` status (H3b)
     // depends on it having run at least once, even for a charger sitting idle.
-    let _ = state_sender.send(running.state());
+    let _ = snapshot_sender.send(ChargerSnapshot::of(&running, &campaigns));
 
     let mut states = running.subscribe();
+    let state_snapshots = snapshot_sender.clone();
     let forward_states = async {
         loop {
             states.changed().await;
-            let state = states.borrow();
-            if state_sender.send(state).is_err() {
+            if state_snapshots
+                .send(ChargerSnapshot::of(&running, &campaigns))
+                .is_err()
+            {
                 break;
             }
         }
@@ -235,12 +458,57 @@ async fn drive_running_charger(
             let _ = running.send(event).await;
         }
     };
+    // Ticking publishes a snapshot too, not only `states.changed()` above: the hardware-only half
+    // of a snapshot (H7's lock/contactor/current limit, H14's direction and exported-energy
+    // register) has no `ChargePointState` counterpart, so nothing about it is guaranteed to bump
+    // the state version. The export register in particular rises on every single tick while
+    // discharging without the protocol state moving at all, and would otherwise only reach the
+    // screen the next time something unrelated happened to change.
+    let tick_snapshots = snapshot_sender.clone();
     let forward_ticks = async {
         while let Some(elapsed) = tick_receiver.recv().await {
             running.tick(elapsed).await;
+            if tick_snapshots
+                .send(ChargerSnapshot::of(&running, &campaigns))
+                .is_err()
+            {
+                break;
+            }
         }
     };
-    tokio::join!(forward_states, forward_commands, forward_ticks);
+    // Hardware actions publish a snapshot of their own rather than waiting for the next tick, so
+    // the dashboard reflects a V2G toggle on the very frame it was pressed. `set_discharging`
+    // returns `Err` for a connector this charger doesn't have; the UI only ever addresses the
+    // connector it is focused on, so that would be a bug here rather than user error - logged, not
+    // surfaced as a status message.
+    let forward_controls = async {
+        while let Some(control) = control_receiver.recv().await {
+            match control {
+                HardwareControl::SetDischarging {
+                    evse,
+                    connector,
+                    discharging,
+                } => {
+                    if let Err(error) = running.set_discharging(evse, connector, discharging) {
+                        tracing::warn!(%error, "hardware control addressed a connector that does not exist");
+                        continue;
+                    }
+                }
+            }
+            if snapshot_sender
+                .send(ChargerSnapshot::of(&running, &campaigns))
+                .is_err()
+            {
+                break;
+            }
+        }
+    };
+    tokio::join!(
+        forward_states,
+        forward_commands,
+        forward_ticks,
+        forward_controls
+    );
 }
 
 /// Where `charger_id`'s persisted hardware state (in-flight transaction, boot reason, cached
@@ -274,7 +542,7 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             self.drain_log_receiver();
-            self.drain_ocpp_state_receiver();
+            self.drain_charger_snapshots();
             self.poll_connect_result();
             self.tick_metrics();
             terminal.draw(|frame| self.draw(frame))?;
@@ -456,11 +724,13 @@ impl App {
 
         match mouse_event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let has_display = self
-                    .charger_state
-                    .as_ref()
-                    .is_some_and(|state| state.config.has_display);
-                let body = dashboard::body_layout(layout.body, has_display);
+                // The same strips `dashboard::render` lays the body out from, so a click is
+                // hit-tested against exactly the rows the last frame drew - each strip shifts the
+                // tree down while it's on screen.
+                let body = dashboard::body_layout(
+                    layout.body,
+                    dashboard::body_strips_for(self.charger_state.as_ref(), &self.campaigns),
+                );
                 self.handle_tree_click(body.tree, body.sidebar.is_none(), mouse_event);
             }
             MouseEventKind::ScrollUp
@@ -759,8 +1029,77 @@ impl App {
                 self.open_command_palette()
             }
             KeyCode::Char('c') => self.open_command_palette(),
+            KeyCode::Char('d') => self.toggle_discharging(),
             _ => {}
         }
+    }
+
+    /// Flips the focused connector between exporting (V2G discharge) and importing, by asking the
+    /// charger's hardware directly - [`HardwareControl::SetDischarging`], never an OCPP message,
+    /// because no OCPP message can carry a power direction (see [`HardwareControl`]).
+    ///
+    /// Two things have to be true first, and neither is a UI nicety:
+    ///
+    /// - The charger has to **declare `supports_bidirectional_power`**. The hardware would obey
+    ///   regardless, but a charger telling a CSMS under test that it cannot export, then exporting,
+    ///   is exactly the "never advertise what isn't simulated" principle read backwards - and the
+    ///   declaration is the only thing the CSMS on the other end can see.
+    /// - The connector has to have a **vehicle plugged in** (occupied or charging). Direction with
+    ///   nothing connected is a reading no real charger produces: the meter is gated on the
+    ///   contactor, which is gated on a session, so the only thing it could show is "exporting" next
+    ///   to a flat zero.
+    ///
+    /// The current direction is read back off [`ChargerState`] - i.e. off the last snapshot the
+    /// hardware itself sent - rather than from a local flag, so the toggle can never disagree with
+    /// what the screen says.
+    fn toggle_discharging(&mut self) {
+        let Some(state) = &self.charger_state else {
+            return;
+        };
+        if !state.config.capabilities.supports_bidirectional_power {
+            self.set_status(
+                StatusSeverity::Error,
+                format!("✗ {} does not declare bidirectional power", state.config.id),
+            );
+            return;
+        }
+        let Some(connector) = state
+            .evses
+            .get(self.focused.evse)
+            .and_then(|evse| evse.connectors.get(self.focused.connector))
+        else {
+            return;
+        };
+        if !matches!(
+            connector.status,
+            ConnectorStatus::Occupied | ConnectorStatus::Charging
+        ) {
+            self.set_status(
+                StatusSeverity::Error,
+                "✗ V2G needs a vehicle plugged in".to_string(),
+            );
+            return;
+        }
+
+        let discharging = !connector.discharging;
+        let Some(sender) = &self.hardware_control_sender else {
+            return;
+        };
+        let _ = sender.send(HardwareControl::SetDischarging {
+            evse: self.focused.evse,
+            connector: self.focused.connector,
+            discharging,
+        });
+        let label = if discharging {
+            "exporting (V2G)"
+        } else {
+            "importing"
+        };
+        self.logs.push(format!(
+            "EVSE {} connector {}: {label}",
+            state.evses[self.focused.evse].id, connector.id
+        ));
+        self.set_status(StatusSeverity::Ok, format!("→ {label}"));
     }
 
     fn handle_command_palette_key(&mut self, key_event: KeyEvent) {
@@ -1045,7 +1384,7 @@ impl App {
     /// always acts on the connector actually shown as focused on screen. Once connected to a
     /// real CSMS (OCPP 2.1), this sends the matching `ChargePointEvent` to the live connection
     /// instead of mutating local state directly - the dashboard picks up the effect once the
-    /// runtime reports it back via [`Self::drain_ocpp_state_receiver`].
+    /// runtime reports it back via [`Self::drain_charger_snapshots`].
     ///
     /// Display commands are the exception: `ocpp-charge-point` doesn't implement the
     /// DisplayMessage functional block yet, so `SetDisplayMessage`/`ClearDisplayMessage`
@@ -1146,8 +1485,8 @@ impl App {
     /// `ChargerHardware::new` only supplies the storage/display *objects*, and `register_setup_blocks`
     /// (H5b/H6b) never reads from or writes to either unless the matching capability says to.
     fn spawn_local_charger(&mut self, config: ChargerConfig) {
-        let (state_sender, state_receiver) = mpsc::unbounded_channel();
-        self.ocpp_state_receiver = Some(state_receiver);
+        let (snapshot_sender, snapshot_receiver) = mpsc::unbounded_channel();
+        self.charger_snapshot_receiver = Some(snapshot_receiver);
 
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         self.ocpp_event_sender = Some(event_sender);
@@ -1155,15 +1494,27 @@ impl App {
         let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
         self.ocpp_tick_sender = Some(tick_sender);
 
+        let (control_sender, control_receiver) = mpsc::unbounded_channel();
+        self.hardware_control_sender = Some(control_sender);
+
         std::thread::spawn(move || {
             let tokio_runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build a runtime for the local charger");
             tokio_runtime.block_on(async move {
-                let hardware = ChargerHardware::new(charger_storage_dir(&config.id));
+                let hardware = charger_hardware(&config);
+                let campaigns = CampaignHandles::of(&hardware);
                 let running = start_local_charger(&config, hardware).await;
-                drive_running_charger(running, state_sender, event_receiver, tick_receiver).await;
+                drive_running_charger(
+                    running,
+                    snapshot_sender,
+                    event_receiver,
+                    tick_receiver,
+                    control_receiver,
+                    campaigns,
+                )
+                .await;
             });
         });
     }
@@ -1259,14 +1610,17 @@ impl App {
         let (result_sender, result_receiver) = oneshot::channel();
         self.connect_result_receiver = Some(result_receiver);
 
-        let (state_sender, state_receiver) = mpsc::unbounded_channel();
-        self.ocpp_state_receiver = Some(state_receiver);
+        let (snapshot_sender, snapshot_receiver) = mpsc::unbounded_channel();
+        self.charger_snapshot_receiver = Some(snapshot_receiver);
 
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         self.ocpp_event_sender = Some(event_sender);
 
         let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
         self.ocpp_tick_sender = Some(tick_sender);
+
+        let (control_sender, control_receiver) = mpsc::unbounded_channel();
+        self.hardware_control_sender = Some(control_sender);
 
         // `connect_and_setup`'s future isn't `Send` (upstream uses non-Send sync
         // primitives internally), so it can't go through `tokio::spawn`. A dedicated
@@ -1283,12 +1637,20 @@ impl App {
                 .build()
                 .expect("failed to build a runtime for the CSMS connection attempt");
             tokio_runtime.block_on(async move {
-                let hardware = ChargerHardware::new(charger_storage_dir(&config.id));
+                let hardware = charger_hardware(&config);
+                let campaigns = CampaignHandles::of(&hardware);
                 match connect_charger(&config, &profile, hardware).await {
                     Ok(running) => {
                         let _ = result_sender.send(Ok(()));
-                        drive_running_charger(running, state_sender, event_receiver, tick_receiver)
-                            .await;
+                        drive_running_charger(
+                            running,
+                            snapshot_sender,
+                            event_receiver,
+                            tick_receiver,
+                            control_receiver,
+                            campaigns,
+                        )
+                        .await;
                     }
                     Err(error) => {
                         let _ = result_sender.send(Err(error.to_string()));
@@ -1335,9 +1697,11 @@ impl App {
     fn return_to_picker(&mut self) {
         self.charger_state = None;
         self.status_message = None;
-        self.ocpp_state_receiver = None;
+        self.charger_snapshot_receiver = None;
         self.ocpp_event_sender = None;
         self.ocpp_tick_sender = None;
+        self.hardware_control_sender = None;
+        self.campaigns = CampaignProgress::default();
         self.live_ocpp_state = None;
         self.screen = Screen::PickCharger;
     }
@@ -1353,18 +1717,23 @@ impl App {
         }
     }
 
-    /// Pulls every live protocol state snapshot forwarded from a connected OCPP 2.1 charger's
-    /// background connection thread, applying each to the dashboard's display state and
-    /// remembering the latest one for [`Self::apply_command`] to dispatch against.
-    fn drain_ocpp_state_receiver(&mut self) {
-        let Some(receiver) = &mut self.ocpp_state_receiver else {
+    /// Pulls every [`ChargerSnapshot`] forwarded from the running charger's background thread,
+    /// applying both halves of each to the dashboard's display state and remembering the latest
+    /// protocol state for [`Self::apply_command`] to dispatch against.
+    ///
+    /// Applying both halves here, in this order, is exactly what `RunningCharger::apply_state` does
+    /// on the charger's own thread - see [`ChargerSnapshot`] for why the TUI can't just call that.
+    fn drain_charger_snapshots(&mut self) {
+        let Some(receiver) = &mut self.charger_snapshot_receiver else {
             return;
         };
-        while let Ok(state) = receiver.try_recv() {
+        while let Ok(snapshot) = receiver.try_recv() {
             if let Some(charger_state) = &mut self.charger_state {
-                apply_ocpp_state(charger_state, &state);
+                apply_ocpp_state(charger_state, &snapshot.ocpp);
+                apply_hardware_snapshot(charger_state, &snapshot.hardware);
             }
-            self.live_ocpp_state = Some(state);
+            self.campaigns = snapshot.campaigns;
+            self.live_ocpp_state = Some(snapshot.ocpp);
         }
     }
 
@@ -1418,7 +1787,8 @@ mod tests {
     use super::*;
     use crate::logs::LogLevel;
     use charge_point_simulator_core::charger::{
-        ChargerConfig, ChargerSource, ConnectionStatus, ConnectorStatus, EvseConfig, OcppVersion,
+        CapabilitiesConfig, ChargerConfig, ChargerSource, ConnectionStatus, ConnectorStatus,
+        EvseConfig, OcppVersion,
     };
     use ocpp_charge_point::state::{
         ConnectorEvent, ConnectorState as OcppConnectorState, EvseEvent, RegistrationStatus,
@@ -1707,7 +2077,7 @@ mod tests {
     /// H3b fixes: a locally-driven charger's `connection_status` no longer reports `Booting`
     /// forever. `confirm_charger_selection` really does spawn a background thread running a real
     /// `RunningCharger` (see `spawn_local_charger`) - unlike every other test in this module,
-    /// this one lets that thread actually run rather than injecting `ocpp_state_receiver`/
+    /// this one lets that thread actually run rather than injecting `charger_snapshot_receiver`/
     /// `ocpp_tick_sender` by hand, so it is deliberately the one place this suite waits on real
     /// (if very short-lived) background-thread timing. The thread does no I/O: `charger()` below
     /// builds a config with default (all-`false`) capabilities, and `ChargerHardware::new`'s real
@@ -1730,7 +2100,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            app.drain_ocpp_state_receiver();
+            app.drain_charger_snapshots();
             if app.charger_state.as_ref().unwrap().connection_status == ConnectionStatus::Offline {
                 break;
             }
@@ -2805,7 +3175,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            app.drain_ocpp_state_receiver();
+            app.drain_charger_snapshots();
             if app.charger_state.as_ref().unwrap().connection_status == ConnectionStatus::Offline {
                 break;
             }
@@ -2832,7 +3202,7 @@ mod tests {
 
         assert_eq!(app.screen, Screen::Dashboard);
         assert!(app.connect_result_receiver.is_some());
-        assert!(app.ocpp_state_receiver.is_some());
+        assert!(app.charger_snapshot_receiver.is_some());
         assert!(app.ocpp_event_sender.is_some());
         let remembered = app.connection_store.get("CP-2.1").unwrap();
         assert_eq!(remembered.csms_url, "ws://localhost:9999/dev");
@@ -3230,7 +3600,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_ocpp_state_receiver_applies_incoming_snapshots_and_remembers_the_latest() {
+    fn drain_charger_snapshots_applies_both_halves_and_remembers_the_latest_protocol_state() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
         app.confirm_charger_selection();
         // H3b: `apply_ocpp_state` only reads `registration` for a `LiveCsms` charger - a `Local`
@@ -3241,12 +3611,27 @@ mod tests {
             url: "ws://csms.example/CP-2.1".into(),
         };
         let (sender, receiver) = mpsc::unbounded_channel();
-        app.ocpp_state_receiver = Some(receiver);
+        app.charger_snapshot_receiver = Some(receiver);
 
         sender
-            .send(ocpp_state_with(OcppConnectorState::Locked))
+            .send(ChargerSnapshot {
+                ocpp: ocpp_state_with(OcppConnectorState::Locked),
+                // H7/H14: none of these five facts exist anywhere in `ocpp`, which is the whole
+                // reason a snapshot carries a second half at all.
+                hardware: vec![vec![ConnectorHardwareSnapshot {
+                    locked: true,
+                    contactor_closed: true,
+                    current_limit_ma: Some(16_000),
+                    discharging: true,
+                    exported_energy_wh: 1_250,
+                }]],
+                campaigns: CampaignProgress {
+                    firmware_install: Some(FirmwareInstallStage::Installing),
+                    ..Default::default()
+                },
+            })
             .unwrap();
-        app.drain_ocpp_state_receiver();
+        app.drain_charger_snapshots();
 
         assert_eq!(
             app.charger_state.as_ref().unwrap().connection_status,
@@ -3255,6 +3640,154 @@ mod tests {
         assert_eq!(
             app.live_ocpp_state.as_ref().unwrap().evses[0].connectors[0],
             OcppConnectorState::Locked
+        );
+
+        let connector = &app.charger_state.as_ref().unwrap().evses[0].connectors[0];
+        assert!(connector.locked);
+        assert!(connector.contactor_closed);
+        assert_eq!(connector.current_limit_ma, Some(16_000));
+        assert!(connector.discharging);
+        assert_eq!(connector.exported_energy_wh, 1_250);
+
+        // The charger-wide half: a firmware campaign has no connector to live on.
+        assert_eq!(
+            app.campaigns.firmware_install,
+            Some(FirmwareInstallStage::Installing)
+        );
+    }
+
+    // --- the hardware bundle (H10/H12) ----------------------------------------------------
+
+    /// A transfer `fraction` of the way through the simulated firmware image, shaped exactly as
+    /// `FakeFileTransfer` would report it.
+    fn in_flight_transfer(fraction: f64) -> InFlightTransfer {
+        let total_bytes = SIMULATED_FIRMWARE_DOWNLOAD.total_bytes;
+        InFlightTransfer {
+            elapsed: SIMULATED_FIRMWARE_DOWNLOAD.duration.mul_f64(fraction),
+            duration: SIMULATED_FIRMWARE_DOWNLOAD.duration,
+            transferred_bytes: (total_bytes as f64 * fraction) as u64,
+            total_bytes,
+        }
+    }
+
+    fn hardware_for(declare: impl FnOnce(&mut CapabilitiesConfig)) -> ChargerHardware {
+        let mut config = charger("CP-HW").config;
+        declare(&mut config.capabilities);
+        charger_hardware(&config)
+    }
+
+    /// Storage and a display are handed over regardless (H5b/H6b's own gating decides whether
+    /// anything is registered); every other piece needs a declaration.
+    #[test]
+    fn a_charger_declaring_nothing_gets_no_firmware_transfer_or_certificate_hardware() {
+        let hardware = hardware_for(|_| {});
+
+        assert!(hardware.storage.is_some());
+        assert!(hardware.display.is_some());
+        assert!(hardware.firmware_installer.is_none());
+        assert!(hardware.firmware_verifier.is_none());
+        assert!(hardware.file_transfer.is_none());
+        assert!(hardware.certificate_store.is_none());
+    }
+
+    /// The verifier comes with the installer, not separately: upstream refuses signed updates
+    /// without one, so an installer alone could only ever demonstrate half a campaign.
+    #[test]
+    fn declaring_firmware_management_supplies_an_installer_a_verifier_and_a_file_transfer() {
+        let hardware = hardware_for(|capabilities| capabilities.firmware_management = true);
+
+        assert!(hardware.firmware_installer.is_some());
+        assert!(hardware.firmware_verifier.is_some());
+        assert!(
+            hardware.file_transfer.is_some(),
+            "a firmware campaign has to fetch the image before installing it"
+        );
+        assert!(hardware.certificate_store.is_none());
+    }
+
+    /// Diagnostics needs the same file transfer for its log upload, but no installer - a charger
+    /// that can upload logs isn't thereby able to install firmware.
+    #[test]
+    fn declaring_diagnostics_supplies_only_the_file_transfer() {
+        let hardware = hardware_for(|capabilities| capabilities.diagnostics = true);
+
+        assert!(hardware.file_transfer.is_some());
+        assert!(hardware.firmware_installer.is_none());
+        assert!(hardware.firmware_verifier.is_none());
+    }
+
+    #[test]
+    fn declaring_certificate_management_supplies_a_certificate_store() {
+        let hardware = hardware_for(|capabilities| capabilities.certificate_management = true);
+
+        assert!(hardware.certificate_store.is_some());
+        assert!(hardware.file_transfer.is_none());
+    }
+
+    /// Nothing registers a `KeyStore` (see `charger_hardware`'s doc comment), so supplying one would
+    /// imply a capability the charger doesn't have - even for a charger that declares `key_storage`.
+    #[test]
+    fn no_key_store_is_supplied_even_when_key_storage_is_declared() {
+        assert!(
+            hardware_for(|capabilities| capabilities.key_storage = true)
+                .key_store
+                .is_none()
+        );
+    }
+
+    /// The link between the bundle and the strip: a charger with firmware hardware reports a stage
+    /// (idle, since nothing has been asked of it), one without reports nothing at all - the
+    /// distinction the strip relies on to tell "cannot install firmware" from "has nothing to
+    /// install".
+    #[test]
+    fn campaign_handles_report_a_stage_only_for_hardware_the_charger_actually_has() {
+        let with_firmware = CampaignHandles::of(&hardware_for(|capabilities| {
+            capabilities.firmware_management = true
+        }))
+        .progress();
+        assert_eq!(
+            with_firmware.firmware_install,
+            Some(FirmwareInstallStage::Idle)
+        );
+        assert_eq!(with_firmware.firmware_download, None, "nothing started yet");
+        assert!(!with_firmware.is_active());
+
+        let without = CampaignHandles::of(&hardware_for(|_| {})).progress();
+        assert_eq!(without, CampaignProgress::default());
+    }
+
+    #[test]
+    fn campaign_progress_is_active_only_while_something_is_actually_happening() {
+        assert!(!CampaignProgress::default().is_active());
+        assert!(
+            !CampaignProgress {
+                firmware_install: Some(FirmwareInstallStage::Idle),
+                ..Default::default()
+            }
+            .is_active(),
+            "an installer with nothing to do is not activity"
+        );
+        assert!(
+            CampaignProgress {
+                firmware_install: Some(FirmwareInstallStage::Installing),
+                ..Default::default()
+            }
+            .is_active()
+        );
+        assert!(
+            CampaignProgress {
+                firmware_install: Some(FirmwareInstallStage::Failed),
+                ..Default::default()
+            }
+            .is_active(),
+            "a failed install is exactly what a user needs to see"
+        );
+        assert!(
+            CampaignProgress {
+                log_upload: Some(in_flight_transfer(0.5)),
+                ..Default::default()
+            }
+            .is_active()
         );
     }
 
@@ -3305,17 +3838,198 @@ mod tests {
     fn returning_to_the_picker_tears_down_the_live_connection_channels() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
         app.confirm_charger_selection();
-        let (_sender, receiver) = mpsc::unbounded_channel::<ChargePointState>();
+        let (_sender, receiver) = mpsc::unbounded_channel::<ChargerSnapshot>();
         let (event_sender, _event_receiver) = mpsc::unbounded_channel();
-        app.ocpp_state_receiver = Some(receiver);
+        app.charger_snapshot_receiver = Some(receiver);
         app.ocpp_event_sender = Some(event_sender);
         app.live_ocpp_state = Some(ocpp_state_with(OcppConnectorState::Available));
 
         app.handle_key_event(key(KeyCode::Esc));
 
-        assert!(app.ocpp_state_receiver.is_none());
+        assert!(app.charger_snapshot_receiver.is_none());
         assert!(app.ocpp_event_sender.is_none());
         assert!(app.live_ocpp_state.is_none());
+    }
+
+    // --- V2G discharge control (H14b) -----------------------------------------------------
+
+    /// A charger declaring `supports_bidirectional_power`, already on the dashboard with a vehicle
+    /// plugged into its only connector and the discharge control channel wired to `receiver`'s
+    /// counterpart (rather than a real background thread - the same injection style the
+    /// `apply_command` connected-mode tests use).
+    fn v2g_app() -> (App, UnboundedReceiver<HardwareControl>) {
+        let mut entry = charger("CP-V2G");
+        entry.config.capabilities.supports_bidirectional_power = true;
+        let mut app = App::new(vec![entry]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Charging;
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        app.hardware_control_sender = Some(sender);
+        (app, receiver)
+    }
+
+    #[test]
+    fn d_asks_the_hardware_to_export_on_the_focused_connector() {
+        let (mut app, mut receiver) = v2g_app();
+
+        app.handle_key_event(key(KeyCode::Char('d')));
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            HardwareControl::SetDischarging {
+                evse: 0,
+                connector: 0,
+                discharging: true,
+            }
+        );
+        assert_eq!(
+            status(&app),
+            Some((StatusSeverity::Ok, "→ exporting (V2G)".to_string()))
+        );
+    }
+
+    /// The toggle reads the direction off `ChargerState` - i.e. off the last snapshot the hardware
+    /// sent - so pressing `d` on a connector already exporting asks for import, not export again.
+    #[test]
+    fn d_asks_for_import_again_when_the_connector_is_already_exporting() {
+        let (mut app, mut receiver) = v2g_app();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].discharging = true;
+
+        app.handle_key_event(key(KeyCode::Char('d')));
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            HardwareControl::SetDischarging {
+                evse: 0,
+                connector: 0,
+                discharging: false,
+            }
+        );
+    }
+
+    #[test]
+    fn d_targets_the_focused_connector_not_the_first_one() {
+        let mut entry = charger_with_evses(
+            "CP-V2G",
+            vec![EvseConfig {
+                id: 1,
+                connectors: 2,
+            }],
+        );
+        entry.config.capabilities.supports_bidirectional_power = true;
+        let mut app = App::new(vec![entry]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[1].status =
+            ConnectorStatus::Charging;
+        app.focused = FocusedConnector {
+            evse: 0,
+            connector: 1,
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.hardware_control_sender = Some(sender);
+
+        app.handle_key_event(key(KeyCode::Char('d')));
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            HardwareControl::SetDischarging {
+                evse: 0,
+                connector: 1,
+                discharging: true,
+            }
+        );
+    }
+
+    /// The hardware would obey either way; declaring is what the CSMS under test can see, so a
+    /// charger that told it "no bidirectional power" must not then export - see
+    /// `toggle_discharging`'s doc comment.
+    #[test]
+    fn d_is_refused_on_a_charger_that_does_not_declare_bidirectional_power() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Charging;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.hardware_control_sender = Some(sender);
+
+        app.handle_key_event(key(KeyCode::Char('d')));
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            status(&app),
+            Some((
+                StatusSeverity::Error,
+                "✗ CP001 does not declare bidirectional power".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn d_is_refused_with_nothing_plugged_in() {
+        let (mut app, mut receiver) = v2g_app();
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Available;
+
+        app.handle_key_event(key(KeyCode::Char('d')));
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            status(&app),
+            Some((
+                StatusSeverity::Error,
+                "✗ V2G needs a vehicle plugged in".to_string()
+            ))
+        );
+    }
+
+    /// The one test that drives `d` through the *real* background thread rather than a hand-injected
+    /// channel, so `drive_running_charger`'s control loop, `RunningCharger::set_discharging`, the
+    /// snapshot it publishes and `apply_hardware_snapshot` are all exercised end to end - the seam
+    /// every other test in this section stubs out. Same shape (and same bounded polling) as
+    /// `a_locally_selected_charger_reports_offline_rather_than_booting_forever`, which is the other
+    /// place this suite lets a real charger thread run.
+    ///
+    /// Declares `supports_bidirectional_power` only, so nothing is persisted: the bundle's
+    /// `FileStorage` is never read from or written to without `has_persistent_storage` (see
+    /// `charger_hardware`), and this test touches no disk.
+    #[test]
+    fn d_reaches_the_real_hardware_and_comes_back_in_a_snapshot() {
+        let mut entry = charger("CP-V2G-LIVE");
+        entry.config.capabilities.supports_bidirectional_power = true;
+        let mut app = App::new(vec![entry]);
+        app.confirm_charger_selection();
+
+        // A vehicle has to be plugged in for the toggle to be offered. Set locally and pressed
+        // immediately: the next snapshot drained will overwrite `status` from the real (still
+        // `Available`) protocol state, but direction is a property of the connector's hardware and
+        // survives that - which is itself part of what this asserts.
+        app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
+            ConnectorStatus::Charging;
+        app.handle_key_event(key(KeyCode::Char('d')));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.drain_charger_snapshots();
+            if app.charger_state.as_ref().unwrap().evses[0].connectors[0].discharging {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the discharge never came back from the charger's own hardware"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn returning_to_the_picker_also_drops_the_hardware_control_channel() {
+        let (mut app, _receiver) = v2g_app();
+
+        app.handle_key_event(key(KeyCode::Esc));
+
+        assert!(app.hardware_control_sender.is_none());
     }
 
     // --- mouse support (Phase 7) ----------------------------------------------------------

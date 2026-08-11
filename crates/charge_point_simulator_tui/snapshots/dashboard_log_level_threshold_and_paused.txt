@@ -7,11 +7,11 @@ EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh                               
                                                                                         soc      100% ██████████
                                                                                         session  10m 00s
 
+                                                                                        lock     engaged
+                                                                                        contact  closed
+                                                                                        limit    16.0 A
+
                                                                                         7.40 kW  32.2 A  1.233 kWh
-
-
-
-
 
 
 

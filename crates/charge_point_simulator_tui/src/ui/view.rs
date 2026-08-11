@@ -13,7 +13,7 @@
 //! `dashboard::render`/`palette::render_*` can be exercised without building a whole `App`
 //! (picker state, connection-setup fields, etc.) that has nothing to do with what they draw.
 
-use crate::app::{App, FocusedConnector, StatusSeverity};
+use crate::app::{App, CampaignProgress, FocusedConnector, StatusSeverity};
 use crate::logs::LogBuffer;
 use charge_point_simulator_core::charger::{ChargerState, Command};
 
@@ -34,6 +34,9 @@ pub struct DashboardView<'a> {
     /// with the prompt closed is read from `logs` instead.
     pub log_filter_input: Option<&'a str>,
     pub status_message: Option<(StatusSeverity, &'a str)>,
+    /// Charger-wide firmware/file-transfer activity - see `App::campaigns`. Copied rather than
+    /// borrowed: it is a handful of `Copy` fields, unlike the `ChargerState` above.
+    pub campaigns: CampaignProgress,
 }
 
 impl<'a> DashboardView<'a> {
@@ -48,6 +51,7 @@ impl<'a> DashboardView<'a> {
                 .status_message
                 .as_ref()
                 .map(|toast| (toast.severity, toast.message.as_str())),
+            campaigns: app.campaigns,
         }
     }
 }

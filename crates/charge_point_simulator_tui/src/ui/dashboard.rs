@@ -7,11 +7,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use super::view::DashboardView;
-use crate::app::{FocusedConnector, StatusSeverity};
+use crate::app::{CampaignProgress, FocusedConnector, StatusSeverity};
 use crate::logs::{Direction, LogLevel};
 use crate::theme;
 use charge_point_simulator_core::charger::{
-    ChargerState, ConnectionStatus, ConnectorState, ConnectorStatus, EvseState, SimulationMode,
+    ChargerConfig, ChargerState, ConnectionStatus, ConnectorState, ConnectorStatus, EvseState,
+    FirmwareInstallStage, InFlightTransfer, SimulationMode,
 };
 
 /// The named top-level regions of the dashboard screen, computed from the terminal area: a
@@ -32,8 +33,16 @@ pub struct DashboardLayout {
 /// [`render`]/[`tree_lines`]'s `inline_detail` parameter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyLayout {
-    /// Zero height when the charger has no display - see [`body_layout`]'s `has_display`.
+    /// Zero height when the charger has no display - see [`BodyStrips::display`].
     pub display: Rect,
+    /// Zero height for a charger that declares no capabilities at all - see
+    /// [`BodyStrips::capabilities`] and [`capability_labels`].
+    pub capabilities: Rect,
+    /// Zero height unless a firmware campaign or file transfer is actually in flight - see
+    /// [`body_layout`]'s `campaigns_active` and [`crate::app::CampaignProgress::is_active`]. A strip
+    /// that only appears while something is happening costs the tree no rows the rest of the time,
+    /// which is most of the time.
+    pub campaigns: Rect,
     pub tree: Rect,
     pub sidebar: Option<Rect>,
 }
@@ -46,6 +55,11 @@ pub struct BodyLayout {
 // `theme::header`'s doc comment).
 const HEADER_HEIGHT: u16 = 2;
 const DISPLAY_HEIGHT: u16 = 2;
+/// Same shape as [`DISPLAY_HEIGHT`] - one row of content under a section rule - and, like the
+/// display strip, only allotted at all when there is something to put in it.
+const CAMPAIGNS_HEIGHT: u16 = 2;
+/// Likewise: one row listing what the charger declares, under its own rule.
+const CAPABILITIES_HEIGHT: u16 = 2;
 const LOG_HEIGHT: u16 = 11;
 const COMMAND_BAR_HEIGHT: u16 = 1;
 
@@ -89,26 +103,65 @@ pub fn dashboard_layout(area: Rect) -> DashboardLayout {
     }
 }
 
-/// Splits `body` into the display strip (only when `has_display`), the EVSE/connector tree, and,
-/// once `body` is at least [`SIDEBAR_MIN_BODY_WIDTH`] columns wide, a detail sidebar for the
-/// focused connector. Narrower than that, `sidebar` is `None` and the tree takes the full width;
-/// the caller renders the same detail inline instead (see [`render`]).
-pub fn body_layout(body: Rect, has_display: bool) -> BodyLayout {
-    let display_height = if has_display { DISPLAY_HEIGHT } else { 0 };
-    let [display, rest] =
-        Layout::vertical([Constraint::Length(display_height), Constraint::Min(0)]).areas(body);
+/// Which of the body's optional strips this frame needs. Each one costs the tree rows for as long
+/// as it's on screen, so each is allotted only when it has something to say - a charger with no
+/// display, no declared capabilities and nothing installing spends nothing on any of them, which is
+/// every charger most of the time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BodyStrips {
+    /// The charger has a display (`ChargerConfig::has_display`), so there is a message - or a
+    /// deliberate `(blank)` - to show.
+    pub display: bool,
+    /// The charger declares at least one capability, so there is something to list.
+    pub capabilities: bool,
+    /// A firmware campaign or file transfer is in flight - see
+    /// [`crate::app::CampaignProgress::is_active`].
+    pub campaigns: bool,
+}
+
+/// Which optional strips a frame showing `charger` with `campaigns` in flight needs - the single
+/// place that decision is made, so [`render`] and [`crate::app::App::handle_mouse_event`]'s
+/// hit-testing can never lay the body out differently for the same state.
+pub(crate) fn body_strips_for(
+    charger: Option<&ChargerState>,
+    campaigns: &CampaignProgress,
+) -> BodyStrips {
+    BodyStrips {
+        display: charger.is_some_and(|state| state.config.has_display),
+        capabilities: charger.is_some_and(|state| !capability_labels(&state.config).is_empty()),
+        campaigns: campaigns.is_active(),
+    }
+}
+
+/// Splits `body` into whichever of the optional strips `strips` calls for, the EVSE/connector tree,
+/// and, once `body` is at least [`SIDEBAR_MIN_BODY_WIDTH`] columns wide, a detail sidebar for the
+/// focused connector. Narrower than that, `sidebar` is `None` and the tree takes the full width; the
+/// caller renders the same detail inline instead (see [`render`]).
+pub fn body_layout(body: Rect, strips: BodyStrips) -> BodyLayout {
+    let height = |wanted: bool, height: u16| if wanted { height } else { 0 };
+    let [display, capabilities, campaigns, rest] = Layout::vertical([
+        Constraint::Length(height(strips.display, DISPLAY_HEIGHT)),
+        Constraint::Length(height(strips.capabilities, CAPABILITIES_HEIGHT)),
+        Constraint::Length(height(strips.campaigns, CAMPAIGNS_HEIGHT)),
+        Constraint::Min(0),
+    ])
+    .areas(body);
 
     if rest.width >= SIDEBAR_MIN_BODY_WIDTH {
         let [tree, sidebar] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(SIDEBAR_WIDTH)]).areas(rest);
         BodyLayout {
             display,
+            capabilities,
+            campaigns,
             tree,
             sidebar: Some(sidebar),
         }
     } else {
         BodyLayout {
             display,
+            capabilities,
+            campaigns,
             tree: rest,
             sidebar: None,
         }
@@ -311,6 +364,41 @@ fn soc_bar(state_of_charge: f64) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(CELLS - filled))
 }
 
+/// Whether the connector's cable lock actuator reports engaged - the hardware fact, spelled the
+/// way a technician would read it off a real charger rather than as a bare `true`/`false`. Always
+/// one of two words, never blank: "not locked" is a real, knowable state, not a missing reading.
+fn lock_text(locked: bool) -> &'static str {
+    if locked { "engaged" } else { "released" }
+}
+
+/// Whether the connector's contactor reports closed, i.e. whether energy can flow at all. Same
+/// two-word rule as [`lock_text`].
+fn contactor_text(contactor_closed: bool) -> &'static str {
+    if contactor_closed { "closed" } else { "open" }
+}
+
+/// The current limit last applied to a connector, in amps.
+///
+/// The three cases `ConnectorState::current_limit_ma` deliberately keeps distinct stay distinct
+/// here, because they mean genuinely different things to anyone testing smart charging: `None` is
+/// "no profile limits this connector", `Some(0)` is "a profile suspended it" (which reads as
+/// `0.0 A` on top of the word, so a limit that happens to *be* zero can't be mistaken for the
+/// absence of one), and anything else is the limit itself.
+fn current_limit_text(current_limit_ma: Option<u32>) -> String {
+    match current_limit_ma {
+        None => "none".to_string(),
+        Some(0) => "suspended (0.0 A)".to_string(),
+        Some(milliamps) => format!("{:.1} A", milliamps as f64 / 1000.0),
+    }
+}
+
+/// Cumulative exported energy in kWh, from the Wh register the hardware keeps
+/// (`ConnectorState::exported_energy_wh`). Three decimals, matching how `EvseMetrics::energy_kwh`
+/// is rendered everywhere else, so the import and export figures read as the same kind of number.
+fn exported_energy_text(exported_energy_wh: i64) -> String {
+    format!("{:.3} kWh", exported_energy_wh as f64 / 1000.0)
+}
+
 /// One EVSE's summary row in the tree: `EVSE 1  ● charging   7.40 kW   32.2 A   1.233 kWh`.
 fn evse_summary_line(evse: &EvseState) -> Line<'static> {
     let status = evse_summary_status(evse);
@@ -415,11 +503,32 @@ fn inline_detail_line(evse: &EvseState, connector: &ConnectorState) -> Line<'sta
         format!("{:.2} kW", evse.metrics.power_kw),
         theme::text_dim(),
     ));
+
+    // Two of the four hardware facts (H7/H14) the sidebar spells out as labelled rows, and only
+    // when they aren't the default. This line already runs to ~66 columns on a vehicle mid-session
+    // and has to survive at 80, which is the width the narrow layout exists for - so it carries the
+    // two that change what a CSMS developer does next (a profile is limiting this connector; it is
+    // exporting rather than importing) and leaves lock and contactor to the sidebar, the same way
+    // it already leaves current and energy there. An absent token means the default - unlimited,
+    // importing - never an unknown reading.
+    if let Some(milliamps) = connector.current_limit_ma {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{:.1} A", milliamps as f64 / 1000.0),
+            theme::text_dim(),
+        ));
+    }
+    if connector.discharging {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("V2G", theme::accent()));
+    }
+
     Line::from(spans)
 }
 
 /// The full detail sidebar for the focused connector: status, vehicle, state of charge with a
-/// small bar, session duration, and the parent EVSE's power/current/energy.
+/// small bar, session duration, the hardware layer's lock/contactor/current-limit and power
+/// direction (see [`lock_text`] and friends), and the parent EVSE's power/current/energy.
 fn sidebar_lines(evse: &EvseState, connector: &ConnectorState) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![Span::styled(
@@ -459,6 +568,47 @@ fn sidebar_lines(evse: &EvseState, connector: &ConnectorState) -> Vec<Line<'stat
         Span::styled("session  ", theme::text_dim()),
         Span::styled(format_uptime(connector.session_duration), theme::text()),
     ]));
+
+    // The hardware layer's own view of this connector (H7/H14), which no `ChargePointState`
+    // carries: what the actuators report, then what the meter's export register holds. Shown
+    // unconditionally rather than only when "interesting", because for anyone testing smart
+    // charging or a remote unlock, "the contactor is open" and "no limit applies" are the answers
+    // they came for as often as the opposite.
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("lock     ", theme::text_dim()),
+        Span::styled(lock_text(connector.locked), theme::text()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("contact  ", theme::text_dim()),
+        Span::styled(contactor_text(connector.contactor_closed), theme::text()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("limit    ", theme::text_dim()),
+        Span::styled(
+            current_limit_text(connector.current_limit_ma),
+            theme::text(),
+        ),
+    ]));
+
+    // Direction is only ever worth a row when it isn't the default: a connector importing is what
+    // the power/current figures below already say. Exported energy, on the other hand, outlives the
+    // discharge that produced it - it is a cumulative register - so it stays visible afterwards.
+    if connector.discharging {
+        lines.push(Line::from(vec![
+            Span::styled("power    ", theme::text_dim()),
+            Span::styled("exporting (V2G)", theme::accent()),
+        ]));
+    }
+    if connector.exported_energy_wh != 0 {
+        lines.push(Line::from(vec![
+            Span::styled("exported ", theme::text_dim()),
+            Span::styled(
+                exported_energy_text(connector.exported_energy_wh),
+                theme::text(),
+            ),
+        ]));
+    }
 
     lines.push(Line::default());
     lines.push(Line::from(vec![
@@ -643,6 +793,158 @@ fn render_scrollbar(frame: &mut Frame, area: Rect, max_offset: usize, position: 
     );
 }
 
+/// Short labels for every capability `config` declares, in a deliberate order: the ones whose
+/// behavior a user can watch happen on this screen first, then the ones that only change what the
+/// charger tells a CSMS.
+///
+/// This is the answer to "why did that just refuse?" and "what is my CSMS being told?" - the two
+/// questions a declaration actually decides. It lists what the *charger declares*, not what the
+/// simulator can do: a flag here is `true` because this charger's YAML (or preset) says so, and
+/// `charge_point_simulator_core`'s `SIMULATED_CAPABILITIES` is where "declared" and "simulated"
+/// are kept honest with each other.
+///
+/// `has_display` is deliberately absent, and is the one exception: a charger that declares a display
+/// gets a whole `Display` section of its own two rows above this one (see [`body_layout`]), so
+/// listing it here would spend a row restating what the screen already shows - the same reason the
+/// campaign strip says nothing about an idle installer. Every other declaration has no other
+/// representation anywhere on this screen.
+fn capability_labels(config: &ChargerConfig) -> Vec<&'static str> {
+    let capabilities = &config.capabilities;
+    [
+        (capabilities.smart_charging, "smart charging"),
+        (capabilities.supports_bidirectional_power, "V2G"),
+        (capabilities.der_control, "DER control"),
+        (capabilities.reservation, "reservation"),
+        (capabilities.local_auth_list, "local auth list"),
+        (capabilities.firmware_management, "firmware"),
+        (capabilities.firmware_publishing, "firmware publishing"),
+        (capabilities.diagnostics, "diagnostics"),
+        (capabilities.certificate_management, "certificates"),
+        (capabilities.has_persistent_storage, "storage"),
+        (capabilities.key_storage, "key storage"),
+        (capabilities.ocsp_checking, "OCSP"),
+        (capabilities.can_unlock_under_load, "unlock under load"),
+        (capabilities.has_rtc, "RTC"),
+        (capabilities.variable_monitoring, "monitoring"),
+        (capabilities.tariff_and_cost, "tariffs"),
+        (capabilities.payment, "payment"),
+        (capabilities.battery_swap, "battery swap"),
+        (capabilities.periodic_event_stream, "event streams"),
+    ]
+    .into_iter()
+    .filter_map(|(declared, label)| declared.then_some(label))
+    .collect()
+}
+
+/// The capability strip's single line: [`capability_labels`] joined, and - when they don't all fit -
+/// truncated with a count of what was dropped rather than cut mid-label.
+///
+/// `+3 more` is deliberately not silent: a strip that quietly stopped listing would read as "this
+/// charger declares nine things" when it declares twelve, and the whole point of the strip is that
+/// what a charger claims is exactly what's on it.
+fn capability_line(labels: &[&'static str], width: usize) -> Line<'static> {
+    const SEPARATOR: &str = "  ·  ";
+
+    let mut shown = labels.len();
+    let joined = |count: usize| -> String {
+        let mut text = labels[..count].join(SEPARATOR);
+        if count < labels.len() {
+            text.push_str(&format!("{SEPARATOR}+{} more", labels.len() - count));
+        }
+        text
+    };
+    while shown > 1 && joined(shown).chars().count() > width {
+        shown -= 1;
+    }
+
+    Line::styled(joined(shown), theme::text_dim())
+}
+
+/// A 10-cell progress bar for an in-flight transfer, the same vocabulary [`soc_bar`] uses so a
+/// filled bar means the same thing everywhere on this screen.
+fn transfer_bar(fraction: f64) -> String {
+    const CELLS: usize = 10;
+    let filled = (fraction.clamp(0.0, 1.0) * CELLS as f64).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(CELLS - filled))
+}
+
+/// `3.4/8.0 MiB` - the byte counts a transfer reports, in the unit a firmware image is actually
+/// discussed in. Deliberately the same figures the CSMS is being told (see
+/// `InFlightTransfer::transferred_bytes`), not a re-derivation from elapsed time.
+fn transfer_bytes_text(transfer: &InFlightTransfer) -> String {
+    const MIB: f64 = (1024 * 1024) as f64;
+    format!(
+        "{:.1}/{:.1} MiB",
+        transfer.transferred_bytes as f64 / MIB,
+        transfer.total_bytes as f64 / MIB
+    )
+}
+
+/// The word for a firmware install's stage, and the style it earns: a failure is a real failure
+/// (the CSMS was told `InstallationFailed`), a completed install is worth a moment of green, and
+/// `Installing` is just informational.
+fn firmware_stage_text(stage: FirmwareInstallStage) -> (&'static str, Style) {
+    match stage {
+        FirmwareInstallStage::Idle => ("idle", theme::text_muted()),
+        FirmwareInstallStage::Installing => ("installing", theme::text()),
+        FirmwareInstallStage::Installed => ("installed", theme::ok()),
+        FirmwareInstallStage::Failed => ("failed", theme::error()),
+    }
+}
+
+/// The campaign strip's single line: whatever of a firmware install, a firmware download and a
+/// diagnostics log upload is currently happening (`docs/hardware-roadmap.md`'s H10).
+///
+/// Only ever rendered when [`crate::app::CampaignProgress::is_active`] says something is - an idle
+/// installer produces no line and gets no rows (see [`body_layout`]). Each piece appears
+/// independently, because a firmware download and a log upload are independent campaigns that can
+/// both be in flight at once.
+fn campaign_line(campaigns: &CampaignProgress) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    if let Some(download) = &campaigns.firmware_download {
+        spans.push(Span::styled("firmware download ", theme::text_dim()));
+        spans.push(Span::styled(
+            transfer_bar(download.fraction()),
+            theme::accent(),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", transfer_bytes_text(download)),
+            theme::text(),
+        ));
+    }
+
+    if let Some(stage) = campaigns.firmware_install.filter(|stage| {
+        // An installer that has never been asked to do anything says nothing here; the strip is for
+        // activity, and "this charger has an installer" is a capability, not an event.
+        !matches!(stage, FirmwareInstallStage::Idle)
+    }) {
+        if !spans.is_empty() {
+            spans.push(Span::raw("   "));
+        }
+        let (text, style) = firmware_stage_text(stage);
+        spans.push(Span::styled("firmware ", theme::text_dim()));
+        spans.push(Span::styled(text, style));
+    }
+
+    if let Some(upload) = &campaigns.log_upload {
+        if !spans.is_empty() {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled("log upload ", theme::text_dim()));
+        spans.push(Span::styled(
+            transfer_bar(upload.fraction()),
+            theme::accent(),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", transfer_bytes_text(upload)),
+            theme::text(),
+        ));
+    }
+
+    Line::from(spans)
+}
+
 /// The EVSE/connector pair `focused` points at, if it identifies a real connector in `charger`.
 fn focused_connector(
     charger: &ChargerState,
@@ -654,9 +956,10 @@ fn focused_connector(
 }
 
 pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
-    let has_display = view.charger.is_some_and(|state| state.config.has_display);
+    let strips = body_strips_for(view.charger, &view.campaigns);
+    let has_display = strips.display;
     let layout = dashboard_layout(frame.area());
-    let body = body_layout(layout.body, has_display);
+    let body = body_layout(layout.body, strips);
 
     // `focused: false` at every section call site below: panel-level focus (as opposed to the
     // tree's own connector-focus concept, handled separately) has no representation in `App`
@@ -674,6 +977,29 @@ pub(super) fn render(frame: &mut Frame, view: &DashboardView) {
         frame.render_widget(
             Paragraph::new(line).block(theme::section("Display", focused)),
             body.display,
+        );
+    }
+
+    if strips.capabilities {
+        let capabilities = view
+            .charger
+            .map(|state| capability_labels(&state.config))
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(capability_line(
+                &capabilities,
+                body.capabilities.width as usize,
+            ))
+            .block(theme::section("Declared", focused)),
+            body.capabilities,
+        );
+    }
+
+    if strips.campaigns {
+        frame.render_widget(
+            Paragraph::new(campaign_line(&view.campaigns))
+                .block(theme::section("Firmware & files", focused)),
+            body.campaigns,
         );
     }
 
@@ -963,7 +1289,7 @@ mod tests {
 
     #[test]
     fn body_splits_tree_and_sidebar_horizontally_when_wide_enough() {
-        let body = body_layout(area(120, 30), false);
+        let body = body_layout(area(120, 30), BodyStrips::default());
 
         let sidebar = body.sidebar.expect("120 columns should fit a sidebar");
         assert_eq!(body.tree.x, 0);
@@ -974,7 +1300,7 @@ mod tests {
 
     #[test]
     fn body_collapses_the_sidebar_below_the_width_threshold() {
-        let body = body_layout(area(80, 30), false);
+        let body = body_layout(area(80, 30), BodyStrips::default());
 
         assert!(body.sidebar.is_none());
         assert_eq!(body.tree.width, 80);
@@ -982,19 +1308,19 @@ mod tests {
 
     #[test]
     fn the_threshold_itself_still_fits_a_sidebar() {
-        let body = body_layout(area(SIDEBAR_MIN_BODY_WIDTH, 30), false);
+        let body = body_layout(area(SIDEBAR_MIN_BODY_WIDTH, 30), BodyStrips::default());
         assert!(body.sidebar.is_some());
     }
 
     #[test]
     fn one_column_below_the_threshold_collapses() {
-        let body = body_layout(area(SIDEBAR_MIN_BODY_WIDTH - 1, 30), false);
+        let body = body_layout(area(SIDEBAR_MIN_BODY_WIDTH - 1, 30), BodyStrips::default());
         assert!(body.sidebar.is_none());
     }
 
     #[test]
     fn the_display_strip_takes_no_space_when_the_charger_has_no_display() {
-        let body = body_layout(area(120, 30), false);
+        let body = body_layout(area(120, 30), BodyStrips::default());
 
         assert_eq!(body.display.height, 0);
         assert_eq!(body.tree.y, body.display.y);
@@ -1002,7 +1328,13 @@ mod tests {
 
     #[test]
     fn the_display_strip_reserves_its_configured_height_when_present() {
-        let body = body_layout(area(120, 30), true);
+        let body = body_layout(
+            area(120, 30),
+            BodyStrips {
+                display: true,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(body.display.height, DISPLAY_HEIGHT);
         assert_eq!(body.tree.y, body.display.bottom());
@@ -1010,7 +1342,13 @@ mod tests {
 
     #[test]
     fn body_layout_does_not_panic_on_a_tiny_area() {
-        let body = body_layout(area(80, 0), true);
+        let body = body_layout(
+            area(80, 0),
+            BodyStrips {
+                display: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(body.tree.height, 0);
     }
 
@@ -1100,7 +1438,7 @@ mod tests {
 
     // --- header_segments ---------------------------------------------------------------
 
-    use charge_point_simulator_core::charger::{ChargerConfig, OcppVersion};
+    use charge_point_simulator_core::charger::{CapabilitiesConfig, OcppVersion, Vehicle};
 
     fn charger_state_for_header(id: &str) -> ChargerState {
         ChargerState::from_config(ChargerConfig {
@@ -1206,6 +1544,329 @@ mod tests {
         );
     }
 
+    // --- the declared-capabilities strip (H4) ----------------------------------------------
+
+    fn config_with(declare: impl FnOnce(&mut CapabilitiesConfig)) -> ChargerConfig {
+        let mut config = ChargerConfig {
+            id: "CP-CAPS".to_string(),
+            ocpp_version: OcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+            capabilities: CapabilitiesConfig::default(),
+        };
+        declare(&mut config.capabilities);
+        config
+    }
+
+    #[test]
+    fn a_charger_declaring_nothing_gets_no_capability_strip_at_all() {
+        let config = config_with(|_| {});
+        assert!(capability_labels(&config).is_empty());
+
+        let state = ChargerState::from_config(config);
+        let strips = body_strips_for(Some(&state), &CampaignProgress::default());
+        assert!(!strips.capabilities);
+        assert_eq!(
+            body_layout(area(120, 30), strips).capabilities.height,
+            0,
+            "an empty list must not cost the tree two rows"
+        );
+    }
+
+    /// A display has its own section; every other declaration has no other representation on this
+    /// screen, which is what the strip is for - see [`capability_labels`].
+    #[test]
+    fn a_declared_display_is_left_to_the_display_section_rather_than_listed_twice() {
+        let mut config = config_with(|_| {});
+        config.has_display = true;
+        assert!(capability_labels(&config).is_empty());
+
+        let both_spellings = config_with(|capabilities| capabilities.has_display = true);
+        assert!(capability_labels(&both_spellings).is_empty());
+    }
+
+    #[test]
+    fn declared_capabilities_are_listed_behaviour_first() {
+        let config = config_with(|capabilities| {
+            capabilities.smart_charging = true;
+            capabilities.supports_bidirectional_power = true;
+            capabilities.has_persistent_storage = true;
+            capabilities.payment = true;
+        });
+
+        assert_eq!(
+            capability_labels(&config),
+            vec!["smart charging", "V2G", "storage", "payment"]
+        );
+    }
+
+    #[test]
+    fn an_undeclared_capability_is_never_listed() {
+        let config = config_with(|capabilities| capabilities.smart_charging = true);
+        let labels = capability_labels(&config);
+
+        assert_eq!(labels, vec!["smart charging"]);
+        assert!(!labels.contains(&"V2G"));
+        assert!(!labels.contains(&"firmware"));
+    }
+
+    /// Truncation says how much it dropped: a list that quietly stopped would read as a shorter
+    /// declaration than the charger actually made.
+    #[test]
+    fn a_capability_list_too_wide_to_fit_says_how_many_it_dropped() {
+        let labels = vec!["smart charging", "V2G", "DER control", "reservation"];
+
+        let full = lines_text(&[capability_line(&labels, 120)]);
+        assert_eq!(
+            full,
+            "smart charging  ·  V2G  ·  DER control  ·  reservation"
+        );
+        assert!(!full.contains("more"));
+
+        let narrow = lines_text(&[capability_line(&labels, 40)]);
+        assert!(narrow.chars().count() <= 40, "{narrow}");
+        assert!(narrow.starts_with("smart charging"), "{narrow}");
+        assert!(narrow.ends_with("more"), "{narrow}");
+
+        // Pathologically narrow: one label always survives rather than an empty or mid-word line.
+        let tiny = lines_text(&[capability_line(&labels, 1)]);
+        assert!(tiny.starts_with("smart charging"), "{tiny}");
+        assert!(tiny.ends_with("+3 more"), "{tiny}");
+    }
+
+    // --- the campaign strip: firmware and file transfers (H10) -----------------------------
+
+    fn transfer(fraction: f64, total_bytes: u64) -> InFlightTransfer {
+        InFlightTransfer {
+            elapsed: Duration::from_secs(10).mul_f64(fraction),
+            duration: Duration::from_secs(10),
+            transferred_bytes: (total_bytes as f64 * fraction) as u64,
+            total_bytes,
+        }
+    }
+
+    #[test]
+    fn the_campaign_strip_is_only_allotted_rows_while_something_is_in_flight() {
+        let idle = body_layout(area(120, 30), BodyStrips::default());
+        assert_eq!(idle.campaigns.height, 0);
+        let tree_without_strip = idle.tree.height;
+
+        let active = body_layout(
+            area(120, 30),
+            BodyStrips {
+                campaigns: true,
+                ..Default::default()
+            },
+        );
+        assert!(active.campaigns.height > 0);
+        assert_eq!(
+            active.tree.height,
+            tree_without_strip - active.campaigns.height,
+            "the strip's rows have to come from the tree, not from nowhere"
+        );
+    }
+
+    /// A firmware download and a log upload are independent campaigns that can both be in flight at
+    /// once, so the strip has to be able to show both - the reason `FakeFileTransfer` fails them
+    /// independently in the first place.
+    #[test]
+    fn the_campaign_strip_shows_a_download_an_install_and_an_upload_together() {
+        let text = lines_text(&[campaign_line(&CampaignProgress {
+            firmware_install: Some(FirmwareInstallStage::Installing),
+            firmware_download: Some(transfer(0.5, 8 * 1024 * 1024)),
+            log_upload: Some(transfer(0.25, 2 * 1024 * 1024)),
+        })]);
+
+        assert!(text.contains("firmware download"), "{text}");
+        assert!(text.contains("4.0/8.0 MiB"), "{text}");
+        assert!(text.contains("firmware installing"), "{text}");
+        assert!(text.contains("log upload"), "{text}");
+        assert!(text.contains("0.5/2.0 MiB"), "{text}");
+    }
+
+    /// An installer that exists but has never been asked to do anything is a capability, not an
+    /// event - the strip is for activity.
+    #[test]
+    fn an_idle_installer_puts_nothing_in_the_campaign_strip() {
+        let text = lines_text(&[campaign_line(&CampaignProgress {
+            firmware_install: Some(FirmwareInstallStage::Idle),
+            ..Default::default()
+        })]);
+
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn a_failed_install_is_named_as_failed_rather_than_silently_dropped() {
+        let text = lines_text(&[campaign_line(&CampaignProgress {
+            firmware_install: Some(FirmwareInstallStage::Failed),
+            ..Default::default()
+        })]);
+
+        assert!(text.contains("firmware failed"), "{text}");
+    }
+
+    #[test]
+    fn a_transfer_bar_fills_with_its_fraction() {
+        assert_eq!(transfer_bar(0.0), "░░░░░░░░░░");
+        assert_eq!(transfer_bar(0.5), "█████░░░░░");
+        assert_eq!(transfer_bar(1.0), "██████████");
+        // Nothing outside 0..=1 can produce a bar of the wrong width.
+        assert_eq!(transfer_bar(-1.0).chars().count(), 10);
+        assert_eq!(transfer_bar(2.0), "██████████");
+    }
+
+    // --- hardware state: lock, contactor, current limit, direction (H7/H14) ----------------
+
+    #[test]
+    fn lock_and_contactor_always_read_as_one_of_two_states_never_blank() {
+        assert_eq!(lock_text(true), "engaged");
+        assert_eq!(lock_text(false), "released");
+        assert_eq!(contactor_text(true), "closed");
+        assert_eq!(contactor_text(false), "open");
+    }
+
+    /// The distinction `ConnectorState::current_limit_ma` exists to preserve has to survive being
+    /// rendered: a suspended connector (`Some(0)`) must not read the same as an unlimited one
+    /// (`None`).
+    #[test]
+    fn a_suspended_current_limit_never_renders_the_same_as_no_limit_at_all() {
+        assert_eq!(current_limit_text(None), "none");
+        assert_eq!(current_limit_text(Some(0)), "suspended (0.0 A)");
+        assert_eq!(current_limit_text(Some(16_000)), "16.0 A");
+        assert_eq!(current_limit_text(Some(6_500)), "6.5 A");
+        assert_ne!(current_limit_text(Some(0)), current_limit_text(None));
+    }
+
+    #[test]
+    fn exported_energy_reads_in_kwh_like_every_other_energy_figure() {
+        assert_eq!(exported_energy_text(0), "0.000 kWh");
+        assert_eq!(exported_energy_text(1_250), "1.250 kWh");
+    }
+
+    /// A connector with a mid-session vehicle, plus whatever hardware state the caller wants.
+    fn connector_with_hardware(
+        locked: bool,
+        contactor_closed: bool,
+        current_limit_ma: Option<u32>,
+        discharging: bool,
+        exported_energy_wh: i64,
+    ) -> ConnectorState {
+        ConnectorState {
+            id: 1,
+            status: ConnectorStatus::Charging,
+            vehicle: Some(Vehicle {
+                id: "MY-EV-1".into(),
+                state_of_charge: Some(34.0),
+            }),
+            session_duration: Duration::from_secs(72),
+            locked,
+            contactor_closed,
+            current_limit_ma,
+            discharging,
+            exported_energy_wh,
+        }
+    }
+
+    fn lines_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_sidebar_states_lock_contactor_and_limit_even_when_none_of_them_is_engaged() {
+        let evse = evse_with_statuses(&[ConnectorStatus::Charging]);
+        let connector = connector_with_hardware(false, false, None, false, 0);
+
+        let text = lines_text(&sidebar_lines(&evse, &connector));
+
+        assert!(text.contains("lock     released"), "{text}");
+        assert!(text.contains("contact  open"), "{text}");
+        assert!(text.contains("limit    none"), "{text}");
+    }
+
+    #[test]
+    fn the_sidebar_shows_engaged_hardware_and_the_applied_limit() {
+        let evse = evse_with_statuses(&[ConnectorStatus::Charging]);
+        let connector = connector_with_hardware(true, true, Some(16_000), false, 0);
+
+        let text = lines_text(&sidebar_lines(&evse, &connector));
+
+        assert!(text.contains("lock     engaged"), "{text}");
+        assert!(text.contains("contact  closed"), "{text}");
+        assert!(text.contains("limit    16.0 A"), "{text}");
+    }
+
+    /// Direction is only worth a row when it isn't the default; the export register outlives the
+    /// discharge that filled it, so it is shown whenever it's non-zero.
+    #[test]
+    fn the_sidebar_calls_out_discharge_and_keeps_the_export_register_afterwards() {
+        let evse = evse_with_statuses(&[ConnectorStatus::Charging]);
+
+        let importing = lines_text(&sidebar_lines(
+            &evse,
+            &connector_with_hardware(true, true, None, false, 0),
+        ));
+        assert!(!importing.contains("exporting"), "{importing}");
+        assert!(!importing.contains("exported"), "{importing}");
+
+        let exporting = lines_text(&sidebar_lines(
+            &evse,
+            &connector_with_hardware(true, true, None, true, 2_500),
+        ));
+        assert!(exporting.contains("exporting (V2G)"), "{exporting}");
+        assert!(exporting.contains("exported 2.500 kWh"), "{exporting}");
+
+        let after = lines_text(&sidebar_lines(
+            &evse,
+            &connector_with_hardware(true, true, None, false, 2_500),
+        ));
+        assert!(!after.contains("exporting (V2G)"), "{after}");
+        assert!(after.contains("exported 2.500 kWh"), "{after}");
+    }
+
+    /// The narrow fallback carries the two hardware facts that change what a user does next, only
+    /// when they aren't the default, and has to stay inside 80 columns while doing it - the width
+    /// the `dashboard_narrow` golden renders at (see [`inline_detail_line`]).
+    #[test]
+    fn the_inline_detail_appends_the_limit_and_direction_only_when_they_are_not_the_default() {
+        let evse = evse_with_statuses(&[ConnectorStatus::Charging]);
+
+        let default_hardware = lines_text(&[inline_detail_line(
+            &evse,
+            &connector_with_hardware(true, true, None, false, 0),
+        )]);
+        assert!(!default_hardware.contains(" A"), "{default_hardware}");
+        assert!(!default_hardware.contains("V2G"), "{default_hardware}");
+
+        let limited_and_exporting = lines_text(&[inline_detail_line(
+            &evse,
+            &connector_with_hardware(true, true, Some(16_000), true, 0),
+        )]);
+        assert!(
+            limited_and_exporting.contains("16.0 A"),
+            "{limited_and_exporting}"
+        );
+        assert!(
+            limited_and_exporting.contains("V2G"),
+            "{limited_and_exporting}"
+        );
+        assert!(
+            limited_and_exporting.chars().count() <= 80,
+            "the inline detail must survive the narrow layout it exists for: \
+             {} columns: {limited_and_exporting}",
+            limited_and_exporting.chars().count()
+        );
+    }
+
     // --- evse_summary_status -------------------------------------------------------------
 
     fn evse_with_statuses(statuses: &[ConnectorStatus]) -> EvseState {
@@ -1222,6 +1883,8 @@ mod tests {
                     locked: false,
                     contactor_closed: false,
                     current_limit_ma: None,
+                    discharging: false,
+                    exported_energy_wh: 0,
                 })
                 .collect(),
             metrics: Default::default(),

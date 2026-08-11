@@ -6,11 +6,11 @@ EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh                               
     C2  ○ available                                                                     no vehicle
 EVSE 2  ✕ faulted   0.00 kW  0.0 A  0.000 kWh                                           session  0s
   ▸ C1  ✕ faulted
+                                                                                        lock     released
+                                                                                        contact  open
+                                                                                        limit    none
+
                                                                                         0.00 kW  0.0 A  0.000 kWh
-
-
-
-
 
 
 

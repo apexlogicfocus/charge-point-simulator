@@ -20,13 +20,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::app::{App, FocusedConnector};
+use crate::app::{App, CampaignProgress, FocusedConnector};
 use crate::logs::{Direction, LogEntry, LogLevel};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargerConfig, ChargerEntry, ChargerSource, ChargerState, Command, ConnectionProfile,
-    ConnectionStatus, EvseConfig, EvseMetrics, OcppVersion, SecurityProfile, SimulationMode,
+    ConnectionStatus, EvseConfig, EvseMetrics, FirmwareInstallStage, InFlightTransfer, OcppVersion,
+    SecurityProfile, SimulationMode, built_in_chargers,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
@@ -189,6 +190,14 @@ fn charging_dashboard_app() -> App {
         current_a: 7.4 * 1000.0 / 230.0,
         energy_kwh: 7.4 * 600.0 / 3600.0,
     };
+    // The hardware-only half of the same reading (H7), set for exactly the same reason and with the
+    // same honesty constraint: a connector genuinely mid-session has its cable locked and its
+    // contactor closed - that is *why* the meter above is moving - here under a CSMS-applied 16 A
+    // charging profile. Left at their construction defaults, the goldens would show a charging
+    // connector as unlocked with its contactor open, a state real hardware never reaches.
+    state.evses[0].connectors[0].locked = true;
+    state.evses[0].connectors[0].contactor_closed = true;
+    state.evses[0].connectors[0].current_limit_ma = Some(16_000);
 
     // Structured entries rather than plain strings, so the goldens actually pin the log pane's
     // columns: timestamp, level, direction marker, elided target, action, and fields.
@@ -381,6 +390,88 @@ fn dashboard_charging() {
     let mut app = charging_dashboard_app();
 
     assert_snapshot("dashboard_charging", &render(&mut app, 120, 34));
+}
+
+/// The same mid-session dashboard with the connector exporting instead of importing
+/// (`docs/hardware-roadmap.md`'s H14): negative power on the meter, the sidebar's direction row,
+/// and the export register that keeps accumulating while OCPP's import register freezes. Its own
+/// scenario rather than a tweak to `dashboard_charging`, because every one of those is a state the
+/// dashboard could only previously have shown by inventing it.
+#[test]
+fn dashboard_discharging() {
+    let mut app = charging_dashboard_app();
+    let state = app.charger_state.as_mut().unwrap();
+    // What `RunningCharger::set_discharging` plus a tick would have produced, projected the way
+    // `apply_hardware_snapshot`/`apply_ocpp_state` project it: direction and the export register on
+    // the connector, a *negative* power reading on the meter, and `energy_kwh` (OCPP's import
+    // register) frozen at whatever it had already accumulated - it must never run backwards.
+    state.evses[0].connectors[0].discharging = true;
+    state.evses[0].connectors[0].exported_energy_wh = 2_500;
+    state.evses[0].metrics.power_kw = -7.4;
+    state.evses[0].metrics.current_a = -7.4 * 1000.0 / 230.0;
+
+    assert_snapshot("dashboard_discharging", &render(&mut app, 120, 34));
+}
+
+/// The shipped `demo-ocpp21-full` preset on the dashboard: the one charger whose declaration is
+/// non-empty out of the box, so this is what the "Declared" strip actually looks like in the app.
+/// Built from `built_in_chargers` rather than a hand-written config on purpose - if a capability is
+/// added to (or removed from) `SIMULATED_CAPABILITIES` in `core`, this golden is what says so.
+#[test]
+fn dashboard_declared_capabilities() {
+    let demo = built_in_chargers()
+        .into_iter()
+        .find(|entry| entry.config.id == "demo-ocpp21-full")
+        .expect("the full-featured demo preset ships with core");
+    let mut app = dashboard_app(demo.config);
+
+    assert_snapshot(
+        "dashboard_declared_capabilities",
+        &render(&mut app, 120, 34),
+    );
+}
+
+/// The same declaration on a terminal too narrow to list all of it, which is where the truncation
+/// count earns its place: `+N more` rather than a list that quietly stops.
+#[test]
+fn dashboard_declared_capabilities_narrow() {
+    let demo = built_in_chargers()
+        .into_iter()
+        .find(|entry| entry.config.id == "demo-ocpp21-full")
+        .expect("the full-featured demo preset ships with core");
+    let mut app = dashboard_app(demo.config);
+
+    assert_snapshot(
+        "dashboard_declared_capabilities_narrow",
+        &render(&mut app, 80, 24),
+    );
+}
+
+/// A firmware campaign and a diagnostics log upload in flight at once (`docs/hardware-roadmap.md`'s
+/// H10), which is the only thing that puts the campaign strip on screen at all - a charger with no
+/// firmware/file-transfer hardware, or one whose installer is idle, spends no rows on it (see
+/// `dashboard::body_layout`). Both halves at once on purpose: they are independent campaigns, and
+/// the strip claiming to show both is worth pinning.
+#[test]
+fn dashboard_firmware_campaign() {
+    let mut app = charging_dashboard_app();
+    app.campaigns = CampaignProgress {
+        firmware_install: Some(FirmwareInstallStage::Installing),
+        firmware_download: Some(InFlightTransfer {
+            elapsed: Duration::from_secs(12),
+            duration: Duration::from_secs(20),
+            transferred_bytes: 5 * 1024 * 1024,
+            total_bytes: 8 * 1024 * 1024,
+        }),
+        log_upload: Some(InFlightTransfer {
+            elapsed: Duration::from_secs(2),
+            duration: Duration::from_secs(10),
+            transferred_bytes: 400 * 1024,
+            total_bytes: 2 * 1024 * 1024,
+        }),
+    };
+
+    assert_snapshot("dashboard_firmware_campaign", &render(&mut app, 120, 34));
 }
 
 /// The log filter prompt open over the dashboard, with the filter already narrowing the pane
@@ -675,6 +766,11 @@ fn multi_evse_mixed_status_app() -> App {
         current_a: 7.4 * 1000.0 / 230.0,
         energy_kwh: 7.4 * 600.0 / 3600.0,
     };
+    // Likewise for the hardware-only half (H7): only the charging connector is locked with its
+    // contactor closed. The free connector and the faulted one on EVSE 2 stay released and open,
+    // which is what their hardware really would report.
+    state.evses[0].connectors[0].locked = true;
+    state.evses[0].connectors[0].contactor_closed = true;
     app
 }
 

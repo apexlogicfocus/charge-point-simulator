@@ -6,11 +6,11 @@ EVSE 1  ○ available   0.00 kW  0│ q           quit (confirm)                
                                 │                                                      █no vehicle
                                 │Charger picker                                        █session  0s
                                 │ ↑/↓         move selection                           █
-                                │ type        filter by charger id                     █0.00 kW  0.0 A  0.000 kWh
-                                │ Enter       select charger                           █
-                                │ Esc         clear filter (or quit)                   █
+                                │ type        filter by charger id                     █lock     released
+                                │ Enter       select charger                           █contact  open
+                                │ Esc         clear filter (or quit)                   █limit    none
                                 │                                                      █
-                                │Connection setup                                      █
+                                │Connection setup                                      █0.00 kW  0.0 A  0.000 kWh
                                 │ Tab/↑/↓     move between fields                      █
                                 │ Ctrl+R      reveal/hide password                     █
                                 │ PgUp/PgDn   cycle recent URLs                        █
@@ -22,13 +22,13 @@ EVSE 1  ○ available   0.00 kW  0│ q           quit (confirm)                
                                 │ ↑/↓         focus connector                          █
 Logs────────────────────────────│ Tab/←/→     focus EVSE                               █────────────────────────────────
                                 │ Ctrl+K / c  open command palette                     █
+                                │ d           toggle V2G discharge (if declared)       █
                                 │                                                      █
                                 │Logs                                                  █
                                 │ PgUp/PgDn   scroll                                   █
-                                │ g / G       jump to oldest / newest                  █
-                                │ /           filter (Esc clears)                      █
+                                │ g / G       jump to oldest / newest                  ║
+                                │ /           filter (Esc clears)                      ║
                                 │ l           cycle level threshold                    ║
                                 │ Ctrl+L      clear logs                               ║
-                                │ y           copy focused log line                    ║
                                 └──────────────────────────────────────────────────────┘
 q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help

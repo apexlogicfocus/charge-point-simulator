@@ -112,12 +112,81 @@ pub fn apply_ocpp_state(charger: &mut ChargerState, ocpp_state: &ChargePointStat
 /// this alongside `apply_ocpp_state` - callers who only care about one signal (e.g. these tests)
 /// can reach for either projection on its own.
 pub fn apply_hardware_state(charger: &mut ChargerState, hardware: &FakeChargePoint) {
-    for (evse, hw_evse) in charger.evses.iter_mut().zip(hardware.evses().iter()) {
-        for (connector, hw_connector) in evse.connectors.iter_mut().zip(hw_evse.connectors().iter())
-        {
-            connector.locked = hw_connector.is_locked();
-            connector.contactor_closed = hw_connector.is_contactor_closed();
-            connector.current_limit_ma = hw_connector.current_limit_ma();
+    apply_hardware_snapshot(charger, &hardware_snapshot(hardware));
+}
+
+/// Everything about one connector that lives *only* in the hardware layer, with no
+/// `ChargePointState` counterpart to read instead: the H7 lock/contactor/current-limit trio and
+/// H14's power direction plus exported-energy register.
+///
+/// A plain, owned, `Copy` value so it can cross a thread boundary, which is the whole reason this
+/// type exists. [`apply_hardware_state`] is enough for a caller holding a
+/// [`FakeChargePoint`] on the same thread it renders from, but
+/// [`super::running_charger::RunningCharger`] keeps its hardware handle private and is not `Send`,
+/// so a frontend that drives the runtime on its own thread - the TUI, and any downstream consumer
+/// of the published crate shaped the same way - can never call `apply_hardware_state` itself. It
+/// forwards a snapshot instead (see [`super::running_charger::RunningCharger::hardware_snapshot`])
+/// and applies it with [`apply_hardware_snapshot`], which is the same projection
+/// `apply_hardware_state` performs, split in two at the point where the value stops needing the
+/// hardware.
+///
+/// Every field is the source for the [`ConnectorState`] field of the same name, whose doc comment
+/// is where each one is actually explained.
+///
+/// [`ConnectorState`]: super::state::ConnectorState
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConnectorHardwareSnapshot {
+    pub locked: bool,
+    pub contactor_closed: bool,
+    pub current_limit_ma: Option<u32>,
+    pub discharging: bool,
+    pub exported_energy_wh: i64,
+}
+
+/// Reads every connector's hardware-only state off `hardware`, outer `Vec` per EVSE and inner per
+/// connector, in the hardware's own array order - the positional addressing
+/// [`apply_hardware_state`]'s doc comment explains, preserved here so a snapshot lines up with a
+/// [`ChargerState`] built from the same config exactly as the hardware handle itself does.
+pub fn hardware_snapshot(hardware: &FakeChargePoint) -> Vec<Vec<ConnectorHardwareSnapshot>> {
+    hardware
+        .evses()
+        .iter()
+        .map(|hw_evse| {
+            hw_evse
+                .connectors()
+                .iter()
+                .map(|hw_connector| ConnectorHardwareSnapshot {
+                    locked: hw_connector.is_locked(),
+                    contactor_closed: hw_connector.is_contactor_closed(),
+                    current_limit_ma: hw_connector.current_limit_ma(),
+                    discharging: hw_connector.is_discharging(),
+                    exported_energy_wh: hw_connector.exported_energy_wh(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Overwrites `charger`'s hardware-only per-connector state from `snapshot`, which
+/// [`hardware_snapshot`] produced - the half of [`apply_hardware_state`] that no longer needs the
+/// hardware handle, so it can run on whichever thread renders (see [`ConnectorHardwareSnapshot`]).
+///
+/// Positional, and tolerant of a length mismatch in either direction: a connector with no entry
+/// keeps whatever it had rather than being reset, exactly as `apply_hardware_state`'s `zip`
+/// already behaved. In practice both sides come from the same [`super::config::ChargerConfig`], so
+/// a mismatch means a snapshot from a *different* charger arrived - and writing a foreign
+/// charger's lock state onto this one's connectors would be worse than writing nothing.
+pub fn apply_hardware_snapshot(
+    charger: &mut ChargerState,
+    snapshot: &[Vec<ConnectorHardwareSnapshot>],
+) {
+    for (evse, hw_evse) in charger.evses.iter_mut().zip(snapshot.iter()) {
+        for (connector, hw_connector) in evse.connectors.iter_mut().zip(hw_evse.iter()) {
+            connector.locked = hw_connector.locked;
+            connector.contactor_closed = hw_connector.contactor_closed;
+            connector.current_limit_ma = hw_connector.current_limit_ma;
+            connector.discharging = hw_connector.discharging;
+            connector.exported_energy_wh = hw_connector.exported_energy_wh;
         }
     }
 }
@@ -798,6 +867,120 @@ mod tests {
         assert!(
             charger.evses[1].connectors[0].locked,
             "position 1 (EvseConfig::id 2) must reflect the lock"
+        );
+    }
+
+    /// H14: direction and the export register are hardware-only facts too, so they ride along in
+    /// the same projection rather than needing a second one.
+    #[tokio::test]
+    async fn apply_hardware_state_reads_power_direction_and_exported_energy() {
+        let hardware = hardware_for(vec![EvseConfig {
+            id: 1,
+            connectors: 2,
+        }]);
+        let mut charger = charger_state();
+
+        apply_hardware_state(&mut charger, &hardware);
+        assert!(!charger.evses[0].connectors[0].discharging);
+        assert_eq!(charger.evses[0].connectors[0].exported_energy_wh, 0);
+
+        // Discharge, with the contactor closed so the meter actually moves, then tick. The
+        // connector is ticked directly rather than through `FakeChargePoint::tick`, which is a
+        // deliberate no-op until `start` has stashed a `HardwareEventSender` (see its own test) -
+        // this fixture has no runtime behind it, only hardware.
+        let connector = &hardware.evses()[0].connectors()[0];
+        connector.set_discharging(true);
+        connector.close_contactor().await.unwrap();
+        connector.tick(std::time::Duration::from_secs(3600));
+
+        apply_hardware_state(&mut charger, &hardware);
+        assert!(charger.evses[0].connectors[0].discharging);
+        assert!(
+            charger.evses[0].connectors[0].exported_energy_wh > 0,
+            "an hour of simulated discharge should have exported something"
+        );
+        // The untouched sibling must not pick up either fact.
+        assert!(!charger.evses[0].connectors[1].discharging);
+        assert_eq!(charger.evses[0].connectors[1].exported_energy_wh, 0);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_carries_the_same_projection_apply_hardware_state_applies_directly() {
+        let evses = vec![
+            EvseConfig {
+                id: 1,
+                connectors: 2,
+            },
+            EvseConfig {
+                id: 2,
+                connectors: 1,
+            },
+        ];
+        let hardware = hardware_for(evses.clone());
+        hardware.evses()[0].connectors()[1].lock().await.unwrap();
+        hardware.evses()[1].connectors()[0]
+            .set_current_limit(Some(0))
+            .await
+            .unwrap();
+        hardware.evses()[1].connectors()[0].set_discharging(true);
+
+        let config = ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses,
+            has_display: false,
+            capabilities: CapabilitiesConfig::default(),
+        };
+        let mut applied_directly = ChargerState::from_config(config.clone());
+        apply_hardware_state(&mut applied_directly, &hardware);
+
+        let mut applied_from_snapshot = ChargerState::from_config(config);
+        apply_hardware_snapshot(&mut applied_from_snapshot, &hardware_snapshot(&hardware));
+
+        assert_eq!(applied_from_snapshot.evses, applied_directly.evses);
+        // Not vacuously equal: the facts set above have to have survived the round trip.
+        assert!(applied_from_snapshot.evses[0].connectors[1].locked);
+        assert_eq!(
+            applied_from_snapshot.evses[1].connectors[0].current_limit_ma,
+            Some(0)
+        );
+        assert!(applied_from_snapshot.evses[1].connectors[0].discharging);
+    }
+
+    /// A snapshot from a *different* charger (or one taken before a config changed) must not write
+    /// a foreign connector's lock state onto this charger's connectors - see
+    /// [`apply_hardware_snapshot`]'s doc comment. Anything the snapshot doesn't cover keeps what it
+    /// had.
+    #[test]
+    fn applying_a_shorter_or_longer_snapshot_leaves_the_uncovered_connectors_alone() {
+        let mut charger = ChargerState::from_config(ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses: vec![EvseConfig {
+                id: 1,
+                connectors: 2,
+            }],
+            has_display: false,
+            capabilities: CapabilitiesConfig::default(),
+        });
+        charger.evses[0].connectors[1].locked = true;
+
+        // One EVSE too many, and one connector too few on the EVSE that does line up.
+        apply_hardware_snapshot(
+            &mut charger,
+            &[
+                vec![ConnectorHardwareSnapshot {
+                    contactor_closed: true,
+                    ..Default::default()
+                }],
+                vec![ConnectorHardwareSnapshot::default()],
+            ],
+        );
+
+        assert!(charger.evses[0].connectors[0].contactor_closed);
+        assert!(
+            charger.evses[0].connectors[1].locked,
+            "a connector the snapshot said nothing about must keep its own state"
         );
     }
 }

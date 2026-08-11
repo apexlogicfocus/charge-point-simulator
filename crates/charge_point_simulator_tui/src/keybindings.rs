@@ -97,6 +97,10 @@ pub const SECTIONS: &[Section] = &[
                 keys: "Ctrl+K / c",
                 description: "open command palette",
             },
+            Binding {
+                keys: "d",
+                description: "toggle V2G discharge (if declared)",
+            },
         ],
     },
     Section {
@@ -192,9 +196,12 @@ const HINT_ENTRIES: &[(&str, u8)] = &[
     ("/: filter", 2),
     ("l: level", 1),
     // Lower priority than the rest: these are the first to go when the terminal is narrow,
-    // below even the navigation hints - useful, but the least essential entries here.
+    // below even the navigation hints - useful, but the least essential entries here. `d` joins
+    // them because it only does anything on a charger that declares bidirectional power, which
+    // most don't; the help overlay still documents it at any width.
     ("Ctrl+L: clear logs", 0),
     ("y: copy log", 0),
+    ("d: V2G", 0),
     ("c: command", 2),
     ("?: help", 3),
 ];
@@ -277,7 +284,7 @@ mod tests {
         assert_eq!(
             dashboard_hint_for_width(200),
             "q: quit  Esc: back  \u{2191}/\u{2193}: connector  Tab/\u{2190}/\u{2192}: EVSE  \
-             /: filter  l: level  Ctrl+L: clear logs  y: copy log  c: command  ?: help"
+             /: filter  l: level  Ctrl+L: clear logs  y: copy log  d: V2G  c: command  ?: help"
         );
     }
 

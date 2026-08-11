@@ -143,9 +143,18 @@ The guiding principles, which every task should be checked against:
 - **H7** — `ConnectorState` gained `locked`, `contactor_closed`, `current_limit_ma`, filled by a new
   `apply_hardware_state` next to `apply_ocpp_state` (they read different sources, so they stay
   separate functions) and joined on `RunningCharger::apply_state`, the only place a state snapshot
-  and the hardware handle are both in scope. Plumbing only: nothing calls it yet, because the TUI's
-  `App` holds channel endpoints rather than a hardware handle. Rendering these is a TUI task with its
-  own golden review.
+  and the hardware handle are both in scope.
+
+  **Now rendered, and the plumbing gap it left is closed.** H7 landed as plumbing nothing called,
+  because the TUI's `App` holds channel endpoints rather than a hardware handle — and could never
+  hold one, since `RunningCharger` is not `Send` and keeps `hardware` private. That is a property of
+  *any* frontend with a thread or request boundary, not a TUI quirk, so the fix landed here rather
+  than there: `ConnectorHardwareSnapshot` plus `ocpp_bridge::hardware_snapshot`/
+  `apply_hardware_snapshot` and `RunningCharger::hardware_snapshot` split the projection in two at
+  the point where the value stops needing the hardware, and `apply_hardware_state` is now defined in
+  terms of them so the two paths cannot drift. `ConnectorState` also gained H14's `discharging`/
+  `exported_energy_wh`, filled by the same projection. See `docs/tui-roadmap.md`'s Phase 8 for the
+  rendering half and its goldens.
 - **H9** — reservations and the local authorization list, proven from outside the crate via
   `tests/reservation_and_auth_list.rs`. Two things it could *not* prove, which matter more than the
   three it could:
@@ -277,6 +286,11 @@ Every charger — local or connected — runs a real `ocpp_charge_point::ChargeP
 - `charger/state.rs` no longer simulates anything electrical or drives `connection_status` itself;
   `ocpp_bridge::apply_ocpp_state` is the only thing that writes either, from a real
   `ChargePointState` snapshot.
+- Everything the hardware knows that OCPP has no field for — lock, contactor, applied current limit,
+  power direction, the export register — reaches a frontend through `apply_hardware_state` on the
+  charger's own thread, or `RunningCharger::hardware_snapshot` + `apply_hardware_snapshot` across a
+  thread boundary. Both are the same projection; the TUI uses the second, and any downstream consumer
+  of the published crate that doesn't own the charger's thread will too.
 
 One simulation, as the guiding principle at the top of this document says.
 
@@ -509,6 +523,10 @@ more satisfying task.
   command exists to carry it. H14a's `set_discharging` is therefore reachable only programmatically
   — as of H14b, through `RunningCharger::set_discharging`/`exported_energy_wh` specifically (a
   frontend, a test, a downstream consumer), never through the protocol.
+
+  The TUI's `d` binding is that programmatic caller (see `docs/tui-roadmap.md`'s Phase 8): it sends a
+  `HardwareControl::SetDischarging` down its own channel, deliberately separate from the
+  `ChargePointEvent` path, precisely so nothing about it reads as protocol-driven.
 
   So bidirectional metering is real and testable, but "CSMS tells the charger to export" cannot be
   simulated at all today. Fixing it needs an upstream `HardwareCommand` variant plus a projection in

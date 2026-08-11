@@ -95,12 +95,84 @@ The guiding principles, which every remaining phase should be checked against:
   hit-testing can never disagree about where a row is. Pure refactor for rendering: every golden
   is byte-identical.
 
-## Phase 7 — polish
+- **Phase 8 — catching up with the hardware layer.** Waves H4–H14 of `docs/hardware-roadmap.md`
+  landed a great deal of hardware the dashboard could not see, could not reach, or was never given.
+  This phase closes all three, and is why the "Lock and contactor state are unreachable" gap is no
+  longer listed below.
 
-All four items have landed; see the Done section above. Nothing is scheduled after this — the
-open decisions below are all settled, so the next move is one of the unscheduled gaps after them.
-(No REST API crate is coming here — `core` is published to crates.io and any REST API lives in a
-separate downstream repo. See `CLAUDE.md`.)
+  **The thread boundary was the blocker, and it is now `core`'s to solve.** H7's
+  lock/contactor/current-limit trio is written by `apply_hardware_state`, which needs the hardware
+  handle — private to `RunningCharger`, which is not `Send` and lives on the charger's own thread. So
+  the TUI could never have called it. `core` gained `ConnectorHardwareSnapshot`,
+  `ocpp_bridge::hardware_snapshot`/`apply_hardware_snapshot` and
+  `RunningCharger::hardware_snapshot`, splitting that projection in two at the point where the value
+  stops needing the hardware; `apply_hardware_state` is now defined in terms of them, so the two
+  paths cannot drift. The TUI's channel carries a `ChargerSnapshot { ocpp, hardware, campaigns }`
+  instead of a bare `ChargePointState`, and applying both halves in `drain_charger_snapshots` is
+  exactly what `RunningCharger::apply_state` does on the other side — asserted in `core`'s
+  `a_hardware_snapshot_carries_what_apply_state_would_have_written`. Deliberately in `core`, not the
+  TUI: any downstream consumer of the published crate with a request/response boundary hits the
+  identical wall.
+
+  `ConnectorState` also gained `discharging`/`exported_energy_wh` (H14), filled by the same
+  projection, since `MeterSample` carries no export figure at all and OCPP's `energy_wh` deliberately
+  freezes rather than running backwards while exporting.
+
+  **Snapshots are now published on ticks and hardware actions too**, not only `states.changed()`:
+  the hardware half has no `ChargePointState` counterpart, so nothing about it is guaranteed to bump
+  the state version, and the export register in particular rises every tick with the protocol state
+  untouched.
+
+  **What reached the screen.** The sidebar states lock, contactor and current limit unconditionally
+  (`released`/`open`/`none` is as much an answer as its opposite), plus a direction row while
+  exporting and the export register whenever it is non-zero; `Some(0)` renders as
+  `suspended (0.0 A)` so a suspending profile can't be mistaken for the absence of one. The narrow
+  inline line carries only the limit and a `V2G` marker — it already runs to ~66 columns and has to
+  survive at 80 — leaving lock and contactor to the sidebar, exactly as it already leaves current and
+  energy there.
+
+  **`d` toggles discharge**, through a new `HardwareControl` channel to the charger's thread calling
+  `RunningCharger::set_discharging`. Its own channel and its own type, deliberately, because no OCPP
+  message can carry a direction (`HardwareCommand` has six variants and none of them can) — keeping
+  it out of the `ChargePointEvent` path is what stops the control reading as something the protocol
+  did. Gated on the charger declaring `supports_bidirectional_power` and on a vehicle actually being
+  plugged in: the hardware would obey regardless, but the declaration is the only thing the CSMS can
+  see, and direction with nothing connected is a reading no real charger produces. The current
+  direction is read back off the last snapshot rather than a local flag, so the toggle can never
+  disagree with the screen.
+
+  **The bundle was the other half of the gap.** `App` passed `ChargerHardware::new` — storage and a
+  display — so `firmware_installer`, `firmware_verifier`, `file_transfer` and `certificate_store`
+  were always `None` and a charger declaring `firmware_management`/`diagnostics`/
+  `certificate_management` registered *nothing*. `app.rs::charger_hardware` now builds each piece
+  the charger declares, with the install duration and transfer profiles as named constants carrying
+  their rationale. `key_store` stays `None` on purpose: nothing registers a `KeyStore`, so supplying
+  one would only suggest the charger does something with it.
+
+  Progress is surfaced through a `Firmware & files` strip, fed by `CampaignHandles` — `Arc` clones
+  taken out of the bundle *before* it is consumed, the same "clone before handing ownership away"
+  pattern `ChargerHardware`'s doc comment prescribes. This needed one observational accessor in
+  `core`: `FakeFileTransfer::download_in_flight`/`upload_in_flight` (returning `InFlightTransfer`),
+  because a transfer's progress otherwise goes only to upstream's callback and on to the CSMS, where
+  no frontend can see it. `Some(FirmwareInstallStage::Idle)` versus `None` is a real distinction: an
+  installer with nothing to do, versus a charger that cannot install firmware.
+
+  **A `Declared` strip** lists what the charger claims, which is the answer to both "why did that
+  refuse?" and "what is my CSMS being told?". Truncates with `+N more` rather than stopping quietly.
+  `has_display` is the one declaration left out — it has a whole section of its own two rows above.
+  All three strips are conditional and share one decision point, `dashboard::body_strips_for`, so
+  `render` and mouse hit-testing cannot lay the body out differently for the same state.
+
+  **`core` ships `demo-ocpp21-full`**, a preset declaring `SIMULATED_CAPABILITIES` — every capability
+  with hardware behind it and no others, with a test that keeps that constant honest — so none of the
+  above needs hand-written YAML to reach.
+
+## Where we are
+
+Phases 0–8 have all landed; see the Done section above. Nothing is scheduled after this — the open
+decisions below are all settled, so the next move is one of the unscheduled gaps after them. (No REST
+API crate is coming here — `core` is published to crates.io and any REST API lives in a separate
+downstream repo. See `CLAUDE.md`.)
 
 ## Settled decisions
 
@@ -134,9 +206,6 @@ All four former open decisions have had their human call:
   `ChargePointState` exposes no sent/received counts. The quantities available TUI-side (commands
   dispatched, state snapshots received) are not message counts, and displaying them under that
   label would misrepresent them. Needs support in `ocpp-charge-point` upstream.
-- **Lock and contactor state are unreachable.** `FakeConnector` tracks both, but they live in the
-  OCPP hardware layer rather than on `ChargerState`, so the sidebar cannot show them without new
-  plumbing.
 - **The view model is thin.** `DashboardView` borrows `&ChargerState` wholesale rather than
   reshaping it, so render functions still walk nested state. Adequate for one frontend; worth
   revisiting if a second frontend appears — though as an out-of-repo consumer of the published

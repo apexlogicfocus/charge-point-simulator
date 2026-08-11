@@ -6,11 +6,11 @@ EVSE 1  ○ available   0.00 kW  0.0 A  0.000 kWh                               
 EVSE 2  ○ available   0.00 kW  0.0 A  0.000 kWh                                         no vehicle
     C1  ○ available                                                                     session  0s
     C2  ○ available
+                                                                                        lock     released
+                                                                                        contact  open
+                                                                                        limit    none
+
                                                                                         0.00 kW  0.0 A  0.000 kWh
-
-
-
-
 
 
 

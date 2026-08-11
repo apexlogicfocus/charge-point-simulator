@@ -286,6 +286,8 @@ mod tests {
                     locked: false,
                     contactor_closed: false,
                     current_limit_ma: None,
+                    discharging: false,
+                    exported_energy_wh: 0,
                 })
                 .collect(),
             metrics: Default::default(),

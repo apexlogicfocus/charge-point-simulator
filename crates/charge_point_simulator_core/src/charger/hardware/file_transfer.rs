@@ -43,6 +43,44 @@ impl TransferProfile {
     }
 }
 
+/// A transfer that is running right now, as an outside observer can see it - returned by
+/// [`FakeFileTransfer::download_in_flight`]/[`FakeFileTransfer::upload_in_flight`].
+///
+/// Purely observational, exactly like [`super::firmware::FirmwareInstallStage`]: nothing in
+/// `ocpp-charge-point` reads it, and reading it neither advances nor disturbs the transfer. It
+/// exists because the progress a transfer *reports* goes to upstream's `TransferProgress` callback
+/// (and from there to the CSMS as `FirmwareStatusNotification`/`LogStatusNotification`), which a
+/// frontend cannot intercept - so without this, a firmware download in flight is invisible to
+/// anything but the CSMS on the other end.
+///
+/// There is deliberately no completed/failed variant: the slot this is read from exists only while
+/// a transfer is running, so `None` means "nothing in flight" and cannot distinguish "finished" from
+/// "never started". A caller wanting the outcome has it already - `download`/`upload` return it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InFlightTransfer {
+    /// Simulated time ticked into this transfer so far.
+    pub elapsed: Duration,
+    /// The configured total from this half's [`TransferProfile`], for turning `elapsed` into a
+    /// fraction. Never zero for a paced transfer; a [`TransferProfile::instant`] one completes
+    /// before anything could observe it.
+    pub duration: Duration,
+    /// How many of `total_bytes` have notionally moved - the same figure reported to upstream.
+    pub transferred_bytes: u64,
+    /// The size this transfer claims, from its [`TransferProfile`].
+    pub total_bytes: u64,
+}
+
+impl InFlightTransfer {
+    /// Completed fraction, `0.0..=1.0`, from the byte counts rather than the durations so it can
+    /// never disagree with the figure the CSMS was told.
+    pub fn fraction(&self) -> f64 {
+        if self.total_bytes == 0 {
+            return 1.0;
+        }
+        (self.transferred_bytes as f64 / self.total_bytes as f64).clamp(0.0, 1.0)
+    }
+}
+
 /// A simulated file transfer: no network, no bytes, just [`Self::tick`]-paced progress and a
 /// configurable, independently-failable outcome for each of `download` and `upload`.
 #[derive(Debug)]
@@ -81,6 +119,36 @@ impl FakeFileTransfer {
             upload_fail: AtomicBool::new(false),
             last_upload_bytes: Mutex::new(None),
         }
+    }
+
+    /// How far the in-flight [`FileTransfer::download`] has got, or `None` when no download is
+    /// currently running - see [`InFlightTransfer`].
+    pub fn download_in_flight(&self) -> Option<InFlightTransfer> {
+        Self::in_flight(&self.download, &self.download_progress)
+    }
+
+    /// How far the in-flight [`FileTransfer::upload`] has got, or `None` when no upload is
+    /// currently running - see [`InFlightTransfer`].
+    pub fn upload_in_flight(&self) -> Option<InFlightTransfer> {
+        Self::in_flight(&self.upload, &self.upload_progress)
+    }
+
+    /// Reads a half's progress channel without disturbing it. The slot is `Some` for exactly as long
+    /// as [`Self::run`]'s loop is running (it sets it on entry and clears it on the way out,
+    /// whichever way that goes), which is what makes its presence the honest answer to "is a
+    /// transfer in flight right now?".
+    fn in_flight(
+        profile: &TransferProfile,
+        slot: &Mutex<Option<watch::Sender<Duration>>>,
+    ) -> Option<InFlightTransfer> {
+        let sender = slot.lock().expect("lock poisoned").clone()?;
+        let elapsed = *sender.borrow();
+        Some(InFlightTransfer {
+            elapsed,
+            duration: profile.duration,
+            transferred_bytes: transferred_bytes(profile, elapsed),
+            total_bytes: profile.total_bytes,
+        })
     }
 
     /// The bytes handed to the most recent [`FileTransfer::upload`] call, if it carried
@@ -293,6 +361,58 @@ mod tests {
         assert!(
             seen.windows(2).all(|pair| pair[0] <= pair[1]),
             "progress must never go backwards: {seen:?}"
+        );
+    }
+
+    /// The observational accessor a frontend needs: nothing else can see a transfer's progress,
+    /// since the reports themselves go to upstream's callback and on to the CSMS.
+    #[tokio::test]
+    async fn an_in_flight_download_is_observable_and_stops_being_so_once_it_finishes() {
+        let transfer = FakeFileTransfer::new(
+            TransferProfile {
+                duration: Duration::from_secs(10),
+                total_bytes: 1000,
+            },
+            TransferProfile::instant(0),
+        );
+
+        assert_eq!(
+            transfer.download_in_flight(),
+            None,
+            "nothing is in flight before `download` is even called"
+        );
+
+        let ignored = TransferProgress::ignored();
+        let download = transfer.download("https://example.invalid/fw.bin", &ignored);
+        let observe = async {
+            tokio::task::yield_now().await;
+            let started = transfer
+                .download_in_flight()
+                .expect("a download awaiting ticks is in flight");
+            assert_eq!(started.transferred_bytes, 0);
+            assert_eq!(started.total_bytes, 1000);
+            assert_eq!(started.fraction(), 0.0);
+
+            transfer.tick(Duration::from_secs(4));
+            tokio::task::yield_now().await;
+            let midway = transfer
+                .download_in_flight()
+                .expect("still in flight, four of ten seconds in");
+            assert_eq!(midway.transferred_bytes, 400);
+            assert!((midway.fraction() - 0.4).abs() < 1e-9, "{midway:?}");
+            // An upload nobody started must not pick up the download's progress.
+            assert_eq!(transfer.upload_in_flight(), None);
+
+            transfer.tick(Duration::from_secs(6));
+        };
+
+        let (result, ()) = tokio::join!(download, observe);
+        result.unwrap();
+
+        assert_eq!(
+            transfer.download_in_flight(),
+            None,
+            "a finished download is no longer in flight"
         );
     }
 

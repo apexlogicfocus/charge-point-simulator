@@ -77,10 +77,21 @@ cargo fmt --all
 model, fake hardware, and a live OCPP 2.1 bridge (`connect_charger` + `apply_ocpp_state`); the
 TUI has a working picker → connection setup → dashboard flow.
 
-One thing worth knowing before touching the dashboard:
+Two things worth knowing before touching the dashboard:
 
-- `LogBuffer::set_filter`/`clear_filter` are implemented and tested but no key binding reaches
-  them yet — that's the source of the workspace's one `dead_code` warning.
+- **A charger's observable state reaches the TUI as a `ChargerSnapshot`, and has two halves.**
+  `ocpp` is a `ChargePointState`, applied with `apply_ocpp_state`. `hardware` is
+  `RunningCharger::hardware_snapshot`, applied with `apply_hardware_snapshot` — per-connector lock,
+  contactor, current limit, power direction and export register, none of which exist anywhere in
+  OCPP. Applying both is what `RunningCharger::apply_state` does in one call for a caller on the
+  charger's own thread; the TUI can't be that caller (`connect_charger`'s future isn't `Send`, so the
+  charger runs on its own thread and the hardware handle never leaves it), which is the whole reason
+  the split exists. If you add hardware state, add it to that projection in `core` — not to a TUI-side
+  shadow copy.
+- **The TUI builds the hardware bundle, gated on the charger's declared capabilities**
+  (`app.rs::charger_hardware`). A firmware installer or certificate store is only handed over when
+  the charger declares the matching block, and `register_optional_hardware` gates registration on the
+  same flags — so a capability a config didn't declare is inert twice over.
 
 A local (unconnected) charger runs a real `ocpp_charge_point::ChargePointRuntime` too (see
 `charger::RunningCharger`/`start_local_charger`), just with no CSMS ever dialed and no

@@ -213,12 +213,31 @@ to when the charger's configuration says to.
 The built-in Ratatui dashboard provides:
 
 * 📊 Charge point overview
-* 🔌 Connector states
+* 🔌 Connector states, including the cable lock, the contactor, and any current limit a smart
+  charging profile has applied
 * ⚡ Charging sessions
-* 📈 Meter values
+* 📈 Meter values, and the separate export register when a connector is discharging
+* 📦 Firmware installs and file transfers in flight
+* 📋 What the selected charger declares to the CSMS
 * 📜 Live logs
-* ⌨️ Keyboard controls
+* ⌨️ Keyboard controls (`?` lists them all)
 * 🔍 Real-time protocol events
+
+### Bidirectional power (V2G)
+
+`d` puts the focused connector into export and back, on a charger whose configuration declares
+`capabilities.supports_bidirectional_power` and with a vehicle plugged in. This is a direct hardware
+action, not an OCPP one - no OCPP message can carry a power direction, so a CSMS cannot ask a charger
+to export today. The metering itself is real: exported energy accumulates in its own register while
+OCPP's import register correctly freezes rather than running backwards.
+
+### Built-in presets
+
+Three chargers ship without any YAML: a plain OCPP 1.6J single-connector charger, a plain 2.0.1
+dual-EVSE one, and `demo-ocpp21-full`, which declares every capability the simulator has simulated
+hardware behind - smart charging, V2G, DER control, reservations, the local authorization list,
+firmware management, diagnostics, certificate management and persistent storage - so all of it can be
+exercised without writing a config first.
 
 ---
 

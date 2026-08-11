@@ -17,7 +17,9 @@ pub use connector::FakeConnector;
 pub use crypto::{EcdsaCrypto, EcdsaCryptoError, verify_signature};
 pub use display::FakeDisplay;
 pub use evse::FakeEvse;
-pub use file_transfer::{FakeFileTransfer, FakeFileTransferError, TransferProfile};
+pub use file_transfer::{
+    FakeFileTransfer, FakeFileTransferError, InFlightTransfer, TransferProfile,
+};
 pub use firmware::{
     FakeFirmwareInstaller, FakeFirmwareInstallerError, FakeFirmwareVerifier,
     FakeFirmwareVerifierError, FirmwareInstallStage,

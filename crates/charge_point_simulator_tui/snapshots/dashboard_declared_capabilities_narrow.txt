@@ -1,0 +1,24 @@
+● connected  |  demo-ocpp21-full  |  OCPP 2.1  |  local simulation  |  up 0s  ·
+────────────────────────────────────────────────────────────────────────────────
+Declared────────────────────────────────────────────────────────────────────────
+smart charging  ·  V2G  ·  DER control  ·  reservation  ·  +5 more
+EVSEs (1/2)─────────────────────────────────────────────────────────────────────
+EVSE 1  ○ available   0.00 kW  0.0 A  0.000 kWh
+  ▸ C1  ○ available
+        no vehicle  session 0s  0.00 kW
+EVSE 2  ○ available   0.00 kW  0.0 A  0.000 kWh
+    C1  ○ available
+
+
+Logs────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+q: quit  Esc: back  /: filter  c: command  ?: help

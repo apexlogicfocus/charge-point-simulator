@@ -1,7 +1,7 @@
 ● connected  |  CP-CHARGE  |  OCPP 1.6J  |  local simulation  |  up 10m 00s  ·
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 EVSEs (1/1)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
-EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh                                         EVSE 1 / C1
+EVSE 1  ● charging   -7.40 kW  -32.2 A  1.233 kWh                                       EVSE 1 / C1
   ▸ C1  ● charging   MY-EV-1   100%                                                     ● charging
                                                                                         vehicle  MY-EV-1
                                                                                         soc      100% ██████████
@@ -10,15 +10,15 @@ EVSE 1  ● charging   7.40 kW  32.2 A  1.233 kWh                               
                                                                                         lock     engaged
                                                                                         contact  closed
                                                                                         limit    16.0 A
+                                                                                        power    exporting (V2G)
+                                                                                        exported 2.500 kWh
 
-                             target EVSE 1 / C1  (Tab to retarget)                           kW  32.2 A  1.233 kWh
-                            ┌Filter────────────────────────────────────────────────────────┐
-                            │                                                              │
-                            └──────────────────────────────────────────────────────────────┘
-                            ┌Command───────────────────────────────────────────────────────┐
-                            │> Unplug vehicle  Removes the vehicle and frees the connector │
-                            │  Report fault    Marks the connector as faulted              │
-                            └──────────────────────────────────────────────────────────────┘
+                                                                                        -7.40 kW  -32.2 A  1.233 kWh
+
+
+
+
+
 
 Logs────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 10:30:03.000 INFO  → core::state    Heartbeat heartbeat sent seq=3                                                     ║

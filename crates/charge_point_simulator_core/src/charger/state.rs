@@ -130,6 +130,26 @@ pub struct ConnectorState {
     /// [`super::hardware::FakeConnector::current_limit_ma`] - same H7 rationale as
     /// [`Self::locked`].
     pub current_limit_ma: Option<u32>,
+    /// Whether this connector's meter is currently running in export (V2G discharge) direction
+    /// rather than import (`docs/hardware-roadmap.md`'s H14). Written exclusively by
+    /// [`super::ocpp_bridge::apply_hardware_state`], reading
+    /// [`super::hardware::FakeConnector::is_discharging`] - same H7 rationale as [`Self::locked`].
+    ///
+    /// No CSMS message can ever set this: `HardwareCommand` cannot carry direction, so discharge
+    /// is reachable only through [`super::running_charger::RunningCharger::set_discharging`] (see
+    /// its doc comment, and the roadmap's "Known gaps"). A frontend showing this field is
+    /// therefore reporting a deliberate local action, never something the protocol did.
+    pub discharging: bool,
+    /// Cumulative energy this connector has exported so far, in Wh - the counterpart to
+    /// [`EvseMetrics::energy_kwh`], which is OCPP's *import* register and deliberately freezes
+    /// rather than running backwards while discharging (H14a). Written exclusively by
+    /// [`super::ocpp_bridge::apply_hardware_state`], reading
+    /// [`super::hardware::FakeConnector::exported_energy_wh`].
+    ///
+    /// Per connector rather than per EVSE, unlike `EvseMetrics`: `MeterSample` carries no export
+    /// figure at all, so there is nothing for [`super::ocpp_bridge::apply_ocpp_state`] to sum on
+    /// the EVSE's behalf and no reason to invent an aggregate the hardware never reports.
+    pub exported_energy_wh: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -228,6 +248,8 @@ impl ChargerState {
                         locked: false,
                         contactor_closed: false,
                         current_limit_ma: None,
+                        discharging: false,
+                        exported_energy_wh: 0,
                     })
                     .collect(),
                 metrics: EvseMetrics::default(),
@@ -345,6 +367,20 @@ mod tests {
         assert!(!connector.locked);
         assert!(!connector.contactor_closed);
         assert_eq!(connector.current_limit_ma, None);
+    }
+
+    /// H14: a connector nothing has actuated is importing (the default direction) and has exported
+    /// nothing - the same "no hardware behind it yet" starting point the H7 fields have.
+    #[test]
+    fn a_fresh_connector_is_importing_and_has_exported_nothing() {
+        let state = ChargerState::from_config(config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]));
+
+        let connector = &state.evses[0].connectors[0];
+        assert!(!connector.discharging);
+        assert_eq!(connector.exported_energy_wh, 0);
     }
 
     #[test]

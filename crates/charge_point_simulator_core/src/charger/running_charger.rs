@@ -17,7 +17,9 @@ use super::config::ChargerConfig;
 use super::connect::{NullCsms, register_optional_hardware, register_setup_blocks};
 use super::hardware::{FakeChargePoint, FakeConnector, FakeFileTransfer, FakeFirmwareInstaller};
 use super::hardware_bundle::ChargerHardware;
-use super::ocpp_bridge::{apply_hardware_state, apply_ocpp_state};
+use super::ocpp_bridge::{
+    ConnectorHardwareSnapshot, apply_hardware_state, apply_ocpp_state, hardware_snapshot,
+};
 use super::state::ChargerState;
 
 /// Returned by [`RunningCharger::set_discharging`]/[`RunningCharger::exported_energy_wh`] when
@@ -141,6 +143,23 @@ impl RunningCharger {
     pub fn apply_state(&self, charger: &mut ChargerState) {
         apply_ocpp_state(charger, &self.state());
         apply_hardware_state(charger, &self.hardware);
+    }
+
+    /// This charger's hardware-only per-connector state as an owned, `Send` value - see
+    /// [`ConnectorHardwareSnapshot`], and [`Self::apply_state`] for the same projection applied
+    /// directly.
+    ///
+    /// `apply_state` covers a caller that renders on the thread it runs this charger on. A frontend
+    /// that doesn't - the TUI drives the runtime on a dedicated thread, because
+    /// [`super::connect::connect_charger`]'s future isn't `Send`, and any downstream consumer of
+    /// the published crate with a request/response boundary is in the same position - cannot call
+    /// `apply_state` at all, and cannot reach the `hardware` field either, since it is private and
+    /// deliberately so. This is what such a caller forwards instead, applying it with
+    /// [`apply_hardware_snapshot`] wherever its own [`ChargerState`] lives.
+    ///
+    /// [`apply_hardware_snapshot`]: super::ocpp_bridge::apply_hardware_snapshot
+    pub fn hardware_snapshot(&self) -> Vec<Vec<ConnectorHardwareSnapshot>> {
+        hardware_snapshot(&self.hardware)
     }
 
     /// Puts the connector at `evse_id`/`connector_id` into discharge (V2G export) or back to
@@ -333,6 +352,7 @@ mod tests {
     use crate::charger::config::CapabilitiesConfig;
     use crate::charger::config::EvseConfig;
     use crate::charger::config::OcppVersion;
+    use crate::charger::ocpp_bridge::apply_hardware_snapshot;
     use ocpp_charge_point::hardware::FirmwareInstaller;
     use ocpp_charge_point::persistence::{SecurityLogStore, restore_security_log};
     use ocpp_charge_point::security::SecurityEventLog;
@@ -728,6 +748,49 @@ mod tests {
         assert!(
             charger.exported_energy_wh(0, 0).unwrap() > 0,
             "expected exported energy to rise once discharging and ticked"
+        );
+    }
+
+    /// The cross-thread half of H7/H14 rendering: a frontend that can't call `apply_state` (it
+    /// doesn't own this thread) forwards a snapshot instead, and that snapshot has to carry the same
+    /// facts - including the two, direction and exported energy, that no `ChargePointState` snapshot
+    /// contains at all.
+    #[tokio::test]
+    async fn a_hardware_snapshot_carries_what_apply_state_would_have_written() {
+        let config = config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]);
+        let charger = start_local_charger(&config, ChargerHardware::default()).await;
+        charge_locally(&charger, 0, 0).await;
+        charger.set_discharging(0, 0, true).unwrap();
+        charger.tick(StdDuration::from_secs(3600)).await;
+
+        // Exactly what a frontend on another thread does with what it was forwarded: the OCPP
+        // snapshot through `apply_ocpp_state`, the hardware snapshot through
+        // `apply_hardware_snapshot` - which together must equal the single `apply_state` call a
+        // caller on *this* thread would have made.
+        let (ocpp, hardware) = (charger.state(), charger.hardware_snapshot());
+        let mut from_snapshot = ChargerState::from_config(config.clone());
+        apply_ocpp_state(&mut from_snapshot, &ocpp);
+        apply_hardware_snapshot(&mut from_snapshot, &hardware);
+
+        let mut from_apply_state = ChargerState::from_config(config);
+        charger.apply_state(&mut from_apply_state);
+
+        let connector = &from_snapshot.evses[0].connectors[0];
+        assert!(
+            connector.locked && connector.contactor_closed,
+            "a connector mid-session is locked with its contactor closed: {connector:?}"
+        );
+        assert!(connector.discharging);
+        assert_eq!(
+            connector.exported_energy_wh,
+            charger.exported_energy_wh(0, 0).unwrap()
+        );
+        assert_eq!(
+            from_snapshot.evses, from_apply_state.evses,
+            "forwarding a snapshot must project exactly what applying the hardware directly does"
         );
     }
 
