@@ -168,6 +168,12 @@ The guiding principles, which every task should be checked against:
   backend is a security decision left to H13. Moved `chrono` from a dev- to a regular dependency,
   since `CertificateStore::expires_at` names `chrono::DateTime<Utc>` in non-test code.
 
+- **H8** — the smart-charging chain is proven end to end, from outside the crate
+  (`tests/smart_charging.rs`): a restrictive profile accrues measurably less energy, `Some(0)`
+  suspends without ending the transaction or faulting, clearing restores the rate, a stepped
+  schedule switches exactly at the period boundary, and an undeclared capability leaves the profile
+  inert. Every link works — **once actually wired up**, which local mode does not do. See H3c.
+
 ## Where we are
 
 Every charger — local or connected — runs a real `ocpp_charge_point::ChargePointRuntime` (see
@@ -363,6 +369,35 @@ Also decide, deliberately: idle meter fields read `Some(0)` (hardware) or `None`
 
 Expect TUI goldens to move. Per the TUI roadmap's working agreements, inspect every regenerated one
 rather than accepting the diff.
+
+### H3c — Register the same functional blocks in local mode
+
+**Owns:** `charger/running_charger.rs`, `charger/connect.rs`.
+**Depends on:** nothing outstanding. **Do this before wave 4** — it invalidates conclusions drawn
+from local-mode behavior until it lands.
+
+`start_local_charger` registers exactly one block: `authorization`, against the always-accept
+`LocalAuthorizer`. Nothing else. Smart charging, reservations, the local authorization list,
+meter values, status notifications, the device model — all absent. A local charger is a real state
+machine with real hardware and almost no functional blocks attached, so a CSMS-independent feature
+does not fail loudly; it silently does nothing.
+
+That is how H8 found its gap (an injected `ChargingProfileSet` lands in state and no limit is ever
+computed, because the projection loops `ChargePointBuilder::smart_charging` spawns were never
+started) and it is half of why H9 could not observe local-list rejection. Both had to build their
+own builder chain in a test to work around it. A downstream consumer reaching for
+`start_local_charger` sees the same silent no-op, which is worse for them than for us — they have no
+roadmap explaining it.
+
+The fix is to route local mode through the same `register_setup_blocks` the connected path uses,
+against a null CSMS that satisfies the handler-registration traits without sending anything. H8
+demonstrated in `tests/smart_charging.rs` that every type required is public, so no upstream change
+is needed. Take the local-authorizer fix in "Known gaps" at the same time: both are "local mode is
+under-wired", and testing them together is cheaper than twice.
+
+Do not let the null CSMS quietly *become* a CSMS. It must not fabricate authorization decisions,
+transaction acknowledgements, or boot responses; anything a real CSMS would answer, it should
+decline to answer, so that local mode exercises the offline paths rather than a fake-online one.
 
 ### H7 — Surface hardware state on `ChargerState`
 
