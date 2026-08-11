@@ -3,12 +3,14 @@
 //! logic only - the thread and channel plumbing that carries values across this boundary lives
 //! in the TUI, since it's integration glue rather than testable state logic.
 
+use ocpp_charge_point::hardware::{ChargePoint, Evse};
 use ocpp_charge_point::state::{
     ChargePointEvent, ChargePointState, ConnectorEvent, ConnectorState as OcppConnectorState,
     EvseEvent, IdToken, IdTokenKind, MeterSample, RegistrationStatus, StopReason,
 };
 
 use super::command::Command;
+use super::hardware::FakeChargePoint;
 use super::state::{
     ChargerState, ConnectionStatus, ConnectorStatus, EvseMetrics, SimulationMode, Vehicle,
 };
@@ -90,6 +92,32 @@ pub fn apply_ocpp_state(charger: &mut ChargerState, ocpp_state: &ChargePointStat
                     state_of_charge: None,
                 });
             }
+        }
+    }
+}
+
+/// Overwrites `charger`'s per-connector lock, contactor and applied current-limit state from a
+/// running charger's fake hardware handle, keyed positionally exactly like [`apply_ocpp_state`] -
+/// `charger` and `hardware`'s EVSEs/connectors are built from the same
+/// [`super::config::ChargerConfig`] in the same order, so index (not
+/// [`super::hardware::FakeConnector`]'s own `evse_id`/`connector_id`, which carry the config's
+/// possibly non-1-based or non-contiguous numbering - see [`FakeChargePoint::tick`]'s doc
+/// comment) is the addressing scheme.
+///
+/// A separate function from `apply_ocpp_state` rather than folded into it, because these three
+/// fields have no `ChargePointState` counterpart to read at all - lock, contactor and current
+/// limit live only on [`super::hardware::FakeConnector`], in the hardware layer
+/// (`docs/hardware-roadmap.md`'s H7). [`super::running_charger::RunningCharger::apply_state`] is
+/// the one place both an OCPP snapshot and a hardware handle are reachable together, and calls
+/// this alongside `apply_ocpp_state` - callers who only care about one signal (e.g. these tests)
+/// can reach for either projection on its own.
+pub fn apply_hardware_state(charger: &mut ChargerState, hardware: &FakeChargePoint) {
+    for (evse, hw_evse) in charger.evses.iter_mut().zip(hardware.evses().iter()) {
+        for (connector, hw_connector) in evse.connectors.iter_mut().zip(hw_evse.connectors().iter())
+        {
+            connector.locked = hw_connector.is_locked();
+            connector.contactor_closed = hw_connector.is_contactor_closed();
+            connector.current_limit_ma = hw_connector.current_limit_ma();
         }
     }
 }
@@ -653,6 +681,123 @@ mod tests {
         assert_eq!(
             build_ocpp_event_for_connector(&ocpp, 0, 5, Command::PlugInVehicle, ""),
             None
+        );
+    }
+
+    // --- apply_hardware_state -------------------------------------------------------------
+
+    use ocpp_charge_point::hardware::Connector;
+
+    fn hardware_for(evses: Vec<EvseConfig>) -> FakeChargePoint {
+        FakeChargePoint::from_config(&ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses,
+            has_display: false,
+            capabilities: CapabilitiesConfig::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn apply_hardware_state_reads_lock_and_contactor_off_the_matching_connector() {
+        let hardware = hardware_for(vec![EvseConfig {
+            id: 1,
+            connectors: 2,
+        }]);
+        hardware.evses()[0].connectors()[0].lock().await.unwrap();
+        hardware.evses()[0].connectors()[0]
+            .close_contactor()
+            .await
+            .unwrap();
+
+        let mut charger = charger_state();
+        apply_hardware_state(&mut charger, &hardware);
+
+        assert!(charger.evses[0].connectors[0].locked);
+        assert!(charger.evses[0].connectors[0].contactor_closed);
+        // The untouched sibling connector must not pick up the first one's state.
+        assert!(!charger.evses[0].connectors[1].locked);
+        assert!(!charger.evses[0].connectors[1].contactor_closed);
+    }
+
+    #[tokio::test]
+    async fn apply_hardware_state_distinguishes_some_zero_from_none_for_the_current_limit() {
+        let hardware = hardware_for(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]);
+        let mut charger = charger_state();
+
+        apply_hardware_state(&mut charger, &hardware);
+        assert_eq!(charger.evses[0].connectors[0].current_limit_ma, None);
+
+        hardware.evses()[0].connectors()[0]
+            .set_current_limit(Some(0))
+            .await
+            .unwrap();
+        apply_hardware_state(&mut charger, &hardware);
+        assert_eq!(
+            charger.evses[0].connectors[0].current_limit_ma,
+            Some(0),
+            "Some(0) (suspended) must not collapse into None (unlimited)"
+        );
+
+        hardware.evses()[0].connectors()[0]
+            .set_current_limit(Some(16_000))
+            .await
+            .unwrap();
+        apply_hardware_state(&mut charger, &hardware);
+        assert_eq!(
+            charger.evses[0].connectors[0].current_limit_ma,
+            Some(16_000)
+        );
+
+        hardware.evses()[0].connectors()[0]
+            .set_current_limit(None)
+            .await
+            .unwrap();
+        apply_hardware_state(&mut charger, &hardware);
+        assert_eq!(charger.evses[0].connectors[0].current_limit_ma, None);
+    }
+
+    /// The trap H3 hit (`docs/hardware-roadmap.md`): `EvseConfig::id` need not be 1-based or
+    /// contiguous, but `charger.evses`/`hardware.evses()` are still built from the same config in
+    /// the same order, so position - never `EvseConfig::id` or `FakeConnector`'s own
+    /// `evse_id`/`connector_id` - must be what lines a hardware connector up with its
+    /// `ConnectorState`.
+    #[tokio::test]
+    async fn apply_hardware_state_addresses_connectors_positionally_not_by_evse_config_id() {
+        let evses = vec![
+            EvseConfig {
+                id: 5,
+                connectors: 1,
+            },
+            EvseConfig {
+                id: 2,
+                connectors: 1,
+            },
+        ];
+        let hardware = hardware_for(evses.clone());
+        let mut charger = ChargerState::from_config(ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses,
+            has_display: false,
+            capabilities: CapabilitiesConfig::default(),
+        });
+
+        // Lock only the second positional EVSE's connector - id 2, not id 5.
+        hardware.evses()[1].connectors()[0].lock().await.unwrap();
+
+        apply_hardware_state(&mut charger, &hardware);
+
+        assert!(
+            !charger.evses[0].connectors[0].locked,
+            "position 0 (EvseConfig::id 5) must stay unlocked"
+        );
+        assert!(
+            charger.evses[1].connectors[0].locked,
+            "position 1 (EvseConfig::id 2) must reflect the lock"
         );
     }
 }
