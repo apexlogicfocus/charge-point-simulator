@@ -100,6 +100,14 @@ Three things worth knowing before touching the dashboard:
   the charger declares the matching block, and `register_optional_hardware` gates registration on the
   same flags — so a capability a config didn't declare is inert twice over.
 
+`connect_charger` dials and runs a session in all three OCPP versions, with one function per
+version (`connect_ocpp_2_1`/`connect_ocpp_2_0_1`/`connect_ocpp_1_6`) because the three genuinely
+differ: `register_setup_blocks` is shared by the two 2.x paths, while 1.6J needs eight upstream
+adapter types to translate its flat connector numbering and so mirrors upstream's own
+`setup_ocpp_1_6`. Before adding a registration to the shared helper, check the trait is implemented
+by `OCPP2_0_1Client` as well as 2.1's — a 2.1-only handler trait there is what confined this crate to
+2.1 sessions in the first place.
+
 A local (unconnected) charger runs a real `ocpp_charge_point::ChargePointRuntime` too (see
 `charger::RunningCharger`/`start_local_charger`), just with no CSMS ever dialed and no
 `register`/`register_until_accepted` call — `apply_ocpp_state` is the single path into

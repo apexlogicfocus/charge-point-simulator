@@ -6,8 +6,8 @@ use charge_point_simulator_core::charger::{
     ChargePointEvent, ChargePointState, ChargerConfig, ChargerEntry, ChargerHardware, ChargerState,
     Command, CommandParameter, ConnectionProfile, ConnectionStore, ConnectorHardwareSnapshot,
     FakeFileTransfer, FakeFirmwareInstaller, FakeFirmwareVerifier, FileCertificateStore,
-    FileStorage, FirmwareInstallStage, InFlightTransfer, OcppVersion, RunningCharger,
-    SecurityProfile, SimulationMode, TransferProfile, apply_hardware_snapshot, apply_ocpp_state,
+    FileStorage, FirmwareInstallStage, InFlightTransfer, RunningCharger, SecurityProfile,
+    SimulationMode, TransferProfile, apply_hardware_snapshot, apply_ocpp_state,
     build_ocpp_event_for_connector, connect_charger, start_local_charger,
 };
 use color_eyre::Result;
@@ -1669,17 +1669,13 @@ impl App {
             // however long was spent idling on the picker.
             self.last_metrics_tick = None;
 
-            if charger.config.ocpp_version == OcppVersion::V21 {
-                self.enter_connection_setup(&charger.config.id);
-                self.screen = Screen::ConnectionSetup;
-            } else {
-                // 1.6J/2.0.1 chargers never go through the connection setup screen at all - see
-                // `selecting_a_1_6j_or_2_0_1_charger_still_goes_straight_to_the_dashboard` - so
-                // this is the only place their (always-local; `connect_charger` is 2.1-only)
-                // runtime ever gets started.
-                self.spawn_local_charger(charger.config);
-                self.screen = Screen::Dashboard;
-            }
+            // Every version goes through connection setup now: `connect_charger` runs 1.6J and
+            // 2.0.1 sessions as well as 2.1 ones, so there is no longer a version for which "dial a
+            // CSMS" is impossible. Before that landed, 1.6J/2.0.1 chargers were routed straight to a
+            // local charger instead - which meant the only way to reach a real CSMS with one was a
+            // screen the app never offered. Leaving the URL blank still means local, for any version.
+            self.enter_connection_setup(&charger.config.id);
+            self.screen = Screen::ConnectionSetup;
         }
     }
 
@@ -2044,6 +2040,17 @@ mod tests {
             .collect()
     }
 
+    /// Selects the highlighted charger and takes the local option on the connection setup screen it
+    /// now lands on for every OCPP version (a blank URL means no CSMS - see
+    /// `a_blank_url_still_means_local_for_a_1_6j_charger`).
+    ///
+    /// Most tests below want "a charger on the dashboard" and don't care how it got there; this is
+    /// that, and it is the same two steps a user takes.
+    fn select_charger_locally(app: &mut App) {
+        app.confirm_charger_selection();
+        app.confirm_connection_setup();
+    }
+
     fn charger(id: &str) -> ChargerEntry {
         charger_with_evses(
             id,
@@ -2117,7 +2124,7 @@ mod tests {
         assert!(!app.exit);
 
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('q')));
         assert!(app.quit_confirm_open);
         assert!(!app.exit);
@@ -2205,9 +2212,17 @@ mod tests {
     }
 
     #[test]
-    fn enter_selects_the_highlighted_charger_and_opens_the_dashboard() {
+    fn enter_selects_the_highlighted_charger_and_opens_its_connection_setup() {
         let mut app = App::new(vec![charger("CP001"), charger("CP002")]);
         app.handle_key_event(key(KeyCode::Down));
+        app.handle_key_event(key(KeyCode::Enter));
+
+        // Enter picks the charger; the dashboard is one more Enter away, since every version is now
+        // asked which CSMS (if any) it should dial - see
+        // `selecting_a_1_6j_charger_also_goes_to_connection_setup`.
+        assert_eq!(app.screen, Screen::ConnectionSetup);
+        assert_eq!(app.charger_state.as_ref().unwrap().config.id, "CP002");
+
         app.handle_key_event(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Dashboard);
         assert_eq!(app.charger_state.unwrap().config.id, "CP002");
@@ -2287,7 +2302,7 @@ mod tests {
     #[test]
     fn confirming_a_selection_seeds_a_fresh_booting_charger_state() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         let state = app.charger_state.unwrap();
         assert_eq!(state.connection_status, ConnectionStatus::Booting);
@@ -2298,7 +2313,7 @@ mod tests {
     #[test]
     fn confirming_a_selection_logs_a_boot_message() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         assert_eq!(log_messages(&app.logs), vec!["CP001 booting"]);
     }
 
@@ -2319,7 +2334,7 @@ mod tests {
     #[test]
     fn a_locally_selected_charger_reports_offline_rather_than_booting_forever() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         assert_eq!(
             app.charger_state.as_ref().unwrap().connection_status,
             ConnectionStatus::Booting,
@@ -2356,7 +2371,7 @@ mod tests {
                 },
             ],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         assert_eq!(
             app.focused,
             FocusedConnector {
@@ -2381,7 +2396,7 @@ mod tests {
                 },
             ],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.focused.evse, 1);
@@ -2404,7 +2419,7 @@ mod tests {
                 },
             ],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.focused.evse = 1;
 
         app.handle_key_event(key(KeyCode::Left));
@@ -2428,7 +2443,7 @@ mod tests {
                 },
             ],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.focused = FocusedConnector {
             evse: 0,
             connector: 1,
@@ -2448,7 +2463,7 @@ mod tests {
     #[test]
     fn evse_focus_navigation_on_a_charger_with_no_evses_does_not_panic() {
         let mut app = App::new(vec![charger_with_evses("CP001", vec![])]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Right));
         app.handle_key_event(key(KeyCode::Left));
@@ -2464,7 +2479,7 @@ mod tests {
                 connectors: 2,
             }],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Down));
         assert_eq!(
@@ -2491,7 +2506,7 @@ mod tests {
                 },
             ],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.focused = FocusedConnector {
             evse: 0,
             connector: 1,
@@ -2523,7 +2538,7 @@ mod tests {
                 },
             ],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.focused = FocusedConnector {
             evse: 1,
             connector: 0,
@@ -2555,7 +2570,7 @@ mod tests {
                 },
             ],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.focused = FocusedConnector {
             evse: 1,
             connector: 0,
@@ -2581,7 +2596,7 @@ mod tests {
                 connectors: 1,
             }],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Up));
 
@@ -2591,7 +2606,7 @@ mod tests {
     #[test]
     fn up_and_down_navigation_on_a_charger_with_no_evses_does_not_panic() {
         let mut app = App::new(vec![charger_with_evses("CP001", vec![])]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Down));
         app.handle_key_event(key(KeyCode::Up));
@@ -2608,7 +2623,7 @@ mod tests {
                 connectors: 0,
             }],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Down));
         app.handle_key_event(key(KeyCode::Up));
@@ -2622,7 +2637,7 @@ mod tests {
     #[test]
     fn apply_command_acts_on_the_specifically_focused_connector_not_just_the_first_eligible_one() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         let mut ocpp = ChargePointState::new([2]);
         ocpp.registration = Some(RegistrationStatus::Accepted);
         app.live_ocpp_state = Some(ocpp);
@@ -2653,7 +2668,7 @@ mod tests {
     #[test]
     fn a_command_dispatched_before_the_first_snapshot_says_so_rather_than_faking_it() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         let (sender, mut receiver) = mpsc::unbounded_channel();
         app.ocpp_event_sender = Some(sender);
         assert!(
@@ -2687,7 +2702,7 @@ mod tests {
                 connectors: 2,
             }],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         // Occupy connector 1 (index 0) so it no longer offers "Plug in vehicle"; connector 2
         // (index 1) stays Available and offers it.
         app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
@@ -2715,7 +2730,7 @@ mod tests {
     #[test]
     fn c_opens_the_command_palette_on_the_first_command() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Char('c')));
         assert!(app.command_palette_open);
@@ -2732,7 +2747,7 @@ mod tests {
     #[test]
     fn a_charger_without_a_display_never_offers_display_commands() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
         assert!(!labels.contains(&"Set display message"));
@@ -2742,7 +2757,7 @@ mod tests {
     #[test]
     fn a_charger_with_a_display_offers_set_but_not_clear_until_a_message_is_showing() {
         let mut app = App::new(vec![charger_with_display("CP-display")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
         assert!(labels.contains(&"Set display message"));
@@ -2752,7 +2767,7 @@ mod tests {
     #[test]
     fn setting_a_display_message_shows_it_and_then_offers_clear() {
         let mut app = App::new(vec![charger_with_display("CP-display")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.apply_command(Command::SetDisplayMessage, "Welcome to Flowion");
 
@@ -2771,7 +2786,7 @@ mod tests {
     #[test]
     fn clearing_a_display_message_blanks_it() {
         let mut app = App::new(vec![charger_with_display("CP-display")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.apply_command(Command::SetDisplayMessage, "hello");
 
         app.apply_command(Command::ClearDisplayMessage, "");
@@ -2782,7 +2797,7 @@ mod tests {
     #[test]
     fn display_commands_apply_locally_even_when_a_live_csms_sender_is_present() {
         let mut app = App::new(vec![charger_with_display("CP-display")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         let (sender, mut receiver) = mpsc::unbounded_channel();
         app.ocpp_event_sender = Some(sender);
 
@@ -2798,7 +2813,7 @@ mod tests {
     #[test]
     fn esc_closes_the_command_palette_without_dispatching() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
 
         app.handle_key_event(key(KeyCode::Esc));
@@ -2813,7 +2828,7 @@ mod tests {
     #[test]
     fn typing_in_the_command_palette_filters_by_label_and_resets_the_selection() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
 
         // a fresh connector offers "Plug in vehicle" and "Report fault"
@@ -2832,7 +2847,7 @@ mod tests {
     #[test]
     fn backspacing_the_command_palette_filter_restores_hidden_commands() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
 
         for c in "fault".chars() {
@@ -2848,7 +2863,7 @@ mod tests {
     #[test]
     fn selecting_a_command_that_needs_a_parameter_opens_a_prompt_instead_of_dispatching() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter)); // highlighted command is "Plug in vehicle"
 
@@ -2871,7 +2886,7 @@ mod tests {
         connector: OcppConnectorState,
     ) -> (App, UnboundedReceiver<ChargePointEvent>) {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         // One snapshot drained, so `ChargerState` (which decides what the palette offers) and
         // `live_ocpp_state` (which decides what each command maps to) agree - exactly what the
         // running app's first frame does, and what makes the two halves consistent here.
@@ -2924,7 +2939,7 @@ mod tests {
     #[test]
     fn esc_cancels_the_parameter_prompt_without_applying_the_command() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter)); // opens the prompt
 
@@ -2940,7 +2955,7 @@ mod tests {
     #[test]
     fn down_and_up_move_the_command_palette_selection_and_clamp() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
 
         // a fresh connector only has "Plug in vehicle" and "Report fault" available
@@ -3044,7 +3059,7 @@ mod tests {
     #[test]
     fn returning_to_the_picker_clears_any_status_message() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.set_status(StatusSeverity::Ok, "✓ Plug in vehicle".to_string());
 
         app.handle_key_event(key(KeyCode::Esc));
@@ -3054,7 +3069,7 @@ mod tests {
     #[test]
     fn escape_on_the_dashboard_returns_to_the_picker() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::PickCharger);
         assert!(app.charger_state.is_none());
@@ -3083,7 +3098,7 @@ mod tests {
     /// An app sitting on the dashboard with `count` log entries, for the log-binding tests.
     fn app_with_logs(count: usize) -> App {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.logs = LogBuffer::default();
         for i in 0..count {
             app.logs.push(format!("entry {i}"));
@@ -3250,7 +3265,7 @@ mod tests {
     #[test]
     fn ctrl_k_opens_the_command_palette_and_c_still_works_as_an_alias() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         assert!(app.command_palette_open);
@@ -3263,7 +3278,7 @@ mod tests {
     #[test]
     fn a_bare_k_does_not_open_the_palette() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Char('k')));
         assert!(!app.command_palette_open);
@@ -3272,7 +3287,7 @@ mod tests {
     #[test]
     fn the_palette_matches_commands_as_a_fuzzy_subsequence() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
         for c in "pv".chars() {
             app.handle_key_event(key(KeyCode::Char(c)));
@@ -3292,7 +3307,7 @@ mod tests {
                 connectors: 2,
             }],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
         assert_eq!(
             app.focused_connector_label().as_deref(),
@@ -3318,7 +3333,7 @@ mod tests {
     #[test]
     fn a_blank_parameter_is_rejected_inline_and_leaves_the_prompt_open() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter));
 
@@ -3342,7 +3357,7 @@ mod tests {
     #[test]
     fn a_parameter_prompt_is_prefilled_with_the_last_accepted_value() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter));
@@ -3364,7 +3379,7 @@ mod tests {
     #[test]
     fn a_rejected_parameter_is_not_remembered() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter));
         app.handle_key_event(key(KeyCode::Enter)); // blank, rejected
@@ -3375,7 +3390,7 @@ mod tests {
     #[test]
     fn a_status_message_expires_after_its_ttl() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.set_status(StatusSeverity::Ok, "✓ Plug in vehicle".to_string());
         let shown_at = app.status_message.as_ref().unwrap().shown_at;
 
@@ -3397,17 +3412,35 @@ mod tests {
         assert_eq!(app.screen, Screen::ConnectionSetup);
     }
 
+    /// Every version is offered connection setup now that `connect_charger` runs 1.6J and 2.0.1
+    /// sessions too. Before that, a 1.6J charger was routed straight to a local charger - so the only
+    /// way to reach a CSMS with one was a screen the app never showed.
     #[test]
-    fn selecting_a_1_6j_or_2_0_1_charger_still_goes_straight_to_the_dashboard() {
+    fn selecting_a_1_6j_charger_also_goes_to_connection_setup() {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
+        assert_eq!(app.screen, Screen::ConnectionSetup);
+    }
+
+    /// And the local option is still one keystroke away, for every version: a blank URL means "no
+    /// CSMS", which is what a 1.6J charger used to get with no choice in the matter.
+    #[test]
+    fn a_blank_url_still_means_local_for_a_1_6j_charger() {
+        let mut app = App::new(vec![charger("CP001")]);
+        select_charger_locally(&mut app);
+        app.confirm_connection_setup();
+
         assert_eq!(app.screen, Screen::Dashboard);
+        assert_eq!(
+            app.charger_state.as_ref().unwrap().mode,
+            SimulationMode::Local
+        );
     }
 
     #[test]
     fn connection_setup_defaults_to_an_empty_url_and_the_charger_id_as_identity() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         assert_eq!(app.connection_csms_url.value(), "");
         assert_eq!(app.connection_ocpp_identity.value(), "CP-2.1");
@@ -3429,7 +3462,7 @@ mod tests {
             },
         );
 
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         assert_eq!(app.connection_csms_url.value(), "wss://csms.example.com");
         assert_eq!(app.connection_ocpp_identity.value(), "remembered-id");
@@ -3482,7 +3515,7 @@ mod tests {
     #[test]
     fn esc_on_connection_setup_returns_to_the_picker() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::PickCharger);
     }
@@ -3495,7 +3528,7 @@ mod tests {
     #[test]
     fn confirming_connection_setup_with_a_blank_url_runs_locally_and_reports_offline() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         assert_eq!(app.connection_csms_url.value(), "");
 
         app.confirm_connection_setup();
@@ -3563,7 +3596,7 @@ mod tests {
     #[test]
     fn confirming_with_a_blank_url_does_not_start_a_connect_attempt() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Enter));
 
         assert_eq!(app.screen, Screen::Dashboard);
@@ -3573,7 +3606,7 @@ mod tests {
     #[test]
     fn confirming_with_a_blank_url_leaves_the_charger_in_local_mode() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Enter));
 
         assert_eq!(app.charger_state.unwrap().mode, SimulationMode::Local);
@@ -3767,7 +3800,7 @@ mod tests {
                 },
             },
         );
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.handle_key_event(key(KeyCode::Tab)); // focus OCPP identity
 
         app.handle_key_event(key(KeyCode::PageDown));
@@ -3797,7 +3830,7 @@ mod tests {
         // OCPP bridge alone (see `SimulationMode`'s doc comment) - `tick`'s simulated boot
         // timer must never race it and flip the dashboard to "connected" on its own.
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.charger_state.as_mut().unwrap().mode = SimulationMode::LiveCsms {
             url: "wss://csms.example.com".to_string(),
         };
@@ -3813,7 +3846,7 @@ mod tests {
     #[test]
     fn returning_to_the_picker_leaves_no_stale_live_csms_mode_for_the_next_charger() {
         let mut app = App::new(vec![charger_v21("CP-2.1"), charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.charger_state.as_mut().unwrap().mode = SimulationMode::LiveCsms {
             url: "wss://csms.example.com".to_string(),
         };
@@ -3867,7 +3900,7 @@ mod tests {
     fn a_failed_connection_is_recorded_where_it_cannot_expire() {
         let (sender, receiver) = oneshot::channel();
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.connect_result_receiver = Some(receiver);
         sender
             .send(Err("dns error: no such host".to_string()))
@@ -3895,7 +3928,7 @@ mod tests {
     fn a_failed_connection_is_logged_as_an_error() {
         let (sender, receiver) = oneshot::channel();
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.connect_result_receiver = Some(receiver);
         sender.send(Err("connection refused".to_string())).unwrap();
 
@@ -3928,7 +3961,7 @@ mod tests {
     #[test]
     fn r_reopens_connection_setup_prefilled_after_a_failure() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.connection_store.remember(
             "CP-2.1".to_string(),
             ConnectionProfile {
@@ -3958,7 +3991,7 @@ mod tests {
     #[test]
     fn r_does_nothing_when_there_is_no_failure_to_retry() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         app.handle_key_event(key(KeyCode::Char('r')));
 
@@ -3968,7 +4001,7 @@ mod tests {
     #[test]
     fn returning_to_the_picker_forgets_the_failure() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.screen = Screen::Dashboard;
         app.connection_failure = Some("connection refused".to_string());
 
@@ -4013,7 +4046,7 @@ mod tests {
     #[test]
     fn tick_metrics_forwards_the_elapsed_duration_to_the_running_chargers_tick_channel() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         let (sender, mut receiver) = mpsc::unbounded_channel();
         app.ocpp_tick_sender = Some(sender);
 
@@ -4028,7 +4061,7 @@ mod tests {
     #[test]
     fn tick_metrics_forwards_every_tick_with_no_throttling() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         let (sender, mut receiver) = mpsc::unbounded_channel();
         app.ocpp_tick_sender = Some(sender);
 
@@ -4052,7 +4085,7 @@ mod tests {
     #[test]
     fn drain_charger_snapshots_applies_both_halves_and_remembers_the_latest_protocol_state() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         // H3b: `apply_ocpp_state` only reads `registration` for a `LiveCsms` charger - a `Local`
         // one (what `confirm_charger_selection` alone leaves this charger as, since it hasn't
         // gone through `confirm_connection_setup` yet) always reads `Offline` regardless. This
@@ -4244,7 +4277,7 @@ mod tests {
     #[test]
     fn apply_command_sends_the_matching_event_when_connected_to_a_real_csms() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         let (sender, mut receiver) = mpsc::unbounded_channel();
         app.ocpp_event_sender = Some(sender);
         app.live_ocpp_state = Some(ocpp_state_with(OcppConnectorState::Available));
@@ -4267,7 +4300,7 @@ mod tests {
     #[test]
     fn apply_command_reports_not_ready_when_no_connector_is_eligible_yet() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         let (sender, mut receiver) = mpsc::unbounded_channel();
         app.ocpp_event_sender = Some(sender);
         app.live_ocpp_state = Some(ocpp_state_with(OcppConnectorState::Charging));
@@ -4287,7 +4320,7 @@ mod tests {
     #[test]
     fn returning_to_the_picker_tears_down_the_live_connection_channels() {
         let mut app = App::new(vec![charger_v21("CP-2.1")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         let (_sender, receiver) = mpsc::unbounded_channel::<ChargerSnapshot>();
         let (event_sender, _event_receiver) = mpsc::unbounded_channel();
         app.charger_snapshot_receiver = Some(receiver);
@@ -4311,7 +4344,7 @@ mod tests {
         let mut entry = charger("CP-V2G");
         entry.config.capabilities.supports_bidirectional_power = true;
         let mut app = App::new(vec![entry]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
             ConnectorStatus::Charging;
 
@@ -4374,7 +4407,7 @@ mod tests {
         );
         entry.config.capabilities.supports_bidirectional_power = true;
         let mut app = App::new(vec![entry]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.charger_state.as_mut().unwrap().evses[0].connectors[1].status =
             ConnectorStatus::Charging;
         app.focused = FocusedConnector {
@@ -4402,7 +4435,7 @@ mod tests {
     #[test]
     fn d_is_refused_on_a_charger_that_does_not_declare_bidirectional_power() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.charger_state.as_mut().unwrap().evses[0].connectors[0].status =
             ConnectorStatus::Charging;
         let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -4453,7 +4486,7 @@ mod tests {
         let mut entry = charger("CP-V2G-LIVE");
         entry.config.capabilities.supports_bidirectional_power = true;
         let mut app = App::new(vec![entry]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         // A vehicle has to be plugged in for the toggle to be offered. Set locally and pressed
         // immediately: the next snapshot drained will overwrite `status` from the real (still
@@ -4486,7 +4519,7 @@ mod tests {
         entry.config.capabilities.firmware_management = true;
         entry.config.capabilities.diagnostics = true;
         let mut app = App::new(vec![entry]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         // What `CampaignHandles::progress` reports for this charger's real bundle: hardware present,
         // nothing in flight.
         app.campaigns = CampaignProgress {
@@ -4562,7 +4595,7 @@ mod tests {
     #[test]
     fn a_charger_declaring_nothing_gets_no_hardware_rows_in_the_palette() {
         let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         let labels: Vec<&str> = app
             .palette_entries()
@@ -4635,7 +4668,7 @@ mod tests {
         let mut entry = charger("CP-FW-LIVE");
         entry.config.capabilities.firmware_management = true;
         let mut app = App::new(vec![entry]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
 
         // Wait for the charger's first snapshot, which is what tells the palette the installer
         // exists (`Some(Idle)` rather than `None`).
@@ -4721,7 +4754,7 @@ mod tests {
                 },
             ],
         )]);
-        app.confirm_charger_selection();
+        select_charger_locally(&mut app);
         app.last_frame_area = Rect::new(0, 0, width, height);
         app
     }

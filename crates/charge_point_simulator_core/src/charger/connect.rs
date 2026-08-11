@@ -5,6 +5,7 @@ use ocpp_charge_point::ChargePointBuilder;
 use ocpp_charge_point::ConnectAndSetupError;
 use ocpp_charge_point::authorization::{Authorizer, ClearCacheHandler};
 use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
+use ocpp_charge_point::availability::{Ocpp1_6ChangeAvailabilityHandler, Ocpp1_6StatusNotifier};
 use ocpp_charge_point::certificates::CertificateHandler;
 use ocpp_charge_point::clock::{Clock, MonotonicClock, SystemClock, SystemMonotonicClock};
 use ocpp_charge_point::connection::ReconnectHandler;
@@ -29,6 +30,7 @@ use ocpp_charge_point::local_authorization_list::{
     GetLocalListVersionHandler, SendLocalListHandler,
 };
 use ocpp_charge_point::meter_values::MeterValuesNotifier;
+use ocpp_charge_point::meter_values::Ocpp1_6MeterValuesNotifier;
 use ocpp_charge_point::network_profile::SetNetworkProfileHandler;
 use ocpp_charge_point::network_switch::ConnectionTarget;
 use ocpp_charge_point::payload_limit::PayloadLimits;
@@ -39,15 +41,20 @@ use ocpp_charge_point::periodic_event_stream::{
 use ocpp_charge_point::persistence::{QueueStore, SecurityLogStore};
 use ocpp_charge_point::provisioning::{Backoff, BootNotifier, HeartbeatSender, TokioBackoff};
 use ocpp_charge_point::remote_control::{
+    Ocpp1_6RemoteControlHandler, Ocpp1_6TriggerMessageHandler,
+};
+use ocpp_charge_point::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, TriggerMessageHandler,
     UnlockConnectorHandler,
 };
 use ocpp_charge_point::reporting::{GetBaseReportHandler, GetReportHandler};
+use ocpp_charge_point::reservation::Ocpp1_6ReserveNowHandler;
 use ocpp_charge_point::reservation::{
     CancelReservationHandler, ReservationStatusNotifier, ReserveNowHandler,
 };
 use ocpp_charge_point::reset::ResetHandler;
 use ocpp_charge_point::security::{SecurityEventLog, SecurityEventNotifier};
+use ocpp_charge_point::smart_charging::Ocpp1_6SmartChargingHandler;
 use ocpp_charge_point::smart_charging::{
     ChargingLimitProjection, ClearChargingProfileHandler, GetChargingProfilesHandler,
     GetCompositeScheduleHandler, SetChargingProfileHandler,
@@ -55,6 +62,7 @@ use ocpp_charge_point::smart_charging::{
 use ocpp_charge_point::tariff::{
     ChangeTransactionTariffHandler, ClearTariffsHandler, GetTariffsHandler, SetDefaultTariffHandler,
 };
+use ocpp_charge_point::transactions::Ocpp1_6TransactionNotifier;
 use ocpp_charge_point::transactions::TransactionNotifier;
 use ocpp_charge_point::variable_monitoring::{
     ClearVariableMonitoringHandler, GetMonitoringReportHandler, SetMonitoringBaseHandler,
@@ -224,10 +232,6 @@ where
         + GetReportHandler
         + SecurityEventNotifier
         + CostUpdatedHandler
-        + SetDefaultTariffHandler
-        + ChangeTransactionTariffHandler
-        + ClearTariffsHandler
-        + GetTariffsHandler
         + MeterValuesNotifier
         + SetChargingProfileHandler
         + ClearChargingProfileHandler
@@ -239,11 +243,6 @@ where
         + SetMonitoringBaseHandler
         + SetMonitoringLevelHandler
         + GetMonitoringReportHandler
-        + OpenPeriodicEventStreamHandler
-        + ClosePeriodicEventStreamHandler
-        + AdjustPeriodicEventStreamHandler
-        + GetPeriodicEventStreamHandler
-        + PeriodicEventStreamNotifier
         + ReconnectHandler
         + SetDisplayMessageHandler
         + GetDisplayMessagesHandler
@@ -417,11 +416,6 @@ where
         }
         builder = builder.local_authorization_list(csms).await;
     }
-    // `has_csms`: Tariff and Cost is purely CSMS-facing (a CSMS installing/reading tariffs, or
-    // being told about accrued cost) with no locally-observable effect either way.
-    if has_csms && capabilities.tariff_and_cost {
-        builder = builder.cost(csms).await.tariffs(csms).await;
-    }
     if capabilities.smart_charging {
         if let Some(storage) = storage {
             builder = builder
@@ -450,14 +444,6 @@ where
             .await
             .variable_monitor_events(csms, backoff.clone(), clock.clone(), 60);
     }
-    // `has_csms`: Periodic Event Stream exists only to push data to a CSMS on a schedule the CSMS
-    // requested; with none, there is nothing to open a stream for.
-    if has_csms && capabilities.periodic_event_stream {
-        builder = builder
-            .periodic_event_streams(csms, clock, backoff.clone(), 5)
-            .await;
-    }
-
     if let Some(display) = display {
         builder = builder.display_messages(csms, display).await;
     }
@@ -1126,13 +1112,255 @@ pub async fn connect_charger(
             )
             .await
         }
-        NegotiatedClient::V2_0_1(_) => Err(ConnectAndSetupError::UnsupportedNegotiatedVersion(
-            OcppVersion::V2_0_1,
-        )),
-        NegotiatedClient::V1_6(_) => Err(ConnectAndSetupError::UnsupportedNegotiatedVersion(
-            OcppVersion::V1_6,
-        )),
+        NegotiatedClient::V1_6(client) => {
+            tracing::info!(charger = %config.id, version = "1.6J", "the CSMS negotiated an OCPP version");
+            target.set_version(OcppVersion::V1_6);
+            connect_ocpp_1_6(
+                charge_point,
+                client,
+                firmware_installer,
+                firmware_verifier,
+                file_transfer,
+                certificate_store,
+            )
+            .await
+        }
+        NegotiatedClient::V2_0_1(client) => {
+            tracing::info!(charger = %config.id, version = "2.0.1", "the CSMS negotiated an OCPP version");
+            target.set_version(OcppVersion::V2_0_1);
+            connect_ocpp_2_0_1(
+                charge_point,
+                client,
+                target,
+                storage,
+                display,
+                firmware_installer,
+                firmware_verifier,
+                file_transfer,
+                certificate_store,
+            )
+            .await
+        }
     }
+}
+
+/// Runs a full OCPP 2.0.1 session, mirroring `ocpp_charge_point::connect::setup_ocpp_2_0_1` the way
+/// [`connect_ocpp_2_1`] mirrors `setup_ocpp_2_1`.
+///
+/// Almost all of it *is* [`register_setup_blocks`]: `OCPP2_0_1Client` implements every handler trait
+/// that helper registers, which is why this path is short where [`connect_ocpp_1_6`] is long. What
+/// 2.0.1 does not have, and so is registered only by the 2.1 path: `tariffs` (2.1 replaced 1.6J/2.0.1
+/// cost with a real tariff block), `periodic_event_streams`, `der_control`, priority charging and
+/// dynamic charging profiles. `cost` it does have, and gets here.
+///
+/// Network-profile switching is registered exactly as on 2.1: 2.0.1 has `SetNetworkProfile` too, and
+/// with it the `attach_security_reporting` that call folds in - so unlike the 1.6J path, this one
+/// loses nothing to `ChargePointRuntime::actor()` being private.
+#[allow(clippy::too_many_arguments)]
+async fn connect_ocpp_2_0_1(
+    charge_point: FakeChargePoint,
+    client: ocpp_client::ocpp_2_0_1::OCPP2_0_1Client,
+    target: Arc<ConnectionTarget>,
+    storage: Option<FileStorage>,
+    display: Option<FakeDisplay>,
+    firmware_installer: Option<Arc<FakeFirmwareInstaller>>,
+    firmware_verifier: Option<Arc<FakeFirmwareVerifier>>,
+    file_transfer: Option<Arc<FakeFileTransfer>>,
+    certificate_store: Option<FileCertificateStore>,
+) -> Result<RunningCharger, ConnectAndSetupError<Infallible>> {
+    // Same "clone before handing ownership away" as `connect_ocpp_2_1` - see its comment.
+    let hardware = charge_point.clone();
+    let firmware_installer_handle = firmware_installer.clone();
+    let file_transfer_handle = file_transfer.clone();
+    let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
+        .await
+        .map_err(ConnectAndSetupError::Start)?;
+
+    let (mut builder, security_log) = register_setup_blocks(
+        builder,
+        &client,
+        TokioBackoff,
+        SystemMonotonicClock,
+        SystemClock,
+        storage.as_ref(),
+        display,
+        true, // has_csms: a real CSMS is dialed on this path, exactly as on the 2.1 one.
+    )
+    .await;
+
+    if builder.capabilities().tariff_and_cost {
+        // `cost` only - see this function's own doc comment for why `tariffs` is 2.1's alone.
+        builder = builder.cost(&client).await;
+    }
+
+    builder = register_optional_hardware(
+        builder,
+        &client,
+        TokioBackoff,
+        SystemClock,
+        firmware_installer,
+        firmware_verifier,
+        file_transfer,
+        certificate_store,
+        security_log, // decision 8: share whatever `register_setup_blocks` restored, if anything.
+        true,         // has_csms: as above.
+    )
+    .await;
+
+    builder = builder.network_profile_switching(&target, client.clone(), TokioBackoff);
+
+    Ok(RunningCharger::new(
+        builder.offline_queue_retries(TokioBackoff, 60).build(),
+        hardware,
+        firmware_installer_handle,
+        file_transfer_handle,
+    ))
+}
+
+/// Runs a full OCPP 1.6J session, mirroring `ocpp_charge_point::connect::setup_ocpp_1_6` the way
+/// [`connect_ocpp_2_1`] mirrors `setup_ocpp_2_1`.
+///
+/// # Why this cannot reuse [`register_setup_blocks`]
+///
+/// That helper is generic over *one* CSMS client implementing every handler trait it registers,
+/// which is how 2.1 and 2.0.1 work: `OCPP2_1Client` implements all of them itself. The 1.6J client
+/// does not - it implements 21 of those traits, not 50-odd - because half the 2.x functional blocks
+/// have no 1.6J message to carry them, and several that do are addressed differently (1.6J numbers
+/// connectors flat, where 2.x addresses an EVSE and a connector within it).
+///
+/// Upstream's answer, reproduced here, is a set of public adapters that wrap the 1.6J client and
+/// translate: `Ocpp1_6StatusNotifier`, `Ocpp1_6TransactionNotifier`, `Ocpp1_6RemoteControlHandler`,
+/// `Ocpp1_6TriggerMessageHandler`, `Ocpp1_6ChangeAvailabilityHandler`, `Ocpp1_6MeterValuesNotifier`,
+/// `Ocpp1_6ReserveNowHandler` and `Ocpp1_6SmartChargingHandler`, each constructed from the client
+/// plus `ChargePointBuilder::connector_counts` (the per-EVSE connector counts the flat-numbering
+/// translation needs). So the handlers come from eight different objects rather than one, and no
+/// single generic parameter can express that.
+///
+/// # What 1.6J genuinely does not get, and why
+///
+/// - **Device model** - 1.6J has `GetConfiguration`/`ChangeConfiguration` instead, so this registers
+///   `configuration` where the 2.x paths register `device_model`. Same purpose, different message.
+/// - **Display messages, variable monitoring, periodic event streams, tariffs, DER control** - no
+///   1.6J messages exist for any of them. A charger declaring those capabilities gets them silently
+///   ignored on this path rather than half-registered, exactly as upstream's own 1.6J setup does.
+/// - **Persistence.** The `_persisted` registration forms [`register_setup_blocks`] uses when
+///   `has_persistent_storage` is declared (H5b) are not applied here: upstream's 1.6J setup has no
+///   persistence either, and adding it would mean this path diverging from the source it is meant to
+///   reproduce. This function therefore takes no `storage` at all - there would be nothing to give
+///   it to, and a parameter it quietly ignored would read as persistence that happens. A 1.6J
+///   charger's *certificate* store still persists, because the caller builds that from its own
+///   storage and hands it over as `certificate_store`. Worth closing properly, and worth closing
+///   deliberately rather than as a side effect of this task.
+/// - **Oversized-frame security reporting on redials.** Upstream ends its 1.6J setup with
+///   `target.attach_security_reporting(runtime.actor())`, and `actor()` is `pub(crate)` - the same
+///   privacy that already costs this crate the keepalive loop (see [`connect_ocpp_2_1`]'s own note
+///   and `docs/upstream-asks.md`). The 2.x paths get it for free because
+///   `network_profile_switching` does both, and 1.6J has no network-profile message at all. So a
+///   1.6J redial that meets an oversized frame reports nothing, where upstream's would.
+#[allow(clippy::too_many_arguments)]
+async fn connect_ocpp_1_6(
+    charge_point: FakeChargePoint,
+    client: ocpp_client::ocpp_1_6::OCPP1_6Client,
+    firmware_installer: Option<Arc<FakeFirmwareInstaller>>,
+    firmware_verifier: Option<Arc<FakeFirmwareVerifier>>,
+    file_transfer: Option<Arc<FakeFileTransfer>>,
+    certificate_store: Option<FileCertificateStore>,
+) -> Result<RunningCharger, ConnectAndSetupError<Infallible>> {
+    // Same "clone before handing ownership away" as `connect_ocpp_2_1` - see its comment.
+    let hardware = charge_point.clone();
+    let firmware_installer_handle = firmware_installer.clone();
+    let file_transfer_handle = file_transfer.clone();
+    let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
+        .await
+        .map_err(ConnectAndSetupError::Start)?;
+    let counts = builder.connector_counts();
+
+    // The adapters: everything 1.6J addresses differently from 2.x - see this function's own doc
+    // comment for why they exist at all.
+    let status = Ocpp1_6StatusNotifier::new(client.clone(), counts.clone());
+    let transactions = Arc::new(Ocpp1_6TransactionNotifier::new(
+        client.clone(),
+        counts.clone(),
+    ));
+    let remote = Ocpp1_6RemoteControlHandler::new(client.clone(), counts.clone());
+    let trigger = Ocpp1_6TriggerMessageHandler::new(client.clone(), counts.clone());
+    let availability = Ocpp1_6ChangeAvailabilityHandler::new(client.clone(), counts.clone());
+    let meter = Ocpp1_6MeterValuesNotifier::new(client.clone(), counts.clone());
+
+    let mut builder = builder
+        .provisioning(&client, TokioBackoff, SystemMonotonicClock)
+        .await
+        .status_notifications(&status)
+        .await
+        .transaction_events(&transactions)
+        .await
+        .authorization(&client, SystemClock)
+        .await
+        .clear_cache(&client)
+        .await
+        .remote_control(&remote)
+        .await
+        .trigger_message(&trigger)
+        .await
+        .availability_control(&availability)
+        .await
+        .reset(&client)
+        .await
+        // 1.6J's answer to the 2.x device model - see the doc comment above.
+        .configuration(&client)
+        .await
+        .meter_values(&meter, TokioBackoff, SystemClock)
+        .await
+        .security_events(&client)
+        .await;
+
+    // The same capability gating every other path applies (C3.1): an undeclared capability means no
+    // handler at all, so a CSMS gets `NotImplemented` rather than a handler with nothing behind it.
+    let capabilities = builder.capabilities();
+    if capabilities.reservation {
+        builder = builder
+            .reservation(&Ocpp1_6ReserveNowHandler::new(
+                client.clone(),
+                counts.clone(),
+            ))
+            .await;
+    }
+    if capabilities.local_auth_list {
+        builder = builder.local_authorization_list(&client).await;
+    }
+    if capabilities.smart_charging {
+        builder = builder
+            .smart_charging(
+                &Ocpp1_6SmartChargingHandler::new(client.clone(), counts),
+                Arc::new(ChargingLimitProjection::new()),
+                SystemClock,
+                TokioBackoff,
+            )
+            .await;
+    }
+
+    builder = register_optional_hardware(
+        builder,
+        &client,
+        TokioBackoff,
+        SystemClock,
+        firmware_installer,
+        firmware_verifier,
+        file_transfer,
+        certificate_store,
+        // No `security_events_persisted` runs on this path (see the doc comment's persistence note),
+        // so there is no restored log to share - `log_uploads` renders whatever the live session has.
+        None,
+        true, // has_csms: a real CSMS is dialed on this path, exactly as on the 2.1 one.
+    )
+    .await;
+
+    Ok(RunningCharger::new(
+        builder.offline_queue_retries(TokioBackoff, 60).build(),
+        hardware,
+        firmware_installer_handle,
+        file_transfer_handle,
+    ))
 }
 
 /// Runs a full OCPP 2.1 session: [`register_setup_blocks`] reproduces `setup()`'s registrations,
@@ -1203,7 +1431,23 @@ async fn connect_ocpp_2_1(
     )
     .await;
 
-    if builder.capabilities().smart_charging {
+    // Tariff and Cost, and Periodic Event Stream: both live here rather than in
+    // `register_setup_blocks` because both are 2.1-only. `tariffs` needs four handler traits and
+    // `periodic_event_streams` five that `OCPP2_0_1Client` does not implement (and no 1.6J message
+    // exists for either), so leaving them in the shared helper made its bounds unsatisfiable for any
+    // client but 2.1's - which is what confined this crate to 2.1 sessions. Both were already
+    // capability-gated; the gate is unchanged, only where it sits.
+    let capabilities = builder.capabilities();
+    if capabilities.tariff_and_cost {
+        builder = builder.cost(&client).await.tariffs(&client).await;
+    }
+    if capabilities.periodic_event_stream {
+        builder = builder
+            .periodic_event_streams(&client, SystemClock, TokioBackoff, 5)
+            .await;
+    }
+
+    if capabilities.smart_charging {
         builder = builder
             .priority_charging(&client)
             .await

@@ -590,11 +590,36 @@ message counters on `ChargePointState`.
   every key upstream currently uses is a short constant (`ocpp-cp/auth-cache`, `ocpp-cp/txn`, …) or
   built from small integers, the longest around 25 characters. Worth a guard returning a real error
   before anything starts deriving keys from CSMS-supplied data.
-- **`connect_charger` is OCPP 2.1 only, now explicitly.** A CSMS that negotiates 1.6J or 2.0.1 gets
-  `ConnectAndSetupError::UnsupportedNegotiatedVersion` instead of a session. That matches how the
-  TUI already gates the call and the function's long-standing doc comment, but it is a narrowing:
-  `connect_and_setup` would have run those versions. Driving their builder chains is its own task,
-  worth scheduling once someone actually wants 1.6J against a live CSMS.
+- ~~**`connect_charger` is OCPP 2.1 only.**~~ **Closed** — someone wanted 1.6J against a live CSMS.
+  `connect_charger` now runs all three versions (`connect_ocpp_2_1`/`connect_ocpp_2_0_1`/
+  `connect_ocpp_1_6`), and the TUI offers connection setup for every version rather than routing
+  1.6J/2.0.1 straight to a local charger. What that took, and what it left behind:
+
+  - **`register_setup_blocks` was 2.1-only because of nine trait bounds**, not because of its body:
+    `tariffs` needs four handler traits and `periodic_event_streams` five that `OCPP2_0_1Client`
+    does not implement. Both blocks moved to the 2.1 path, where they always belonged (1.6J has no
+    message for either), and with the bounds gone the helper serves 2.0.1 unchanged — which is why
+    `connect_ocpp_2_0_1` is barely 40 lines.
+  - **1.6J cannot use the helper at all**, and no bound-trimming would change that: the 1.6J client
+    implements 21 of those traits, and the rest come from eight public upstream adapters
+    (`Ocpp1_6StatusNotifier`, `Ocpp1_6TransactionNotifier`, `Ocpp1_6RemoteControlHandler`,
+    `Ocpp1_6TriggerMessageHandler`, `Ocpp1_6ChangeAvailabilityHandler`,
+    `Ocpp1_6MeterValuesNotifier`, `Ocpp1_6ReserveNowHandler`, `Ocpp1_6SmartChargingHandler`) that
+    translate 1.6J's flat connector numbering. Handlers from eight objects cannot be one generic
+    parameter, so `connect_ocpp_1_6` mirrors upstream's own `setup_ocpp_1_6` instead — the same
+    choice upstream made, for the same reason.
+  - **1.6J registers `configuration` where 2.x registers `device_model`** — same purpose, different
+    OCPP message.
+  - **Two gaps this leaves, both deliberate and both recorded in `connect_ocpp_1_6`'s doc comment:**
+    1.6J gets no persistence (upstream's 1.6J setup has none either, and adding it would mean
+    diverging from the source this reproduces), and no oversized-frame security reporting on redials
+    (upstream ends its 1.6J setup with `target.attach_security_reporting(runtime.actor())`, and
+    `actor()` is `pub(crate)` — the third thing that privacy costs us, after the keepalive loop and
+    the watchdog; see `docs/upstream-asks.md`).
+  - **Untested against a real CSMS.** The bounds are what compilation proves, and the 2.1
+    `RecordingCsms` equivalence test still passes, but nothing here drives a 1.6J or 2.0.1 handshake:
+    this suite has no mock CSMS server. Worth building one — it is also what the "no positive-case
+    test for capability-gated registration" gap below needs.
 
 ## Not on this roadmap
 

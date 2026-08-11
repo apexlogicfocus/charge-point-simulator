@@ -11,15 +11,15 @@ checked against the published 0.1.0 source (paths and line numbers are from that
 ours), and each request says what we would do with it, so the design can be argued about on the
 merits rather than guessed at.
 
-Ordered by how much they unblock. **Request 1 unblocks two separate features; request 2 is the only
+Ordered by how much they unblock. **Request 1 unblocks three separate features; request 2 is the only
 one that needs a new enum variant; request 3 is the smallest.**
 
 ---
 
 ## Request 1 — a way to reach the actor, or builder hooks that use it for us
 
-**What is blocked:** the WebSocket keepalive loop, and any hardware watchdog. Both, for the same
-reason.
+**What is blocked:** the WebSocket keepalive loop, any hardware watchdog, and oversized-frame
+security reporting on a 1.6J session's redials. All three, for the same reason.
 
 ### The situation
 
@@ -32,6 +32,11 @@ therefore unreachable from outside the crate:
   CSMS-written `WebSocketPingInterval` device-model variable to the live connection. Your own
   `connect_and_setup` spawns it internally, so an integration that goes through `connect_and_setup`
   gets it and one that drives `ChargePointBuilder` does not.
+- **`ConnectionTarget::attach_security_reporting(runtime.actor())`** — the call upstream's own
+  `setup_ocpp_1_6` ends with, so a redial that meets an oversized frame can report
+  `MemoryExhaustion`. The 2.x paths get it folded into `network_profile_switching`, but 1.6J has no
+  network-profile message, so upstream reaches for the actor directly — and a downstream 1.6J session
+  therefore cannot report it at all.
 - **`Watchdog`** (`src/hardware/watchdog.rs:46`) — the trait is `pub` and documented for
   integrators to implement ("a watchdog is a peripheral: feeding one is a register write on an MCU, a
   `/dev/watchdog` write under Linux"). It is fed from exactly one place, the actor's run loop, via
