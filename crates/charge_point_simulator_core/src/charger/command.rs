@@ -291,6 +291,7 @@ mod tests {
                 })
                 .collect(),
             metrics: Default::default(),
+            power_history: Default::default(),
         }
     }
 

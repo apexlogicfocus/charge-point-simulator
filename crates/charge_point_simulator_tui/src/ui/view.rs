@@ -13,6 +13,7 @@
 //! `dashboard::render`/`palette::render_*` can be exercised without building a whole `App`
 //! (picker state, connection-setup fields, etc.) that has nothing to do with what they draw.
 
+use crate::actions::PaletteEntry;
 use crate::app::{App, CampaignProgress, FocusedConnector, StatusSeverity};
 use crate::logs::LogBuffer;
 use charge_point_simulator_core::charger::{ChargerState, Command};
@@ -64,21 +65,39 @@ impl<'a> DashboardView<'a> {
 pub struct PaletteView<'a> {
     pub filter: &'a str,
     pub cursor: usize,
-    pub commands: Vec<Command>,
+    pub commands: Vec<PaletteEntry>,
     pub selected: usize,
-    /// The connector every listed command would act on, e.g. `"EVSE 1 / C1"`, so the
-    /// consequence of pressing Enter is visible before it's pressed. `None` when the focus
-    /// doesn't resolve to a real connector.
+    /// What the *selected* entry would act on, e.g. `"EVSE 1 / C1"` for a connector-scoped command
+    /// or the charger's own id for a charger-wide one (a display message, a firmware update), so the
+    /// consequence of pressing Enter is visible before it's pressed. `None` when there is nothing
+    /// selected, or when a connector-scoped entry's focus doesn't resolve to a real connector.
     pub target: Option<String>,
+    /// Whether the selected entry is connector-scoped, which is what decides whether `Tab`
+    /// retargeting means anything for it - see [`crate::actions::PaletteEntry::is_connector_scoped`].
+    pub target_is_connector: bool,
 }
 
 impl<'a> PaletteView<'a> {
     pub fn from_app(app: &'a App) -> Self {
+        let commands = app.palette_commands();
+        // The target follows the selection rather than being fixed, because the two kinds of entry
+        // act on different things: a charger-wide entry showing "EVSE 1 / C1" would name a target it
+        // is not going to touch.
+        let selected = commands.get(app.command_palette_selected);
+        let target_is_connector = selected.is_none_or(|entry| entry.is_connector_scoped());
+        let target = if target_is_connector {
+            app.focused_connector_label()
+        } else {
+            app.charger_state
+                .as_ref()
+                .map(|state| state.config.id.clone())
+        };
         Self {
-            target: app.focused_connector_label(),
+            target,
+            target_is_connector,
             filter: app.command_palette_filter.value(),
             cursor: app.command_palette_filter.cursor(),
-            commands: app.palette_commands(),
+            commands,
             selected: app.command_palette_selected,
         }
     }

@@ -121,6 +121,32 @@ impl FakeFileTransfer {
         }
     }
 
+    /// Runs a download with no CSMS campaign behind it, reporting progress nowhere - the same
+    /// local-only path [`super::firmware::FakeFirmwareInstaller::run_install`] exists for, and for
+    /// the same reason: `firmware_updates`/`log_uploads` are only registered when there is a CSMS to
+    /// report to, so in local mode nothing would otherwise ever call this hardware.
+    ///
+    /// An inherent wrapper around [`FileTransfer::download`] so a frontend needs neither
+    /// `ocpp_charge_point`'s trait nor its `TransferProgress`. Progress is deliberately dropped
+    /// rather than forwarded: with no campaign there is no `FirmwareStatusNotification` to send it
+    /// in, and a frontend reads [`Self::download_in_flight`] instead.
+    pub async fn run_download(&self, url: &str) -> Result<(), FakeFileTransferError> {
+        FileTransfer::download(self, url, &TransferProgress::ignored()).await
+    }
+
+    /// The upload counterpart of [`Self::run_download`], for a diagnostics log upload driven locally.
+    /// `bytes` stands in for the log archive a real charger would render, and is what
+    /// [`Self::last_upload`] then reports.
+    pub async fn run_upload(&self, url: &str, bytes: Vec<u8>) -> Result<(), FakeFileTransferError> {
+        FileTransfer::upload(
+            self,
+            url,
+            UploadSource::Bytes(&bytes),
+            &TransferProgress::ignored(),
+        )
+        .await
+    }
+
     /// How far the in-flight [`FileTransfer::download`] has got, or `None` when no download is
     /// currently running - see [`InFlightTransfer`].
     pub fn download_in_flight(&self) -> Option<InFlightTransfer> {
@@ -362,6 +388,43 @@ mod tests {
             seen.windows(2).all(|pair| pair[0] <= pair[1]),
             "progress must never go backwards: {seen:?}"
         );
+    }
+
+    /// The local, CSMS-free entry points a frontend drives (see `run_download`'s doc comment): they
+    /// pace and fail exactly like the trait methods they wrap, since they *are* those methods.
+    #[tokio::test]
+    async fn a_locally_run_transfer_paces_and_fails_like_a_campaign_driven_one() {
+        let transfer = FakeFileTransfer::new(
+            TransferProfile {
+                duration: Duration::from_secs(10),
+                total_bytes: 1000,
+            },
+            TransferProfile::instant(64),
+        );
+
+        let download = transfer.run_download("https://example.invalid/fw.bin");
+        let drive = async {
+            tokio::task::yield_now().await;
+            assert!(
+                transfer.download_in_flight().is_some(),
+                "a locally-run download is observable exactly like a campaign-driven one"
+            );
+            transfer.tick(Duration::from_secs(10));
+        };
+        let (result, ()) = tokio::join!(download, drive);
+        result.unwrap();
+
+        transfer
+            .run_upload("https://example.invalid/logs", b"log archive".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(transfer.last_upload().as_deref(), Some(&b"log archive"[..]));
+
+        transfer.trigger_download_failure();
+        let failed = transfer
+            .run_download("https://example.invalid/fw.bin")
+            .await;
+        assert_eq!(failed, Err(FakeFileTransferError));
     }
 
     /// The observational accessor a frontend needs: nothing else can see a transfer's progress,

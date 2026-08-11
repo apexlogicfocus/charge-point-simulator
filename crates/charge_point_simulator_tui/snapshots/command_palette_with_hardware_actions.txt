@@ -1,0 +1,34 @@
+● connected  |  demo-ocpp21-full  |  OCPP 2.1  |  local simulation  |  up 0s  ·
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Declared────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+smart charging  ·  V2G  ·  DER control  ·  reservation  ·  local auth list  ·  firmware  ·  diagnostics  ·  +2 more
+EVSEs (1/2)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
+EVSE 1  ● charging   0.00 kW  0.0 A  0.000 kWh                                          EVSE 1 / C1
+  ▸ C1  ● charging   MY-EV-1   20%                                                      ● charging
+EVSE 2  ○ available   0.00 kW  0.0 A  0.000 kWh                                         vehicle  MY-EV-1
+    C1  ○ available                                                                     soc      20% ██░░░░░░░░
+                                                                                        session  0s
+                             target EVSE 1 / C1  (Tab to retarget)
+                            ┌Filter────────────────────────────────────────────────────────┐     released
+                            │                                                              │act  open
+                            └──────────────────────────────────────────────────────────────┘t    none
+                            ┌Command───────────────────────────────────────────────────────┐
+                            │> Unplug vehicle              Removes the vehicle and frees th│ kW  0.0 A  0.000 kWh
+                            │  Report fault                Marks the connector as faulted  │
+                            │  Toggle V2G discharge        Exports power from the vehicle, │
+                            │  Install firmware locally    Downloads and installs, with no │
+                            │  Upload diagnostics locally  Uploads a log archive, with no C│
+                            │  Fail firmware installs      Installs fail from now on       │
+                            │  Fail firmware downloads     Downloads fail from now on      │
+Logs────────────────────────│  Fail diagnostics uploads    Uploads fail from now on        │────────────────────────────
+                            └──────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+
+
+
+q: quit  Esc: back  ↑/↓: connector  Tab/←/→: EVSE  /: filter  l: level  c: command  ?: help

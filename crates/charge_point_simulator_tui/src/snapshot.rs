@@ -175,10 +175,6 @@ fn charging_dashboard_app() -> App {
     let state = app.charger_state.as_mut().unwrap();
     Command::PlugInVehicle.apply_to(&mut state.evses[0], 0, "MY-EV-1");
     Command::PresentRfid.apply_to(&mut state.evses[0], 0, "TAG-42");
-    // A fixed, non-wall-clock elapsed time - this mirrors what `App::tick_metrics_with` does to
-    // `charger_state` (`state.tick(elapsed)`), for the session-duration/SoC bookkeeping that
-    // still lives there.
-    state.tick(Duration::from_secs(600));
     // H3b moved the meter itself into `core`'s hardware layer, reached only through a real
     // `RunningCharger` and `apply_ocpp_state` - out of reach from a bare `ChargerState` fixture
     // like this one, which renders straight from `App::charger_state` with no running charger
@@ -190,6 +186,12 @@ fn charging_dashboard_app() -> App {
         current_a: 7.4 * 1000.0 / 230.0,
         energy_kwh: 7.4 * 600.0 / 3600.0,
     };
+    // A fixed, non-wall-clock elapsed time - this mirrors what `App::tick_metrics_with` does to
+    // `charger_state` (`state.tick(elapsed)`), for the session-duration/SoC bookkeeping that
+    // still lives there, and for the power history the sidebar's sparkline plots. Ticked *after*
+    // the reading is set, in the order the real app runs them (snapshot drained, then ticked), so
+    // the history records this session's 7.4 kW rather than a window of zeros.
+    state.tick(Duration::from_secs(600));
     // The hardware-only half of the same reading (H7), set for exactly the same reason and with the
     // same honesty constraint: a connector genuinely mid-session has its cable locked and its
     // contactor closed - that is *why* the meter above is moving - here under a CSMS-applied 16 A
@@ -228,6 +230,18 @@ fn charging_dashboard_app() -> App {
     }
 
     app
+}
+
+/// The picker as the app really opens it: the three shipped presets, so the `Declares` column shows
+/// both states it has - `—` for the two plain presets, and a count for `demo-ocpp21-full`.
+#[test]
+fn picker_with_the_shipped_presets() {
+    let mut app = App::new(built_in_chargers());
+
+    assert_snapshot(
+        "picker_with_the_shipped_presets",
+        &render(&mut app, 120, 34),
+    );
 }
 
 #[test]
@@ -409,6 +423,9 @@ fn dashboard_discharging() {
     state.evses[0].connectors[0].exported_energy_wh = 2_500;
     state.evses[0].metrics.power_kw = -7.4;
     state.evses[0].metrics.current_a = -7.4 * 1000.0 / 230.0;
+    // Long enough for the export to fill the sparkline's window, so the spark shown belongs to the
+    // direction the rest of the panel describes.
+    state.tick(Duration::from_secs(30));
 
     assert_snapshot("dashboard_discharging", &render(&mut app, 120, 34));
 }
@@ -444,6 +461,35 @@ fn dashboard_declared_capabilities_narrow() {
     assert_snapshot(
         "dashboard_declared_capabilities_narrow",
         &render(&mut app, 80, 24),
+    );
+}
+
+/// The command palette on the full-featured preset: protocol commands and hardware actions in one
+/// list, which is the whole point of the palette carrying both. The demo charger declares
+/// bidirectional power, firmware management and diagnostics, so every kind of row is visible at
+/// once; the plain `command_palette` golden next to it shows a charger declaring nothing, where none
+/// of them is.
+#[test]
+fn command_palette_with_hardware_actions() {
+    let demo = built_in_chargers()
+        .into_iter()
+        .find(|entry| entry.config.id == "demo-ocpp21-full")
+        .expect("the full-featured demo preset ships with core");
+    let mut app = dashboard_app(demo.config);
+    // Mid-session on the focused connector, which is what makes the V2G row eligible; and the
+    // installer present but idle, as a real snapshot from this charger's bundle would report.
+    let state = app.charger_state.as_mut().unwrap();
+    Command::PlugInVehicle.apply_to(&mut state.evses[0], 0, "MY-EV-1");
+    Command::PresentRfid.apply_to(&mut state.evses[0], 0, "TAG-42");
+    app.campaigns = CampaignProgress {
+        firmware_install: Some(FirmwareInstallStage::Idle),
+        ..Default::default()
+    };
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+    assert_snapshot(
+        "command_palette_with_hardware_actions",
+        &render(&mut app, 120, 34),
     );
 }
 

@@ -97,10 +97,18 @@ pub(super) fn render_command_palette(frame: &mut Frame, view: &PaletteView) {
     // The target line answers "what will Enter actually do?" before Enter is pressed - the
     // palette used to give no indication which connector it was aimed at.
     let target_line = match &view.target {
-        Some(target) => Line::from(vec![
+        // `Tab` only retargets a connector, so the hint appears only where it does something: a
+        // charger-wide entry (a display message, a firmware update) names the charger instead, and
+        // offering to retarget it would be offering nothing.
+        Some(target) if view.target_is_connector => Line::from(vec![
             Span::styled(" target ", theme::text_dim()),
             Span::styled(target.as_str(), theme::accent()),
             Span::styled("  (Tab to retarget)", theme::text_muted()),
+        ]),
+        Some(target) => Line::from(vec![
+            Span::styled(" target ", theme::text_dim()),
+            Span::styled(target.as_str(), theme::accent()),
+            Span::styled("  (whole charger)", theme::text_muted()),
         ]),
         None => Line::styled(" no connector targeted", theme::text_muted()),
     };

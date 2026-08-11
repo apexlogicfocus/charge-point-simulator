@@ -223,6 +223,23 @@ The built-in Ratatui dashboard provides:
 * ⌨️ Keyboard controls (`?` lists them all)
 * 🔍 Real-time protocol events
 
+### Driving the hardware directly
+
+The command palette (`Ctrl+K`, or `c`) lists two kinds of thing: OCPP commands, which go to the
+charger's own state machine, and hardware actions, which go straight to its simulated hardware
+because OCPP has no way to ask for them. On a charger that declares the matching capability, those
+are:
+
+* **Toggle V2G discharge** (`d` is a shortcut) - see below
+* **Install firmware locally** - fetches an image and installs it, with no CSMS campaign behind
+  either half, so a firmware install can be watched offline
+* **Upload diagnostics locally** - the same for a log upload
+* **Fail firmware installs / downloads / uploads** - arms a deliberate, reproducible failure, so a
+  CSMS's `InstallationFailed`/`DownloadFailed`/`UploadFailure` handling can be exercised on demand.
+  Each is armed until the charger is restarted, and each half fails independently
+
+An action a charger's configuration doesn't declare is simply not listed.
+
 ### Bidirectional power (V2G)
 
 `d` puts the focused connector into export and back, on a charger whose configuration declares

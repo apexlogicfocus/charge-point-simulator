@@ -1,11 +1,11 @@
-● connected  |  CP-CHARGE  |  OCPP 1.6J  |  local simulation  |  up 10m 00s  ·
+● connected  |  CP-CHARGE  |  OCPP 1.6J  |  local simulation  |  up 10m 30s  ·
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 EVSEs (1/1)─────────────────────────────────────────────────────────────────────────────Detail──────────────────────────
 EVSE 1  ● charging   -7.40 kW  -32.2 A  1.233 kWh                                       EVSE 1 / C1
   ▸ C1  ● charging   MY-EV-1   100%                                                     ● charging
                                                                                         vehicle  MY-EV-1
                                                                                         soc      100% ██████████
-                                                                                        session  10m 00s
+                                                                                        session  10m 30s
 
                                                                                         lock     engaged
                                                                                         contact  closed
@@ -14,7 +14,7 @@ EVSE 1  ● charging   -7.40 kW  -32.2 A  1.233 kWh                             
                                                                                         exported 2.500 kWh
 
                                                                                         -7.40 kW  -32.2 A  1.233 kWh
-
+                                                                                        ████████████████████████  24s
 
 
 

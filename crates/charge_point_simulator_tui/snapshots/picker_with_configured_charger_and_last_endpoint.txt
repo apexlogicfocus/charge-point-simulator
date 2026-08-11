@@ -1,9 +1,9 @@
                                         Filter──────────────────────────────────────────────────────────────────────────
 
                                         Select a charger────────────────────────────────────────────────────────────────
-                                          Charger          OCPP        EVSEs     Source           Last endpoint
-                                        > CP001            OCPP 1.6J   1 EVSE    built-in         —
-                                          CP-CUSTOM        OCPP 2.1    1 EVSE    cp-custom.yaml   wss://csms.example.co…
+                                          Charger           OCPP        EVSEs     Declares  Source      Last endpoint
+                                        > CP001             OCPP 1.6J   1 EVSE    —         built-in    —
+                                          CP-CUSTOM         OCPP 2.1    1 EVSE    —         cp-custom…  wss://csms.exam…
 
 
 

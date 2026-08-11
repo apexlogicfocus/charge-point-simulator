@@ -1,10 +1,10 @@
                                         Filter──────────────────────────────────────────────────────────────────────────
-                                        cp0
+
                                         Select a charger────────────────────────────────────────────────────────────────
                                           Charger           OCPP        EVSEs     Declares  Source      Last endpoint
-                                        > CP001             OCPP 1.6J   1 EVSE    —         built-in    —
-                                          CP002             OCPP 2.0.1  1 EVSE    —         built-in    —
-
+                                        > demo-ocpp16j-si…  OCPP 1.6J   1 EVSE    —         built-in    —
+                                          demo-ocpp201-du…  OCPP 2.0.1  2 EVSEs   1         built-in    —
+                                          demo-ocpp21-full  OCPP 2.1    2 EVSEs   10        built-in    —
 
 
 

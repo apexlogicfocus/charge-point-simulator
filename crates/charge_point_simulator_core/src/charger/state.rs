@@ -152,11 +152,84 @@ pub struct ConnectorState {
     pub exported_energy_wh: i64,
 }
 
+/// A rolling window of recent power readings for one EVSE, for anything that wants to show a trend
+/// rather than an instant - a sparkline, a chart, a "was it flat for the last minute?" check.
+///
+/// Lives here rather than in the TUI on purpose (`docs/tui-roadmap.md`'s settled decision 2): a
+/// history is data, and every consumer of the published crate can use it, while a sparkline drawn
+/// from it is presentation and stays in whichever frontend draws one.
+///
+/// # Why it samples rather than recording every value
+///
+/// [`EvseState::tick`] runs at whatever cadence its caller ticks - roughly every 100ms in the TUI -
+/// so recording one value per tick would hold about six seconds in a 60-slot window, and the window
+/// would silently change length with the frame rate. Instead this accumulates simulated time and
+/// appends one sample per [`Self::SAMPLE_INTERVAL`], so [`Self::CAPACITY`] samples always span the
+/// same simulated duration ([`Self::window`]) however the caller slices its ticks - the same
+/// "simulated time, never wall clock" rule the rest of this module follows, and the same
+/// many-small-ticks-equal-one-big-tick property [`Vehicle::state_of_charge`] needs.
+///
+/// Values are `power_kw` exactly as [`EvseMetrics`] carries it, **signed**: a discharging connector
+/// reads negative (H14), and flattening that to a magnitude here would throw away the one thing a
+/// power trend most needs to show.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PowerHistory {
+    samples: Vec<f64>,
+    /// Simulated time accumulated since the last sample was appended, always less than
+    /// [`Self::SAMPLE_INTERVAL`] after [`Self::record`] returns.
+    pending: Duration,
+}
+
+impl PowerHistory {
+    /// How much simulated time each sample covers.
+    pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+    /// How many samples are kept. With [`Self::SAMPLE_INTERVAL`] at one second, one minute of
+    /// history - long enough for a charging session's ramp to be visible, short enough that a change
+    /// now is still visible in a minute's time.
+    pub const CAPACITY: usize = 60;
+
+    /// The simulated duration a full window covers.
+    pub fn window(&self) -> Duration {
+        Self::SAMPLE_INTERVAL * Self::CAPACITY as u32
+    }
+
+    /// The samples held, oldest first. Empty until the first [`Self::SAMPLE_INTERVAL`] of simulated
+    /// time has been recorded - a charger that has only just started has no *history*, and
+    /// synthesizing one from its current reading would invent a past it didn't have.
+    pub fn samples(&self) -> &[f64] {
+        &self.samples
+    }
+
+    /// Accumulates `elapsed` and appends `power_kw` once a whole [`Self::SAMPLE_INTERVAL`] has built
+    /// up, dropping the oldest sample past [`Self::CAPACITY`].
+    ///
+    /// A tick longer than one interval appends one sample per interval it covers, all with the same
+    /// value - the only honest thing available, since no reading was taken in between, and it keeps
+    /// the window's span independent of tick size (a 60s tick fills the window, exactly as 600
+    /// 100ms ticks would).
+    pub fn record(&mut self, elapsed: Duration, power_kw: f64) {
+        self.pending += elapsed;
+        while self.pending >= Self::SAMPLE_INTERVAL {
+            self.pending -= Self::SAMPLE_INTERVAL;
+            self.samples.push(power_kw);
+            if self.samples.len() > Self::CAPACITY {
+                let excess = self.samples.len() - Self::CAPACITY;
+                self.samples.drain(..excess);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvseState {
     pub id: u32,
     pub connectors: Vec<ConnectorState>,
     pub metrics: EvseMetrics,
+    /// Recent `metrics.power_kw` readings - see [`PowerHistory`]. Filled by [`Self::tick`] from
+    /// whatever `metrics` holds when it runs, which is why [`super::ocpp_bridge::apply_ocpp_state`]
+    /// (the only thing that writes `metrics`) has to run first: a caller that ticked before applying
+    /// the frame's snapshot would be recording the previous frame's reading.
+    pub power_history: PowerHistory,
 }
 
 impl EvseState {
@@ -184,6 +257,11 @@ impl EvseState {
     /// Charging never tapers or stops once the vehicle reaches 100% SoC - that's
     /// charging-strategy behavior for a later phase, not this simulator's session tick.
     ///
+    /// It also records this EVSE's current `power_kw` into [`Self::power_history`], which is
+    /// bookkeeping over a reading rather than a simulation of one - the reading itself comes from the
+    /// hardware, through [`super::ocpp_bridge::apply_ocpp_state`], which must therefore have run for
+    /// this frame already (see the field's own doc comment).
+    ///
     /// This is deliberately the only thing left in here (`docs/hardware-roadmap.md`'s H3b): the
     /// electrical simulation (power, current, energy) that used to live alongside it moved into
     /// the hardware layer's `SimulatedMeter`, driven by `FakeChargePoint::tick` and read back
@@ -191,6 +269,8 @@ impl EvseState {
     /// vehicle/battery model down there yet, so `session_duration`/`state_of_charge` stay here
     /// until one exists.
     pub fn tick(&mut self, elapsed: std::time::Duration) {
+        self.power_history.record(elapsed, self.metrics.power_kw);
+
         for connector in &mut self.connectors {
             match connector.status {
                 ConnectorStatus::Charging => {
@@ -253,6 +333,7 @@ impl ChargerState {
                     })
                     .collect(),
                 metrics: EvseMetrics::default(),
+                power_history: PowerHistory::default(),
             })
             .collect();
 
@@ -381,6 +462,119 @@ mod tests {
         let connector = &state.evses[0].connectors[0];
         assert!(!connector.discharging);
         assert_eq!(connector.exported_energy_wh, 0);
+    }
+
+    // --- power history (tui-roadmap settled decision 2) -----------------------------------
+
+    #[test]
+    fn a_fresh_evse_has_no_power_history_at_all() {
+        let state = ChargerState::from_config(config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]));
+
+        assert!(
+            state.evses[0].power_history.samples().is_empty(),
+            "a charger that just started has no past to show"
+        );
+    }
+
+    #[test]
+    fn power_history_samples_once_per_interval_of_simulated_time() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]));
+        state.evses[0].metrics.power_kw = 7.4;
+
+        // Half an interval: not a sample yet.
+        state.tick(PowerHistory::SAMPLE_INTERVAL / 2);
+        assert!(state.evses[0].power_history.samples().is_empty());
+
+        // The other half completes it.
+        state.tick(PowerHistory::SAMPLE_INTERVAL / 2);
+        assert_eq!(state.evses[0].power_history.samples(), [7.4]);
+
+        state.tick(PowerHistory::SAMPLE_INTERVAL);
+        assert_eq!(state.evses[0].power_history.samples(), [7.4, 7.4]);
+    }
+
+    /// The property the whole sampling design exists for, and the same one SoC progression needs:
+    /// how the caller slices its ticks must not change what a full window covers. Ticking at the
+    /// TUI's real ~100ms cadence and ticking once must agree.
+    #[test]
+    fn power_history_holds_the_same_span_however_the_ticks_are_sliced() {
+        let mut many_small = ChargerState::from_config(config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]));
+        many_small.evses[0].metrics.power_kw = 7.4;
+        for _ in 0..100 {
+            many_small.tick(Duration::from_millis(100));
+        }
+
+        let mut one_big = ChargerState::from_config(config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]));
+        one_big.evses[0].metrics.power_kw = 7.4;
+        one_big.tick(Duration::from_secs(10));
+
+        assert_eq!(
+            many_small.evses[0].power_history.samples().len(),
+            10,
+            "ten seconds of simulated time is ten samples"
+        );
+        assert_eq!(
+            many_small.evses[0].power_history.samples(),
+            one_big.evses[0].power_history.samples()
+        );
+    }
+
+    #[test]
+    fn power_history_keeps_the_most_recent_samples_and_drops_the_rest() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]));
+
+        // Fill the window with a distinguishable value, then overwrite it with another.
+        state.evses[0].metrics.power_kw = 1.0;
+        state.tick(PowerHistory::SAMPLE_INTERVAL * PowerHistory::CAPACITY as u32);
+        assert_eq!(
+            state.evses[0].power_history.samples().len(),
+            PowerHistory::CAPACITY
+        );
+
+        state.evses[0].metrics.power_kw = 2.0;
+        state.tick(PowerHistory::SAMPLE_INTERVAL * 3);
+
+        let samples = state.evses[0].power_history.samples();
+        assert_eq!(
+            samples.len(),
+            PowerHistory::CAPACITY,
+            "the window is bounded"
+        );
+        assert_eq!(&samples[samples.len() - 3..], [2.0, 2.0, 2.0]);
+        assert_eq!(
+            samples[0], 1.0,
+            "the oldest three were dropped, not the newest"
+        );
+    }
+
+    /// H14: a discharging EVSE reads negative, and the history has to keep the sign - a trend that
+    /// showed export and import identically would be the one thing it must not do.
+    #[test]
+    fn power_history_keeps_the_sign_of_an_exporting_evse() {
+        let mut state = ChargerState::from_config(config(vec![EvseConfig {
+            id: 1,
+            connectors: 1,
+        }]));
+        state.evses[0].metrics.power_kw = -7.4;
+
+        state.tick(PowerHistory::SAMPLE_INTERVAL);
+
+        assert_eq!(state.evses[0].power_history.samples(), [-7.4]);
     }
 
     #[test]

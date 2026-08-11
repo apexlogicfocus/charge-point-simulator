@@ -21,7 +21,7 @@ EVSE 1  ○ available   0.00 kW  0│ q           quit (confirm)                
                                 │ Esc         back to picker                           █
                                 │ ↑/↓         focus connector                          █
 Logs────────────────────────────│ Tab/←/→     focus EVSE                               █────────────────────────────────
-                                │ Ctrl+K / c  open command palette                     █
+                                │ Ctrl+K / c  commands + hardware actions              █
                                 │ d           toggle V2G discharge (if declared)       █
                                 │                                                      █
                                 │Logs                                                  █

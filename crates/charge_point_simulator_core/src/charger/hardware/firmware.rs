@@ -103,11 +103,31 @@ impl FakeFirmwareInstaller {
         }
     }
 
+    /// Runs an installation without a CSMS campaign behind it - the "technician with a USB stick"
+    /// path, and the only way to reach this hardware at all in local mode, where
+    /// [`super::super::connect::register_optional_hardware`] never registers `firmware_updates`
+    /// (there is no CSMS to report progress to - see its `has_csms` doc comment).
+    ///
+    /// An inherent wrapper around [`FirmwareInstaller::install`], the trait method upstream's own
+    /// `run_firmware_updates` calls, so a frontend can drive an install without importing
+    /// `ocpp_charge_point`'s traits or naming its [`FirmwareInstallOutcome`]. The outcome is
+    /// observable through [`Self::stage`] either way, which is what a frontend renders.
+    ///
+    /// Paced by [`Self::tick`] exactly as a CSMS-driven install is, so this resolves only once
+    /// enough simulated time has been supplied - a caller holding an `Arc` of this can therefore
+    /// start one, keep ticking, and watch it progress.
+    pub async fn run_install(&self) -> Result<(), FakeFirmwareInstallerError> {
+        FirmwareInstaller::install(self).await.map(|_| ())
+    }
+
     /// Makes the current (or next) [`Self::install`] call fail with
     /// [`FakeFirmwareInstallerError`] instead of completing - the deliberate, reproducible way to
     /// exercise a CSMS's `InstallationFailed` handling, per the roadmap's working agreement that a
     /// fake must never fail randomly. Wakes an installation already waiting on [`Self::tick`] so
     /// the failure surfaces immediately rather than waiting for the next tick.
+    ///
+    /// Not resettable: once armed, every subsequent install on this instance fails too. A frontend
+    /// offering this should say so rather than calling it "fail the next one".
     pub fn trigger_failure(&self) {
         self.fail.store(true, Ordering::Relaxed);
         if let Some(sender) = self.progress.lock().expect("lock poisoned").clone() {
@@ -258,6 +278,41 @@ impl FirmwareVerifier for FakeFirmwareVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The local, CSMS-free entry point a frontend drives - the same install `run_firmware_updates`
+    /// would have driven, reachable without importing upstream's trait or naming its outcome.
+    #[tokio::test]
+    async fn a_locally_run_install_reports_its_stage_and_still_needs_ticks() {
+        let installer = FakeFirmwareInstaller::new(Duration::from_secs(90));
+        assert_eq!(installer.stage(), FirmwareInstallStage::Idle);
+
+        let install = installer.run_install();
+        let drive = async {
+            tokio::task::yield_now().await;
+            assert_eq!(
+                installer.stage(),
+                FirmwareInstallStage::Installing,
+                "an install awaiting ticks is observably in flight"
+            );
+            installer.tick(Duration::from_secs(90));
+        };
+        let (result, ()) = tokio::join!(install, drive);
+
+        result.unwrap();
+        assert_eq!(installer.stage(), FirmwareInstallStage::Installed);
+    }
+
+    #[tokio::test]
+    async fn arming_a_failure_fails_a_locally_run_install_too() {
+        let installer = FakeFirmwareInstaller::new(Duration::ZERO);
+        installer.trigger_failure();
+
+        assert_eq!(
+            installer.run_install().await,
+            Err(FakeFirmwareInstallerError)
+        );
+        assert_eq!(installer.stage(), FirmwareInstallStage::Failed);
+    }
 
     #[tokio::test]
     async fn install_progresses_through_installing_before_completing_exactly_once() {

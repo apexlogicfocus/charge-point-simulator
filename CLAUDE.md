@@ -77,7 +77,7 @@ cargo fmt --all
 model, fake hardware, and a live OCPP 2.1 bridge (`connect_charger` + `apply_ocpp_state`); the
 TUI has a working picker → connection setup → dashboard flow.
 
-Two things worth knowing before touching the dashboard:
+Three things worth knowing before touching the dashboard:
 
 - **A charger's observable state reaches the TUI as a `ChargerSnapshot`, and has two halves.**
   `ocpp` is a `ChargePointState`, applied with `apply_ocpp_state`. `hardware` is
@@ -88,6 +88,13 @@ Two things worth knowing before touching the dashboard:
   charger runs on its own thread and the hardware handle never leaves it), which is the whole reason
   the split exists. If you add hardware state, add it to that projection in `core` — not to a TUI-side
   shadow copy.
+- **Commands and hardware actions are different things, deliberately.** A
+  `charge_point_simulator_core::charger::Command` becomes a `ChargePointEvent` and the charger's state
+  machine decides what happens; a `crate::actions::HardwareAction` (V2G discharge, a local firmware
+  install, an armed failure) has no protocol path at all and goes down its own `HardwareControl`
+  channel. Both show up in one palette, but keep them separate types - it is what stops the second
+  kind reading as something OCPP did. `App::apply_command` never mutates `ChargerState` itself; the
+  only exception is `SetDisplayMessage`/`ClearDisplayMessage`, and its doc comment explains why.
 - **The TUI builds the hardware bundle, gated on the charger's declared capabilities**
   (`app.rs::charger_hardware`). A firmware installer or certificate store is only handed over when
   the charger declares the matching block, and `register_optional_hardware` gates registration on the

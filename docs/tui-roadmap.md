@@ -167,9 +167,52 @@ The guiding principles, which every remaining phase should be checked against:
   with hardware behind it and no others, with a test that keeps that constant honest — so none of the
   above needs hand-written YAML to reach.
 
+- **Phase 9 — the actions the hardware could take but nothing could ask for.** Phase 8 gave the
+  charger firmware, file-transfer and certificate hardware and put its progress on screen, but left
+  three things unfinished, all now closed.
+
+  **Local campaigns are drivable.** `register_optional_hardware` gates `firmware_updates`/
+  `log_uploads` on `has_csms`, so in local mode the installer and file transfer existed, were ticked,
+  and could never be asked to do anything — the `Firmware & files` strip could only ever animate
+  against a real CSMS. `core` gained inherent, CSMS-free entry points on the fakes themselves
+  (`FakeFirmwareInstaller::run_install`, `FakeFileTransfer::run_download`/`run_upload`), so the TUI
+  drives them without importing upstream's traits — the boundary its `Cargo.toml` states, where
+  `ocpp-charge-point` is a dev-dependency only. `HardwareControl` grew `InstallFirmware`,
+  `UploadDiagnostics` and the three failure arms, and the charger thread *spawns* a campaign rather
+  than awaiting it, so a 30-second install doesn't queue every later control behind it. The spawned
+  task holds only `Arc` clones of the hardware, never `RunningCharger` (which isn't `Send`).
+
+  **The palette carries both kinds of action.** A new `src/actions.rs` holds `HardwareAction` and a
+  `PaletteEntry` enum; `App::palette_entries` lists eligible commands then eligible hardware actions,
+  fuzzy-matched together. They stay distinct types in distinct channels because a `Command` becomes a
+  `ChargePointEvent` and a `HardwareAction` has no protocol path at all — keeping them apart is what
+  stops the second reading as something OCPP did. Availability is gated on the charger's declaration,
+  so an undeclared action is absent rather than greyed out, and the palette's target line now follows
+  the *selected* entry: `EVSE 1 / C1  (Tab to retarget)` for a connector-scoped one, the charger's id
+  and `(whole charger)` for a firmware update. `d` stays as the discharge shortcut and delegates to
+  the same action, keeping its refusal messages (a keybinding needs them; the palette never lists an
+  unavailable row).
+
+  Failure arming is labelled "from now on", not "next": the fakes' flags are armed once and never
+  cleared, and the nicer sentence would describe behavior the simulator doesn't have.
+
+  **The picker shows what a charger declares** — a `Declares` column holding a count, because the
+  shipped `demo-ocpp21-full` alone declares ten and any list short enough for a table cell would be a
+  list of the first two. The `Charger` column moved to `Fill(3)` to pay for it: an id truncated past
+  the part that distinguishes it makes the whole row useless.
+
+  **Settled decision 2 is implemented** — see it below for the sampling design and why the sparkline
+  plots magnitude.
+
+  One more thing this turned up, and fixed: `App::apply_command`'s fallback to `Command::apply_to`.
+  It was only reachable before the charger's first snapshot arrived, and in that window it mutated
+  `ChargerState` directly — the change looked like it worked and was then silently reverted by the
+  snapshot. It now reports "not ready yet", which also retires H3b's "local mode is half-converged"
+  note. `Command::apply_to` stays in `core` as published API; nothing in the TUI calls it.
+
 ## Where we are
 
-Phases 0–8 have all landed; see the Done section above. Nothing is scheduled after this — the open
+Phases 0–9 have all landed; see the Done section above. Nothing is scheduled after this — the open
 decisions below are all settled, so the next move is one of the unscheduled gaps after them. (No REST
 API crate is coming here — `core` is published to crates.io and any REST API lives in a separate
 downstream repo. See `CLAUDE.md`.)
@@ -185,9 +228,14 @@ All four former open decisions have had their human call:
    which now says this is deliberate.
 2. **Power sparkline ownership** — rolling metrics history belongs in `core`, not the TUI. A
    sparkline is then pure presentation over data downstream consumers of the published `core`
-   crate can serve too. Not yet
-   implemented; when it is, the history lives beside `EvseMetrics` and is driven by
-   `EvseState::tick`'s existing injected `elapsed`, never a wall clock.
+   crate can serve too. **Implemented in Phase 8**, exactly as described: `core`'s `PowerHistory`
+   lives beside `EvseMetrics` on `EvseState` and is driven by `EvseState::tick`'s injected
+   `elapsed`, never a wall clock. It *samples* rather than recording every tick — one value per
+   simulated second, 60 kept — because recording per tick would make the window's span depend on the
+   frame rate, and would hold about six seconds of history at the TUI's ~100ms cadence. The TUI
+   draws the last 24 of those samples in the sidebar. Magnitude only: eight block glyphs cannot show
+   a signed series against a baseline, and an exporting EVSE's samples are negative (H14) — the sign
+   is stated by the direction row and the signed `kW` figure beside the spark instead.
 3. **Deprecating the first-eligible command API** — removed. `Command::apply`/`Command::is_available`
    and `ocpp_bridge::build_ocpp_event` are gone, along with `build_ocpp_event`'s re-export from
    `charger/mod.rs`. Every caller already targeted a specific connector; keeping a second

@@ -7,7 +7,7 @@ use tui_big_text::{BigText, PixelSize};
 
 use crate::app::App;
 use crate::theme::{self, BRAND_TEAL};
-use charge_point_simulator_core::charger::{ChargerEntry, ChargerSource};
+use charge_point_simulator_core::charger::{ChargerConfig, ChargerEntry, ChargerSource};
 
 /// Rows occupied by the stacked "CHARGE" / "POINT" / "SIMULATOR" banner at
 /// `PixelSize::Quadrant` (4 terminal rows per glyph line).
@@ -81,6 +81,50 @@ fn last_endpoint_label(app: &App, entry: &ChargerEntry) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
+/// A charger row's "declares" column: how many capabilities this charger's configuration declares,
+/// or `—` for one that declares none.
+///
+/// A count rather than a list, because the picker is a table of one-line rows and the shipped
+/// `demo-ocpp21-full` preset alone declares ten - any list short enough for a column here would be a
+/// list of the first two. The dashboard's `Declared` strip names them once a charger is selected;
+/// what this column answers is the question the picker is for: which of these chargers is the
+/// interesting one?
+///
+/// Counted from the same [`ChargerConfig::capabilities`] the CSMS is told about, including the legacy
+/// top-level `has_display` spelling - see `dashboard::capability_labels`, which lists what this
+/// counts (except the display, which has its own section there and so is one the two disagree on
+/// deliberately: a count that skipped it would understate what the charger declares).
+fn capability_count_label(config: &ChargerConfig) -> String {
+    let capabilities = config.capabilities();
+    let count = usize::from(capabilities.has_display)
+        + usize::from(capabilities.supports_bidirectional_power)
+        + usize::from(capabilities.can_unlock_under_load)
+        + usize::from(capabilities.has_rtc)
+        + usize::from(capabilities.has_persistent_storage)
+        + usize::from(capabilities.reservation)
+        + usize::from(capabilities.local_auth_list)
+        + usize::from(capabilities.smart_charging)
+        + usize::from(capabilities.firmware_management)
+        + usize::from(capabilities.firmware_publishing)
+        + usize::from(capabilities.diagnostics)
+        + usize::from(capabilities.certificate_management)
+        + usize::from(capabilities.variable_monitoring)
+        + usize::from(capabilities.tariff_and_cost)
+        + usize::from(capabilities.payment)
+        + usize::from(capabilities.der_control)
+        + usize::from(capabilities.battery_swap)
+        + usize::from(capabilities.periodic_event_stream)
+        + usize::from(capabilities.certificates)
+        + usize::from(capabilities.key_storage)
+        + usize::from(capabilities.ocsp_checking);
+
+    if count == 0 {
+        "—".to_string()
+    } else {
+        count.to_string()
+    }
+}
+
 /// Truncates `text` to at most `max_width` character cells, appending `…` when something was
 /// actually cut - so a column too narrow for a long charger id, YAML file name, or CSMS URL
 /// says so, instead of `ratatui::widgets::Table` silently clipping it mid-word on its own.
@@ -152,12 +196,14 @@ fn render_charger_list(frame: &mut Frame, app: &App, area: Rect) {
     const COLUMN_SPACING: u16 = 2;
     const HIGHLIGHT_SYMBOL: &str = "> ";
 
-    // Weighted 2:2:3 rather than even, so the two columns most likely to hold something long
-    // (a YAML file name, a full CSMS URL) get more of the shrink-to-fit room than the charger
-    // id typically needs.
+    // Weighted 3:2:3 rather than even: the CSMS URL is the longest thing here, but charger ids are
+    // long too (the shipped presets are `demo-ocpp21-full` and friends) and an id truncated past the
+    // part that distinguishes it makes the whole row useless, so it gets a share of its own rather
+    // than whatever the other two leave. `Declares` is a fixed 8 because it holds a count.
     let widths = [
-        Constraint::Fill(2),
+        Constraint::Fill(3),
         Constraint::Length(10),
+        Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Fill(2),
         Constraint::Fill(3),
@@ -174,8 +220,15 @@ fn render_charger_list(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let header = Row::new(
-        ["Charger", "OCPP", "EVSEs", "Source", "Last endpoint"]
-            .map(|title| Cell::from(Line::styled(title, theme::text_dim()))),
+        [
+            "Charger",
+            "OCPP",
+            "EVSEs",
+            "Declares",
+            "Source",
+            "Last endpoint",
+        ]
+        .map(|title| Cell::from(Line::styled(title, theme::text_dim()))),
     );
 
     let rows = chargers.iter().map(|entry| {
@@ -187,6 +240,7 @@ fn render_charger_list(frame: &mut Frame, app: &App, area: Rect) {
                 "{evse_count} EVSE{}",
                 if evse_count == 1 { "" } else { "s" }
             ),
+            capability_count_label(&entry.config),
             source_label(&entry.source),
             last_endpoint_label(app, entry),
         ];
@@ -218,9 +272,68 @@ fn render_charger_list(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use charge_point_simulator_core::charger::{
+        CapabilitiesConfig, OcppVersion, SIMULATED_CAPABILITIES,
+    };
 
     fn area(width: u16, height: u16) -> Rect {
         Rect::new(0, 0, width, height)
+    }
+
+    fn config(declare: impl FnOnce(&mut CapabilitiesConfig)) -> ChargerConfig {
+        let mut capabilities = CapabilitiesConfig::default();
+        declare(&mut capabilities);
+        ChargerConfig {
+            id: "CP001".into(),
+            ocpp_version: OcppVersion::V21,
+            evses: vec![],
+            has_display: false,
+            capabilities,
+        }
+    }
+
+    #[test]
+    fn a_charger_declaring_nothing_shows_a_dash_rather_than_a_zero() {
+        assert_eq!(capability_count_label(&config(|_| {})), "—");
+    }
+
+    #[test]
+    fn the_count_follows_the_declaration() {
+        assert_eq!(
+            capability_count_label(&config(|capabilities| capabilities.smart_charging = true)),
+            "1"
+        );
+        assert_eq!(
+            capability_count_label(&config(|capabilities| {
+                capabilities.smart_charging = true;
+                capabilities.der_control = true;
+                capabilities.payment = true;
+            })),
+            "3"
+        );
+    }
+
+    /// The legacy top-level `has_display:` key counts too: `ChargerConfig::capabilities()` ORs it
+    /// with the block's own spelling, and this column has to agree with what the CSMS is told.
+    #[test]
+    fn the_legacy_display_spelling_is_counted() {
+        let mut legacy = config(|_| {});
+        legacy.has_display = true;
+        assert_eq!(capability_count_label(&legacy), "1");
+
+        // Both spellings at once is still one capability, not two.
+        let mut both = config(|capabilities| capabilities.has_display = true);
+        both.has_display = true;
+        assert_eq!(capability_count_label(&both), "1");
+    }
+
+    /// The shipped preset is the one row where this column carries a real number, so it is worth
+    /// pinning: if a wave adds hardware and moves a flag into `SIMULATED_CAPABILITIES`, this is one
+    /// of the places that says so.
+    #[test]
+    fn the_full_demo_preset_counts_every_simulated_capability() {
+        let demo = config(|capabilities| *capabilities = SIMULATED_CAPABILITIES);
+        assert_eq!(capability_count_label(&demo), "10");
     }
 
     #[test]

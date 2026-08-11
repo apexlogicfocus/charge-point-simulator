@@ -135,10 +135,18 @@ The guiding principles, which every task should be checked against:
   2. **The simulated boot lifecycle is gone.** A local charger used to show `Booting` for ~1.5
      simulated seconds and then `Connected`; it now reports `Offline` permanently. See `CLAUDE.md` —
      this is a product change, not a bug fix, and the note that prompted it was stale.
-  3. **Local-mode connector *status* still comes from the coarse `Command::apply_to` path**, while
-     the meter is fully real. Routing local commands through the OCPP event pipeline is command
-     routing rather than physics, and was correctly left out of scope. Until it lands, local mode is
-     half-converged — which is worth fixing before anyone reads local-mode behavior as authoritative.
+  3. **Local-mode connector *status* still came from the coarse `Command::apply_to` path**, while the
+     meter was fully real — so local mode was half-converged, and was not to be read as
+     authoritative. **Since TUI Phase 8 this is closed**, and it turned out to have been mostly closed
+     by H3b itself: `App::apply_command` prefers the OCPP event path whenever a snapshot and an event
+     channel exist, and a local charger has had both since H3b. What was left was the fallback for
+     the window *before* the first snapshot arrives, which mutated `ChargerState` directly and was
+     then silently reverted by that snapshot. It now reports "not ready yet", so `Command::apply_to`
+     is on no path the TUI takes. It stays in `core` as published API for downstream consumers with
+     no runtime of their own.
+
+     One local write remains, deliberately: `SetDisplayMessage`/`ClearDisplayMessage`. See "Known
+     gaps" — the display has H7's handle problem and no projection yet.
 
 - **H7** — `ConnectorState` gained `locked`, `contactor_closed`, `current_limit_ma`, filled by a new
   `apply_hardware_state` next to `apply_ocpp_state` (they read different sources, so they stay
@@ -475,6 +483,23 @@ more satisfying task.
 
 ## Known gaps
 
+Three of the gaps below need a change in `ocpp-charge-point` rather than here, and
+`docs/upstream-asks.md` writes them up as a document that can be handed straight to someone working
+in that repo: a public `actor()` (or builder hooks) to unblock both the keepalive loop and a custom
+`Watchdog`, a `HardwareCommand` variant carrying power direction to unblock CSMS-driven V2G, and
+message counters on `ChargePointState`.
+
+- **The display has no projection, and no handle to build one from.** `ChargerHardware.display` is an
+  owned `Option<FakeDisplay>` consumed by `register_setup_blocks`, and `FakeDisplay` is not `Clone`
+  the way `FakeChargePoint` is, so no caller keeps a handle — which means `hardware_snapshot` cannot
+  report what the display is showing, and a `SetDisplayMessage` a *CSMS* sends lands somewhere no
+  frontend can see. `ChargerState::display_message` is consequently the one piece of state the TUI
+  still writes itself (from its own display commands), and the only state on that struct with no
+  hardware behind it. Exactly H7's handle problem, one wave later: making `FakeDisplay` cheaply
+  `Clone` (an inner `Arc`, as `FakeChargePoint` did) and adding the message to
+  `ConnectorHardwareSnapshot`'s charger-wide counterpart would close it, and would also let the TUI's
+  display commands drive real hardware instead of a local field.
+
 - **The local authorization list can never reject anything (ours to fix, and worth doing soon).**
   H3b's `LocalAuthorizer` returns `Ok(Accepted)` for everything and is `Infallible`, so upstream's
   `offline_decision` — the only code that reads `local_authorization_list.entries` — is unreachable.
@@ -491,6 +516,15 @@ more satisfying task.
   (all-false capabilities registers no gated block). Nothing asserts that declaring `reservation` or
   `local_auth_list` actually *does* register `reserve_now`/`send_local_list`. H9 was scoped out of
   `connect.rs` and could not add it from an integration test.
+- **Firmware and diagnostics campaigns are only CSMS-driven over OCPP — locally they are driven
+  directly.** `register_optional_hardware` gates `firmware_updates`/`log_uploads` on `has_csms`, which
+  is right (there is no CSMS to report `FirmwareStatusNotification`/`LogStatusNotification` to), but
+  it left the installer and file transfer unreachable in local mode: present, ticked, and never
+  asked to do anything. Closed on the frontend side rather than by faking a campaign:
+  `FakeFirmwareInstaller::run_install` and `FakeFileTransfer::run_download`/`run_upload` are inherent,
+  CSMS-free entry points, and the TUI's palette drives them (see `docs/tui-roadmap.md`'s Phase 9).
+  What is still *not* simulated is the CSMS half of a local campaign — no status notifications are
+  produced, because there is nobody to send them to.
 - **`publish_firmware` and OCSP are unregistered for want of an implementation.** No
   `FirmwarePublisher` fake exists (wave 3 didn't build one — the H10a brief didn't ask), and neither
   `FileCertificateStore` nor upstream's `StoredCertificates` implements `OcspChecker`. Both are small

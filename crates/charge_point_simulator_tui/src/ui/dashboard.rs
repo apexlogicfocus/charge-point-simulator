@@ -12,7 +12,7 @@ use crate::logs::{Direction, LogLevel};
 use crate::theme;
 use charge_point_simulator_core::charger::{
     ChargerConfig, ChargerState, ConnectionStatus, ConnectorState, ConnectorStatus, EvseState,
-    FirmwareInstallStage, InFlightTransfer, SimulationMode,
+    FirmwareInstallStage, InFlightTransfer, PowerHistory, SimulationMode,
 };
 
 /// The named top-level regions of the dashboard screen, computed from the terminal area: a
@@ -65,6 +65,11 @@ const COMMAND_BAR_HEIGHT: u16 = 1;
 
 /// The detail sidebar's fixed width when there's room for one.
 const SIDEBAR_WIDTH: u16 = 32;
+
+/// How many power samples the sidebar's sparkline shows - one cell each, sized to leave room for the
+/// `Ns` window label beside it inside [`SIDEBAR_WIDTH`]. `core`'s `PowerHistory` keeps more
+/// (`PowerHistory::CAPACITY`); this is how much of it fits here.
+const SIDEBAR_SPARKLINE_CELLS: usize = 24;
 
 /// Below this body width, the sidebar collapses and the focused connector's detail is shown
 /// inline beneath its row in the tree instead - see [`body_layout`]. Chosen so the sidebar
@@ -620,6 +625,25 @@ fn sidebar_lines(evse: &EvseState, connector: &ConnectorState) -> Vec<Line<'stat
         Span::styled(" kWh", theme::text_dim()),
     ]));
 
+    // The last minute of that power reading, so the figure above reads as part of a trend rather
+    // than an instant - nothing at all until there is real history to draw (see `power_sparkline`).
+    // Only the most recent `SIDEBAR_SPARKLINE_CELLS` samples: the sidebar is 32 columns wide and a
+    // spark wider than its own panel would be clipped mid-series with no sign it had been.
+    let samples = evse.power_history.samples();
+    if !samples.is_empty() {
+        let recent = &samples[samples.len().saturating_sub(SIDEBAR_SPARKLINE_CELLS)..];
+        lines.push(Line::from(vec![
+            Span::styled(power_sparkline(recent), theme::accent()),
+            Span::styled(
+                format!(
+                    "  {}s",
+                    (PowerHistory::SAMPLE_INTERVAL * recent.len() as u32).as_secs()
+                ),
+                theme::text_dim(),
+            ),
+        ]));
+    }
+
     lines
 }
 
@@ -858,6 +882,45 @@ fn capability_line(labels: &[&'static str], width: usize) -> Line<'static> {
     }
 
     Line::styled(joined(shown), theme::text_dim())
+}
+
+/// A text sparkline over `samples`, one cell per sample, scaled to the largest magnitude present -
+/// the presentation half of `core`'s [`PowerHistory`], which owns the data (`docs/tui-roadmap.md`'s
+/// settled decision 2).
+///
+/// Empty when there is nothing to plot, so a charger with no history yet draws no line rather than a
+/// flat one it would be easy to read as "measured zero for a minute".
+///
+/// **Magnitude only, and deliberately.** A discharging EVSE's samples are negative (H14), and eight
+/// block glyphs cannot show a signed series against a baseline without inventing a second row. The
+/// sign is not lost, though: the sidebar states the direction on its own row and prints the signed
+/// `kW` figure right below this line - so what the spark adds is the shape of the last minute, which
+/// is the thing no single reading can show.
+fn power_sparkline(samples: &[f64]) -> String {
+    const CELLS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    let peak = samples
+        .iter()
+        .fold(0.0f64, |peak, sample| peak.max(sample.abs()));
+    if samples.is_empty() {
+        return String::new();
+    }
+    if peak == 0.0 {
+        // Idle for the whole window is a real reading, and the flattest glyph is the honest one for
+        // it - unlike an *absent* history, which draws nothing at all.
+        return CELLS[0].to_string().repeat(samples.len());
+    }
+
+    samples
+        .iter()
+        .map(|sample| {
+            let fraction = (sample.abs() / peak).clamp(0.0, 1.0);
+            // `ceil` so any non-zero reading gets at least the lowest visible cell: a connector
+            // drawing a trickle must not render identically to one drawing nothing.
+            let cell = ((fraction * CELLS.len() as f64).ceil() as usize).clamp(1, CELLS.len());
+            CELLS[cell - 1]
+        })
+        .collect()
 }
 
 /// A 10-cell progress bar for an in-flight transfer, the same vocabulary [`soc_bar`] uses so a
@@ -1544,6 +1607,93 @@ mod tests {
         );
     }
 
+    // --- the power sparkline (settled decision 2) ------------------------------------------
+
+    #[test]
+    fn no_history_draws_no_sparkline_at_all() {
+        assert_eq!(power_sparkline(&[]), "");
+    }
+
+    /// An EVSE that really was idle for the window is a different thing from one with no history:
+    /// the first is a measurement, the second is an absence.
+    #[test]
+    fn an_idle_window_draws_the_flattest_line_rather_than_nothing() {
+        assert_eq!(power_sparkline(&[0.0, 0.0, 0.0]), "▁▁▁");
+    }
+
+    #[test]
+    fn a_sparkline_scales_to_the_largest_magnitude_it_holds() {
+        assert_eq!(power_sparkline(&[0.0, 3.7, 7.4]), "▁▄█");
+        // Scaled to its own peak, so the same shape at a tenth the power reads the same - a
+        // sparkline is about the trend; the kW figure beside it carries the absolute value.
+        assert_eq!(power_sparkline(&[0.0, 0.37, 0.74]), "▁▄█");
+    }
+
+    /// A trickle must not render identically to nothing at all, which is what a flooring
+    /// implementation would do to it.
+    #[test]
+    fn any_non_zero_reading_gets_at_least_the_lowest_visible_cell() {
+        let spark = power_sparkline(&[0.001, 7.4]);
+        assert_eq!(spark.chars().next(), Some('▁'));
+        assert_ne!(spark.chars().next(), Some(' '));
+    }
+
+    /// H14: exported power is negative, and magnitude is what the spark plots - see
+    /// [`power_sparkline`] for why, and where the direction is stated instead.
+    #[test]
+    fn exporting_and_importing_the_same_power_draw_the_same_shape() {
+        assert_eq!(power_sparkline(&[-7.4, -3.7]), power_sparkline(&[7.4, 3.7]));
+    }
+
+    #[test]
+    fn the_sidebar_shows_the_window_it_is_plotting_and_only_once_there_is_history() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Charging]);
+        let connector = connector_with_hardware(true, true, None, false, 0);
+
+        let without_history = lines_text(&sidebar_lines(&evse, &connector));
+        // The SoC bar uses `█`/`░` of its own, so the anchor here is the spark's window label - the
+        // one thing only the spark row carries.
+        assert!(!without_history.contains("  5s"), "{without_history}");
+        assert!(!without_history.contains('▁'), "{without_history}");
+
+        evse.metrics.power_kw = 7.4;
+        for _ in 0..5 {
+            evse.tick(PowerHistory::SAMPLE_INTERVAL);
+        }
+
+        let with_history = lines_text(&sidebar_lines(&evse, &connector));
+        assert!(with_history.contains("█████  5s"), "{with_history}");
+    }
+
+    /// The sidebar is 32 columns wide, so the spark is capped rather than clipped - a series cut off
+    /// with no indication would misreport how long the window is.
+    #[test]
+    fn the_sidebar_sparkline_never_outgrows_the_panel() {
+        let mut evse = evse_with_statuses(&[ConnectorStatus::Charging]);
+        evse.metrics.power_kw = 7.4;
+        for _ in 0..PowerHistory::CAPACITY {
+            evse.tick(PowerHistory::SAMPLE_INTERVAL);
+        }
+        let connector = connector_with_hardware(true, true, None, false, 0);
+
+        let text = lines_text(&sidebar_lines(&evse, &connector));
+        // The last such line, not the first: the SoC bar above uses the same full block.
+        let spark_line = text
+            .lines()
+            .rfind(|line| line.contains('█'))
+            .expect("a full window draws a spark");
+
+        assert!(
+            spark_line.chars().count() <= SIDEBAR_WIDTH as usize,
+            "{} columns in a {SIDEBAR_WIDTH}-column sidebar: {spark_line}",
+            spark_line.chars().count()
+        );
+        assert!(
+            spark_line.ends_with(&format!("{SIDEBAR_SPARKLINE_CELLS}s")),
+            "the label has to say the window actually shown: {spark_line}"
+        );
+    }
+
     // --- the declared-capabilities strip (H4) ----------------------------------------------
 
     fn config_with(declare: impl FnOnce(&mut CapabilitiesConfig)) -> ChargerConfig {
@@ -1888,6 +2038,7 @@ mod tests {
                 })
                 .collect(),
             metrics: Default::default(),
+            power_history: Default::default(),
         }
     }
 

@@ -1,13 +1,14 @@
+use crate::actions::{HardwareAction, PaletteEntry};
 use crate::logs::{LogBuffer, LogEntry};
 use crate::screen::Screen;
 use crate::text_field::TextField;
 use charge_point_simulator_core::charger::{
     ChargePointEvent, ChargePointState, ChargerConfig, ChargerEntry, ChargerHardware, ChargerState,
     Command, CommandParameter, ConnectionProfile, ConnectionStore, ConnectorHardwareSnapshot,
-    ConnectorStatus, FakeFileTransfer, FakeFirmwareInstaller, FakeFirmwareVerifier,
-    FileCertificateStore, FileStorage, FirmwareInstallStage, InFlightTransfer, OcppVersion,
-    RunningCharger, SecurityProfile, SimulationMode, TransferProfile, apply_hardware_snapshot,
-    apply_ocpp_state, build_ocpp_event_for_connector, connect_charger, start_local_charger,
+    FakeFileTransfer, FakeFirmwareInstaller, FakeFirmwareVerifier, FileCertificateStore,
+    FileStorage, FirmwareInstallStage, InFlightTransfer, OcppVersion, RunningCharger,
+    SecurityProfile, SimulationMode, TransferProfile, apply_hardware_snapshot, apply_ocpp_state,
+    build_ocpp_event_for_connector, connect_charger, start_local_charger,
 };
 use color_eyre::Result;
 use crossterm::event::{
@@ -336,6 +337,14 @@ const SIMULATED_FIRMWARE_DOWNLOAD: TransferProfile = TransferProfile {
 /// The diagnostics bundle a simulated log upload claims to send - smaller and quicker than a
 /// firmware image, as a real log archive is. Independently configured because a CSMS developer needs
 /// to watch an upload and a download at once, which is exactly what `FakeFileTransfer` supports.
+/// The stand-in log archive a locally-driven diagnostics upload sends. `FakeFileTransfer` never
+/// moves real bytes and reports `SIMULATED_LOG_UPLOAD.total_bytes` as the size regardless, so this
+/// exists to be *something* honest for `FakeFileTransfer::last_upload` to hold rather than to be a
+/// realistic archive - a fabricated one would invite reading it as real diagnostics.
+fn simulated_diagnostics_log() -> Vec<u8> {
+    b"flowion-charge-point-simulator: simulated diagnostics archive\n".to_vec()
+}
+
 const SIMULATED_LOG_UPLOAD: TransferProfile = TransferProfile {
     duration: Duration::from_secs(10),
     total_bytes: 2 * 1024 * 1024,
@@ -405,15 +414,71 @@ fn charger_hardware(config: &ChargerConfig) -> ChargerHardware {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardwareControl {
     /// Put one connector into export (V2G discharge), or back to import. Addressed positionally -
-    /// indices into `ChargerState::evses`/`EvseState::connectors` - exactly as
+    /// indices into `ChargerState::evses`/`EvseState::connectors`, exactly as
     /// `RunningCharger::set_discharging` addresses it.
     SetDischarging {
         evse: usize,
         connector: usize,
         discharging: bool,
     },
+    /// Fetch a firmware image and install it, with no CSMS campaign behind either half - see
+    /// [`SIMULATED_FIRMWARE_URL`] and `FakeFirmwareInstaller::run_install`. The download is run
+    /// first because that is the order a real campaign runs it in, and because it is what makes the
+    /// campaign strip show a download before an install.
+    InstallFirmware,
+    /// Render a diagnostics log archive and upload it, likewise with no CSMS behind it.
+    UploadDiagnostics,
+    /// Arm the installer to fail. Not undoable - see [`crate::actions::HardwareAction::description`].
+    FailFirmwareInstall,
+    /// Arm the download half of the file transfer to fail.
+    FailFirmwareDownload,
+    /// Arm the upload half to fail, independently of the download.
+    FailDiagnosticsUpload,
 }
 
+/// Where a locally-driven firmware image is fetched from, and where a locally-driven log archive is
+/// sent. Both are `.invalid` (RFC 2606's reserved TLD, guaranteed never to resolve) and never
+/// dialed: `FakeFileTransfer` moves no real bytes, and a URL that looked real would invite someone
+/// to check whether it was.
+const SIMULATED_FIRMWARE_URL: &str = "https://firmware.invalid/flowion-simulator.bin";
+const SIMULATED_DIAGNOSTICS_URL: &str = "https://diagnostics.invalid/upload";
+
+/// The line a dispatched [`HardwareControl`] gets in the log pane and the status bar. Written from
+/// the control rather than the action so it can name the connector a discharge toggle resolved to,
+/// which is the part a reader needs to check.
+fn hardware_control_log_line(control: HardwareControl, charger: &ChargerState) -> String {
+    match control {
+        HardwareControl::SetDischarging {
+            evse,
+            connector,
+            discharging,
+        } => {
+            let evse_id = charger.evses.get(evse).map(|evse| evse.id);
+            let connector_id = charger
+                .evses
+                .get(evse)
+                .and_then(|evse| evse.connectors.get(connector))
+                .map(|connector| connector.id);
+            let target = match (evse_id, connector_id) {
+                (Some(evse_id), Some(connector_id)) => {
+                    format!("EVSE {evse_id} connector {connector_id}")
+                }
+                _ => "connector".to_string(),
+            };
+            let direction = if discharging {
+                "exporting (V2G)"
+            } else {
+                "importing"
+            };
+            format!("{target}: {direction}")
+        }
+        HardwareControl::InstallFirmware => "firmware update started (no CSMS)".to_string(),
+        HardwareControl::UploadDiagnostics => "diagnostics upload started (no CSMS)".to_string(),
+        HardwareControl::FailFirmwareInstall => "firmware installs will now fail".to_string(),
+        HardwareControl::FailFirmwareDownload => "firmware downloads will now fail".to_string(),
+        HardwareControl::FailDiagnosticsUpload => "diagnostics uploads will now fail".to_string(),
+    }
+}
 /// Runs a [`RunningCharger`] to completion: publishes a [`ChargerSnapshot`] to `snapshot_sender`
 /// whenever anything observable moves, applies every dispatched command from `event_receiver`, and
 /// calls `RunningCharger::tick` for every simulated `elapsed` forwarded on `tick_receiver` - the
@@ -492,6 +557,65 @@ async fn drive_running_charger(
                     if let Err(error) = running.set_discharging(evse, connector, discharging) {
                         tracing::warn!(%error, "hardware control addressed a connector that does not exist");
                         continue;
+                    }
+                }
+                // Spawned rather than awaited: a campaign takes tens of seconds of simulated time,
+                // and awaiting it here would leave every later control (a V2G toggle, an armed
+                // failure) queued behind it. The spawned task holds only `Arc` clones of the
+                // hardware, never `running` - which is not `Send` and could not cross a task
+                // boundary anyway. Progress reaches the screen through the per-tick snapshot above.
+                HardwareControl::InstallFirmware => {
+                    let (Some(transfer), Some(installer)) = (
+                        campaigns.file_transfer.clone(),
+                        campaigns.firmware_installer.clone(),
+                    ) else {
+                        tracing::warn!(
+                            "a firmware update was requested on a charger with no firmware hardware"
+                        );
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        // Download then install, the order a real campaign runs them in. A failed
+                        // download stops there: installing an image that never arrived would be a
+                        // fiction, and the armed failure exists precisely to test that path.
+                        if let Err(error) = transfer.run_download(SIMULATED_FIRMWARE_URL).await {
+                            tracing::warn!(%error, "simulated firmware download failed");
+                            return;
+                        }
+                        if let Err(error) = installer.run_install().await {
+                            tracing::warn!(%error, "simulated firmware installation failed");
+                        }
+                    });
+                }
+                HardwareControl::UploadDiagnostics => {
+                    let Some(transfer) = campaigns.file_transfer.clone() else {
+                        tracing::warn!(
+                            "a diagnostics upload was requested on a charger with no file transfer"
+                        );
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        if let Err(error) = transfer
+                            .run_upload(SIMULATED_DIAGNOSTICS_URL, simulated_diagnostics_log())
+                            .await
+                        {
+                            tracing::warn!(%error, "simulated diagnostics upload failed");
+                        }
+                    });
+                }
+                HardwareControl::FailFirmwareInstall => {
+                    if let Some(installer) = &campaigns.firmware_installer {
+                        installer.trigger_failure();
+                    }
+                }
+                HardwareControl::FailFirmwareDownload => {
+                    if let Some(transfer) = &campaigns.file_transfer {
+                        transfer.trigger_download_failure();
+                    }
+                }
+                HardwareControl::FailDiagnosticsUpload => {
+                    if let Some(transfer) = &campaigns.file_transfer {
+                        transfer.trigger_upload_failure();
                     }
                 }
             }
@@ -596,17 +720,43 @@ impl App {
     /// Results are ordered best-match first, with ties broken by the order in `Command::ALL`
     /// so a given filter always produces the same list - `sort_by_key` is stable, which is
     /// what makes that guarantee hold.
-    pub(crate) fn palette_commands(&self) -> Vec<Command> {
+    pub(crate) fn palette_commands(&self) -> Vec<PaletteEntry> {
         let filter = self.command_palette_filter.value();
-        let mut scored: Vec<(Command, u32)> = self
-            .available_commands()
+        let mut scored: Vec<(PaletteEntry, u32)> = self
+            .palette_entries()
             .into_iter()
-            .filter_map(|command| {
-                crate::fuzzy::score(command.label(), filter).map(|score| (command, score))
+            .filter_map(|entry| {
+                crate::fuzzy::score(entry.label(), filter).map(|score| (entry, score))
             })
             .collect();
         scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
-        scored.into_iter().map(|(command, _)| command).collect()
+        scored.into_iter().map(|(entry, _)| entry).collect()
+    }
+
+    /// Everything the palette could offer right now: the eligible protocol
+    /// [`commands`](Self::available_commands), then the eligible [`HardwareAction`]s (see
+    /// [`crate::actions`] for why those are a separate kind of thing). Both are filtered by their
+    /// own availability rules, so an action a charger hasn't declared is never listed - not listed
+    /// and greyed out, simply absent, the same treatment an ineligible command already gets.
+    pub(crate) fn palette_entries(&self) -> Vec<PaletteEntry> {
+        let Some(state) = &self.charger_state else {
+            return Vec::new();
+        };
+        let connector = state
+            .evses
+            .get(self.focused.evse)
+            .and_then(|evse| evse.connectors.get(self.focused.connector));
+
+        self.available_commands()
+            .into_iter()
+            .map(PaletteEntry::Command)
+            .chain(
+                HardwareAction::ALL
+                    .into_iter()
+                    .filter(|action| action.is_available(state, connector, &self.campaigns))
+                    .map(PaletteEntry::Hardware),
+            )
+            .collect()
     }
 
     fn handle_events(&mut self) -> Result<()> {
@@ -1034,24 +1184,13 @@ impl App {
         }
     }
 
-    /// Flips the focused connector between exporting (V2G discharge) and importing, by asking the
-    /// charger's hardware directly - [`HardwareControl::SetDischarging`], never an OCPP message,
-    /// because no OCPP message can carry a power direction (see [`HardwareControl`]).
+    /// `d`: the shortcut for [`HardwareAction::ToggleDischarge`], which is also in the palette.
     ///
-    /// Two things have to be true first, and neither is a UI nicety:
-    ///
-    /// - The charger has to **declare `supports_bidirectional_power`**. The hardware would obey
-    ///   regardless, but a charger telling a CSMS under test that it cannot export, then exporting,
-    ///   is exactly the "never advertise what isn't simulated" principle read backwards - and the
-    ///   declaration is the only thing the CSMS on the other end can see.
-    /// - The connector has to have a **vehicle plugged in** (occupied or charging). Direction with
-    ///   nothing connected is a reading no real charger produces: the meter is gated on the
-    ///   contactor, which is gated on a session, so the only thing it could show is "exporting" next
-    ///   to a flat zero.
-    ///
-    /// The current direction is read back off [`ChargerState`] - i.e. off the last snapshot the
-    /// hardware itself sent - rather than from a local flag, so the toggle can never disagree with
-    /// what the screen says.
+    /// The palette only ever lists an action that is available, so it needs no refusal path. A
+    /// keybinding does: pressed on a charger that doesn't declare bidirectional power, or with
+    /// nothing plugged in, it has to say why rather than doing nothing. Both conditions are
+    /// [`HardwareAction::is_available`]'s, asked again here only to explain which one failed - see
+    /// its doc comment for why each is a condition at all.
     fn toggle_discharging(&mut self) {
         let Some(state) = &self.charger_state else {
             return;
@@ -1063,17 +1202,11 @@ impl App {
             );
             return;
         }
-        let Some(connector) = state
+        let connector = state
             .evses
             .get(self.focused.evse)
-            .and_then(|evse| evse.connectors.get(self.focused.connector))
-        else {
-            return;
-        };
-        if !matches!(
-            connector.status,
-            ConnectorStatus::Occupied | ConnectorStatus::Charging
-        ) {
+            .and_then(|evse| evse.connectors.get(self.focused.connector));
+        if !HardwareAction::ToggleDischarge.is_available(state, connector, &self.campaigns) {
             self.set_status(
                 StatusSeverity::Error,
                 "✗ V2G needs a vehicle plugged in".to_string(),
@@ -1081,25 +1214,7 @@ impl App {
             return;
         }
 
-        let discharging = !connector.discharging;
-        let Some(sender) = &self.hardware_control_sender else {
-            return;
-        };
-        let _ = sender.send(HardwareControl::SetDischarging {
-            evse: self.focused.evse,
-            connector: self.focused.connector,
-            discharging,
-        });
-        let label = if discharging {
-            "exporting (V2G)"
-        } else {
-            "importing"
-        };
-        self.logs.push(format!(
-            "EVSE {} connector {}: {label}",
-            state.evses[self.focused.evse].id, connector.id
-        ));
-        self.set_status(StatusSeverity::Ok, format!("→ {label}"));
+        self.run_hardware_action(HardwareAction::ToggleDischarge);
     }
 
     fn handle_command_palette_key(&mut self, key_event: KeyEvent) {
@@ -1322,20 +1437,69 @@ impl App {
     /// parameter prompt for it instead; the command is actually applied once
     /// that prompt is submitted (see [`submit_parameter_prompt`](Self::submit_parameter_prompt)).
     fn dispatch_selected_command(&mut self) {
-        let commands = self.palette_commands();
-        let command = commands.get(self.command_palette_selected).copied();
+        let entries = self.palette_commands();
+        let entry = entries.get(self.command_palette_selected).copied();
         self.close_command_palette();
 
-        let Some(command) = command else {
+        match entry {
+            Some(PaletteEntry::Command(command)) => {
+                if let Some(parameter) = command.parameter() {
+                    self.open_parameter_prompt(command, parameter);
+                    return;
+                }
+                self.apply_command(command, "");
+            }
+            // No hardware action takes a parameter, so none of them can reach the prompt path: an
+            // install duration or a transfer size is the *charger's* configuration (see
+            // `charger_hardware`'s constants), not something to ask for per invocation.
+            Some(PaletteEntry::Hardware(action)) => self.run_hardware_action(action),
+            None => {}
+        }
+    }
+
+    /// Sends `action` to the running charger's hardware and reports it, the same way
+    /// [`Self::apply_command`] reports a dispatched command - `→`, because what happened is that the
+    /// hardware was asked, and the dashboard learns the result from the snapshot that follows.
+    ///
+    /// Availability was already decided by [`HardwareAction::is_available`] when the palette listed
+    /// this, so the checks here are the last-line kind: no charger, no channel, or a focus that
+    /// doesn't resolve to a connector.
+    fn run_hardware_action(&mut self, action: HardwareAction) {
+        let Some(state) = &self.charger_state else {
             return;
         };
+        let control = match action {
+            HardwareAction::ToggleDischarge => {
+                let Some(connector) = state
+                    .evses
+                    .get(self.focused.evse)
+                    .and_then(|evse| evse.connectors.get(self.focused.connector))
+                else {
+                    return;
+                };
+                HardwareControl::SetDischarging {
+                    evse: self.focused.evse,
+                    connector: self.focused.connector,
+                    // Read off the last snapshot, never a local flag, so the toggle cannot disagree
+                    // with what the sidebar says the hardware is doing.
+                    discharging: !connector.discharging,
+                }
+            }
+            HardwareAction::InstallFirmware => HardwareControl::InstallFirmware,
+            HardwareAction::UploadDiagnostics => HardwareControl::UploadDiagnostics,
+            HardwareAction::FailFirmwareInstall => HardwareControl::FailFirmwareInstall,
+            HardwareAction::FailFirmwareDownload => HardwareControl::FailFirmwareDownload,
+            HardwareAction::FailDiagnosticsUpload => HardwareControl::FailDiagnosticsUpload,
+        };
 
-        if let Some(parameter) = command.parameter() {
-            self.open_parameter_prompt(command, parameter);
+        let Some(sender) = &self.hardware_control_sender else {
             return;
-        }
+        };
+        let _ = sender.send(control);
 
-        self.apply_command(command, "");
+        let description = hardware_control_log_line(control, state);
+        self.logs.push(description.clone());
+        self.set_status(StatusSeverity::Ok, format!("→ {description}"));
     }
 
     /// Opens the prompt for `command`, prefilled with the last value accepted for the same
@@ -1381,14 +1545,24 @@ impl App {
 
     /// Dispatches `command` against the focused connector (see [`FocusedConnector`]) - never
     /// merely "the focused EVSE's first eligible connector," so a command run from the palette
-    /// always acts on the connector actually shown as focused on screen. Once connected to a
-    /// real CSMS (OCPP 2.1), this sends the matching `ChargePointEvent` to the live connection
-    /// instead of mutating local state directly - the dashboard picks up the effect once the
-    /// runtime reports it back via [`Self::drain_charger_snapshots`].
+    /// always acts on the connector actually shown as focused on screen.
     ///
-    /// Display commands are the exception: `ocpp-charge-point` doesn't implement the
-    /// DisplayMessage functional block yet, so `SetDisplayMessage`/`ClearDisplayMessage`
-    /// always apply locally, live CSMS connection or not.
+    /// **Always by sending a `ChargePointEvent` to the charger's own state machine**, never by
+    /// mutating `ChargerState`: the dashboard picks up the effect when the runtime reports it back
+    /// through [`Self::drain_charger_snapshots`]. That holds for a local charger as much as a
+    /// CSMS-connected one, since H3b gave both a real `ChargePointRuntime` - `charger.rs`'s coarse
+    /// `Command::apply_to` is no longer on any path the TUI takes. It used to be the fallback here
+    /// whenever `live_ocpp_state` was still `None`, which made the first frame or two after
+    /// selecting a charger quietly dishonest: the mutation looked like it worked and was then
+    /// reverted by the first snapshot to arrive. That window now reports "not ready yet" instead.
+    ///
+    /// Display commands are the exception, and the only state the TUI still writes itself:
+    /// `ChargerState::display_message` has no projection behind it, because `ChargerHardware`'s
+    /// `FakeDisplay` is moved into the builder's registration and no handle survives for a snapshot
+    /// to read (`FakeDisplay` isn't `Clone` the way `FakeChargePoint` is) - the same handle problem
+    /// H7 had, still open for the display. So `SetDisplayMessage`/`ClearDisplayMessage` apply
+    /// locally, live CSMS connection or not, and a message a *CSMS* sets lands on the hardware where
+    /// the dashboard cannot see it.
     fn apply_command(&mut self, command: Command, input: &str) {
         if command.is_display_command() {
             if let Some(state) = &mut self.charger_state
@@ -1400,38 +1574,42 @@ impl App {
             return;
         }
 
-        if let (Some(ocpp_state), Some(sender)) = (&self.live_ocpp_state, &self.ocpp_event_sender) {
-            match build_ocpp_event_for_connector(
-                ocpp_state,
-                self.focused.evse,
-                self.focused.connector,
-                command,
-                input,
-            ) {
-                Some(event) => {
-                    let _ = sender.send(event);
-                    self.logs.push(format!("{} sent to CSMS", command.label()));
-                    self.set_status(StatusSeverity::Ok, format!("→ {}", command.label()));
-                }
-                None => {
-                    self.set_status(
-                        StatusSeverity::Error,
-                        format!("✗ {} not ready yet", command.label()),
-                    );
-                }
-            }
+        let Some(sender) = &self.ocpp_event_sender else {
+            // No charger thread is running at all, so there is nothing to dispatch against.
             return;
-        }
+        };
+        let Some(ocpp_state) = &self.live_ocpp_state else {
+            // A thread exists but hasn't published its first snapshot yet - a window of a frame or
+            // two after selecting a charger. This used to fall back to `Command::apply_to`,
+            // mutating `ChargerState` directly, which *looked* like it worked and was then silently
+            // reverted by the first snapshot to arrive (`apply_ocpp_state` overwrites every
+            // connector's status from the real protocol state). Saying "not ready yet" is the
+            // honest answer, and the same one an ineligible connector already gets.
+            self.set_status(
+                StatusSeverity::Error,
+                format!("✗ {} not ready yet", command.label()),
+            );
+            return;
+        };
 
-        let Some(state) = &mut self.charger_state else {
-            return;
-        };
-        let Some(evse) = state.evses.get_mut(self.focused.evse) else {
-            return;
-        };
-        if let Some(log_line) = command.apply_to(evse, self.focused.connector, input) {
-            self.logs.push(log_line);
-            self.set_status(StatusSeverity::Ok, format!("✓ {}", command.label()));
+        match build_ocpp_event_for_connector(
+            ocpp_state,
+            self.focused.evse,
+            self.focused.connector,
+            command,
+            input,
+        ) {
+            Some(event) => {
+                let _ = sender.send(event);
+                self.logs.push(format!("{} sent to CSMS", command.label()));
+                self.set_status(StatusSeverity::Ok, format!("→ {}", command.label()));
+            }
+            None => {
+                self.set_status(
+                    StatusSeverity::Error,
+                    format!("✗ {} not ready yet", command.label()),
+                );
+            }
         }
     }
 
@@ -2387,16 +2565,18 @@ mod tests {
         assert_eq!(app.focused, FocusedConnector::default());
     }
 
+    /// Every dispatch goes to the charger's own state machine as a `ChargePointEvent`, so what this
+    /// asserts is that the event names the focused connector - a command silently acting on a
+    /// different connector than the one on screen is the bug the per-connector API exists to prevent.
     #[test]
     fn apply_command_acts_on_the_specifically_focused_connector_not_just_the_first_eligible_one() {
-        let mut app = App::new(vec![charger_with_evses(
-            "CP001",
-            vec![EvseConfig {
-                id: 1,
-                connectors: 2,
-            }],
-        )]);
+        let mut app = App::new(vec![charger_v21("CP-2.1")]);
         app.confirm_charger_selection();
+        let mut ocpp = ChargePointState::new([2]);
+        ocpp.registration = Some(RegistrationStatus::Accepted);
+        app.live_ocpp_state = Some(ocpp);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.ocpp_event_sender = Some(sender);
         app.focused = FocusedConnector {
             evse: 0,
             connector: 1,
@@ -2404,11 +2584,46 @@ mod tests {
 
         app.apply_command(Command::PlugInVehicle, "MY-EV-2");
 
-        let state = app.charger_state.unwrap();
-        assert_eq!(state.evses[0].connectors[0].vehicle, None);
         assert_eq!(
-            state.evses[0].connectors[1].vehicle.as_ref().unwrap().id,
-            "MY-EV-2"
+            receiver.try_recv().unwrap(),
+            ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 1,
+                    event: ConnectorEvent::CableConnected,
+                },
+            }
+        );
+    }
+
+    /// The window this covers used to be a real (if brief) lie: between selecting a charger and its
+    /// thread's first snapshot, a dispatched command mutated `ChargerState` directly, appeared to
+    /// work, and was then silently reverted by `apply_ocpp_state` the moment that snapshot landed.
+    #[test]
+    fn a_command_dispatched_before_the_first_snapshot_says_so_rather_than_faking_it() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.ocpp_event_sender = Some(sender);
+        assert!(
+            app.live_ocpp_state.is_none(),
+            "no snapshot has been drained yet"
+        );
+
+        app.apply_command(Command::PlugInVehicle, "MY-EV-1");
+
+        assert!(receiver.try_recv().is_err(), "nothing to dispatch against");
+        assert_eq!(
+            status(&app),
+            Some((
+                StatusSeverity::Error,
+                "✗ Plug in vehicle not ready yet".to_string()
+            ))
+        );
+        assert_eq!(
+            app.charger_state.as_ref().unwrap().evses[0].connectors[0].vehicle,
+            None,
+            "and nothing was mutated locally to be reverted a frame later"
         );
     }
 
@@ -2595,24 +2810,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn submitting_the_parameter_prompt_applies_the_command_with_the_given_input() {
+    /// A dashboard whose charger has already published a snapshot, with the event channel stubbed so
+    /// dispatch can be observed: the shape every command dispatch takes in the running app, since
+    /// `apply_command` sends a `ChargePointEvent` and never touches `ChargerState` itself.
+    ///
+    /// `connector` is the OCPP state the connector is in, which decides both which commands are
+    /// offered and which event each maps to.
+    fn dispatchable_app(
+        connector: OcppConnectorState,
+    ) -> (App, UnboundedReceiver<ChargePointEvent>) {
         let mut app = App::new(vec![charger("CP001")]);
         app.confirm_charger_selection();
-        app.handle_key_event(key(KeyCode::Char('c')));
-        app.handle_key_event(key(KeyCode::Enter)); // opens the "Vehicle ID" prompt
+        // One snapshot drained, so `ChargerState` (which decides what the palette offers) and
+        // `live_ocpp_state` (which decides what each command maps to) agree - exactly what the
+        // running app's first frame does, and what makes the two halves consistent here.
+        let (snapshot_sender, snapshot_receiver) = mpsc::unbounded_channel();
+        app.charger_snapshot_receiver = Some(snapshot_receiver);
+        snapshot_sender
+            .send(ChargerSnapshot {
+                ocpp: ocpp_state_with(connector),
+                hardware: vec![vec![ConnectorHardwareSnapshot::default()]],
+                campaigns: CampaignProgress::default(),
+            })
+            .expect("the receiver is alive");
+        app.drain_charger_snapshots();
 
-        for c in "MY-EV-1".chars() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        app.ocpp_event_sender = Some(sender);
+        (app, receiver)
+    }
+
+    #[test]
+    fn submitting_the_parameter_prompt_applies_the_command_with_the_given_input() {
+        // `Locked` rather than `Available`, so the command offered is "Present RFID card" - whose
+        // parameter (the tag) actually reaches the dispatched event, which is what "with the given
+        // input" is about.
+        let (mut app, mut receiver) = dispatchable_app(OcppConnectorState::Locked);
+        app.handle_key_event(key(KeyCode::Char('c')));
+        app.handle_key_event(key(KeyCode::Enter)); // opens the "RFID tag" prompt
+
+        for c in "TAG-42".chars() {
             app.handle_key_event(key(KeyCode::Char(c)));
         }
         app.handle_key_event(key(KeyCode::Enter));
 
         assert!(app.parameter_prompt.is_none());
-        let state = app.charger_state.unwrap();
-        assert_eq!(
-            state.evses[0].connectors[0].vehicle.as_ref().unwrap().id,
-            "MY-EV-1"
-        );
+        let sent = receiver.try_recv().unwrap();
+        let ChargePointEvent::Evse {
+            event:
+                EvseEvent::Connector {
+                    event: ConnectorEvent::IdTokenPresented(token),
+                    ..
+                },
+            ..
+        } = sent
+        else {
+            panic!("expected an IdTokenPresented event, got {sent:?}");
+        };
+        assert_eq!(token.value, "TAG-42");
     }
 
     #[test]
@@ -2653,38 +2908,64 @@ mod tests {
 
     #[test]
     fn enter_dispatches_the_selected_command_and_closes_the_palette() {
-        let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        let (mut app, mut receiver) = dispatchable_app(OcppConnectorState::Available);
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter)); // opens the "Vehicle ID" parameter prompt
         app.handle_key_event(key(KeyCode::Char('E')));
-        app.handle_key_event(key(KeyCode::Enter)); // submits it, applying the command
+        app.handle_key_event(key(KeyCode::Enter)); // submits it, dispatching the command
 
         assert!(!app.command_palette_open);
         assert!(app.parameter_prompt.is_none());
-        let state = app.charger_state.unwrap();
         assert_eq!(
-            state.evses[0].connectors[0].status,
-            charge_point_simulator_core::charger::ConnectorStatus::Occupied
+            receiver.try_recv().unwrap(),
+            ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::CableConnected,
+                },
+            }
         );
-        assert!(state.evses[0].connectors[0].vehicle.is_some());
         assert!(
             log_messages(&app.logs)
                 .iter()
-                .any(|l| l.contains("plugged in"))
+                .any(|l| l.contains("Plug in vehicle sent to CSMS"))
         );
     }
 
+    /// Availability follows the charger's *reported* state, not the dispatch: what changes the list
+    /// is the snapshot that comes back once the connector has actually moved.
     #[test]
-    fn dispatching_a_command_updates_the_available_commands_for_the_next_open() {
-        let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+    fn available_commands_follow_the_snapshot_the_charger_sends_back_after_a_dispatch() {
+        let (mut app, mut receiver) = dispatchable_app(OcppConnectorState::Available);
         app.handle_key_event(key(KeyCode::Char('c')));
         app.handle_key_event(key(KeyCode::Enter)); // opens the parameter prompt
         app.handle_key_event(key(KeyCode::Char('E')));
         app.handle_key_event(key(KeyCode::Enter)); // submits it: plug in vehicle
+        assert!(receiver.try_recv().is_ok(), "the event was dispatched");
 
-        app.handle_key_event(key(KeyCode::Char('c')));
+        // Until the charger says the cable is in, the list is unchanged - the command is still
+        // offered, because as far as the charger has reported, the connector is still free.
+        assert!(
+            app.available_commands()
+                .iter()
+                .any(|command| command.label() == "Plug in vehicle")
+        );
+
+        let (snapshot_sender, snapshot_receiver) = mpsc::unbounded_channel();
+        app.charger_snapshot_receiver = Some(snapshot_receiver);
+        snapshot_sender
+            .send(ChargerSnapshot {
+                ocpp: ocpp_state_with(OcppConnectorState::Locked),
+                hardware: vec![vec![ConnectorHardwareSnapshot {
+                    locked: true,
+                    ..Default::default()
+                }]],
+                campaigns: CampaignProgress::default(),
+            })
+            .unwrap();
+        app.drain_charger_snapshots();
+
         let labels: Vec<&str> = app.available_commands().iter().map(|c| c.label()).collect();
         assert!(labels.contains(&"Present RFID card"));
         assert!(labels.contains(&"Unplug vehicle"));
@@ -2693,8 +2974,7 @@ mod tests {
 
     #[test]
     fn dispatching_a_command_shows_a_confirmation_status_message() {
-        let mut app = App::new(vec![charger("CP001")]);
-        app.confirm_charger_selection();
+        let (mut app, _receiver) = dispatchable_app(OcppConnectorState::Available);
         assert_eq!(status(&app), None);
 
         app.handle_key_event(key(KeyCode::Char('c')));
@@ -2702,9 +2982,11 @@ mod tests {
         app.handle_key_event(key(KeyCode::Char('E')));
         app.handle_key_event(key(KeyCode::Enter)); // submits it
 
+        // `→`, not `✓`: the command was handed to the charger, which is a different claim from
+        // "it happened" - the connector moves when the charger says it did.
         assert_eq!(
             status(&app),
-            Some((StatusSeverity::Ok, "✓ Plug in vehicle".to_string()))
+            Some((StatusSeverity::Ok, "→ Plug in vehicle".to_string()))
         );
     }
 
@@ -3884,9 +4166,13 @@ mod tests {
                 discharging: true,
             }
         );
+        // The message names the connector it resolved to, so a misdirected toggle is visible.
         assert_eq!(
             status(&app),
-            Some((StatusSeverity::Ok, "→ exporting (V2G)".to_string()))
+            Some((
+                StatusSeverity::Ok,
+                "→ EVSE 1 connector 1: exporting (V2G)".to_string()
+            ))
         );
     }
 
@@ -4021,6 +4307,213 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    // --- local firmware and diagnostics campaigns (H10) -----------------------------------
+
+    /// A charger declaring firmware management and diagnostics, on the dashboard, with the control
+    /// channel stubbed so what the palette dispatches can be observed.
+    fn campaign_app() -> (App, UnboundedReceiver<HardwareControl>) {
+        let mut entry = charger("CP-FW");
+        entry.config.capabilities.firmware_management = true;
+        entry.config.capabilities.diagnostics = true;
+        let mut app = App::new(vec![entry]);
+        app.confirm_charger_selection();
+        // What `CampaignHandles::progress` reports for this charger's real bundle: hardware present,
+        // nothing in flight.
+        app.campaigns = CampaignProgress {
+            firmware_install: Some(FirmwareInstallStage::Idle),
+            ..Default::default()
+        };
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        app.hardware_control_sender = Some(sender);
+        (app, receiver)
+    }
+
+    fn dispatch_from_palette(app: &mut App, filter: &str) {
+        app.handle_key_event(key(KeyCode::Char('c')));
+        for c in filter.chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+        app.handle_key_event(key(KeyCode::Enter));
+    }
+
+    /// The gap this closes: in local mode `register_optional_hardware` never registers
+    /// `firmware_updates`, so before this the installer existed, was ticked, and could never be asked
+    /// to do anything.
+    #[test]
+    fn the_palette_can_start_a_firmware_update_with_no_csms_in_the_picture() {
+        let (mut app, mut receiver) = campaign_app();
+
+        dispatch_from_palette(&mut app, "install firmware");
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            HardwareControl::InstallFirmware
+        );
+        assert_eq!(
+            status(&app),
+            Some((
+                StatusSeverity::Ok,
+                "→ firmware update started (no CSMS)".to_string()
+            ))
+        );
+        assert!(
+            log_messages(&app.logs)
+                .iter()
+                .any(|line| line.contains("firmware update started"))
+        );
+    }
+
+    #[test]
+    fn the_palette_can_start_a_diagnostics_upload_and_arm_each_failure_independently() {
+        let (mut app, mut receiver) = campaign_app();
+
+        dispatch_from_palette(&mut app, "upload diagnostics");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            HardwareControl::UploadDiagnostics
+        );
+
+        dispatch_from_palette(&mut app, "fail firmware downloads");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            HardwareControl::FailFirmwareDownload
+        );
+
+        dispatch_from_palette(&mut app, "fail diagnostics uploads");
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            HardwareControl::FailDiagnosticsUpload
+        );
+    }
+
+    /// The palette lists a hardware action only where the charger declares the hardware behind it -
+    /// the same treatment an ineligible command gets, and the reason there is no greyed-out row.
+    #[test]
+    fn a_charger_declaring_nothing_gets_no_hardware_rows_in_the_palette() {
+        let mut app = App::new(vec![charger("CP001")]);
+        app.confirm_charger_selection();
+
+        let labels: Vec<&str> = app
+            .palette_entries()
+            .iter()
+            .map(|entry| entry.label())
+            .collect();
+
+        assert!(labels.contains(&"Plug in vehicle"), "{labels:?}");
+        for action in HardwareAction::ALL {
+            assert!(!labels.contains(&action.label()), "{labels:?}");
+        }
+    }
+
+    #[test]
+    fn a_declaring_charger_gets_its_hardware_rows_after_the_protocol_commands() {
+        let (app, _receiver) = campaign_app();
+
+        let labels: Vec<&str> = app
+            .palette_entries()
+            .iter()
+            .map(|entry| entry.label())
+            .collect();
+
+        assert!(labels.contains(&"Install firmware locally"), "{labels:?}");
+        assert!(labels.contains(&"Upload diagnostics locally"), "{labels:?}");
+        assert!(labels.contains(&"Fail firmware installs"), "{labels:?}");
+        // Not this one: nothing declared bidirectional power.
+        assert!(!labels.contains(&"Toggle V2G discharge"), "{labels:?}");
+        let first_hardware = labels
+            .iter()
+            .position(|label| *label == "Install firmware locally")
+            .unwrap();
+        let last_command = labels
+            .iter()
+            .position(|label| *label == "Plug in vehicle")
+            .unwrap();
+        assert!(last_command < first_hardware, "{labels:?}");
+    }
+
+    /// One installer tracks one installation, so the row disappears while a campaign is running -
+    /// asserted here through the same `campaigns` field a real snapshot writes.
+    #[test]
+    fn starting_a_second_firmware_update_is_not_offered_while_one_is_in_flight() {
+        let (mut app, _receiver) = campaign_app();
+        app.campaigns.firmware_install = Some(FirmwareInstallStage::Installing);
+
+        let labels: Vec<&str> = app
+            .palette_entries()
+            .iter()
+            .map(|entry| entry.label())
+            .collect();
+
+        assert!(!labels.contains(&"Install firmware locally"), "{labels:?}");
+        // Arming a failure still is: that is how you fail the install already running.
+        assert!(labels.contains(&"Fail firmware installs"), "{labels:?}");
+    }
+
+    /// The end-to-end proof, on a real charger thread: dispatching a local firmware update runs the
+    /// download and the install against the actual hardware in the bundle, and the campaign strip's
+    /// data comes back through the snapshot. The one test here that exercises
+    /// `drive_running_charger`'s spawned campaign task, `FakeFileTransfer::run_download` and
+    /// `FakeFirmwareInstaller::run_install` together - everything else in this section stubs the
+    /// channel.
+    ///
+    /// Simulated time is forwarded in 10s slices through the same `tick_metrics_with` the main loop
+    /// uses, so the 20s download and 30s install resolve in no wall-clock time at all. Bounded by a
+    /// deadline: a regression fails this rather than hanging it.
+    #[test]
+    fn a_locally_dispatched_firmware_update_actually_runs_on_the_real_hardware() {
+        let mut entry = charger("CP-FW-LIVE");
+        entry.config.capabilities.firmware_management = true;
+        let mut app = App::new(vec![entry]);
+        app.confirm_charger_selection();
+
+        // Wait for the charger's first snapshot, which is what tells the palette the installer
+        // exists (`Some(Idle)` rather than `None`).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.campaigns.firmware_install.is_none() {
+            app.drain_charger_snapshots();
+            assert!(Instant::now() < deadline, "no snapshot from the charger");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.campaigns.firmware_install,
+            Some(FirmwareInstallStage::Idle),
+            "the installer is there, with nothing to do yet"
+        );
+
+        dispatch_from_palette(&mut app, "install firmware");
+
+        let mut saw_download = false;
+        let mut saw_installing = false;
+        // Generous on purpose: the work itself is instant (simulated time is forwarded in 10s
+        // slices below), so this bounds only how long a *regression* is allowed to hang, and a
+        // loaded machine running the whole suite in parallel must not trip it.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.drain_charger_snapshots();
+            saw_download |= app.campaigns.firmware_download.is_some();
+            saw_installing |=
+                app.campaigns.firmware_install == Some(FirmwareInstallStage::Installing);
+            if app.campaigns.firmware_install == Some(FirmwareInstallStage::Installed) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the local firmware update never completed: download seen: {saw_download}, \
+                 installing seen: {saw_installing}, stage: {:?}",
+                app.campaigns.firmware_install
+            );
+            app.tick_metrics_with(Duration::from_secs(10), Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            saw_download,
+            "the image is fetched before it is installed, and that has to be observable"
+        );
+        assert!(saw_installing, "so does the install itself");
     }
 
     #[test]

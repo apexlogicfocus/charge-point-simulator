@@ -37,5 +37,5 @@ pub use ocpp_charge_point::state::{ChargePointEvent, ChargePointState};
 pub use running_charger::{RunningCharger, start_local_charger};
 pub use state::{
     ChargerState, ConnectionStatus, ConnectorState, ConnectorStatus, EvseMetrics, EvseState,
-    SimulationMode, Vehicle,
+    PowerHistory, SimulationMode, Vehicle,
 };

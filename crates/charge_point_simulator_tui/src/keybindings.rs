@@ -95,7 +95,7 @@ pub const SECTIONS: &[Section] = &[
             },
             Binding {
                 keys: "Ctrl+K / c",
-                description: "open command palette",
+                description: "commands + hardware actions",
             },
             Binding {
                 keys: "d",
