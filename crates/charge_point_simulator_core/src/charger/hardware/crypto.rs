@@ -1,207 +1,179 @@
-//! A [`ring`]-backed [`SoftwareCrypto`] - the crypto half [`super::keys::FileKeyStore`] was left
-//! generic over, per `docs/hardware-roadmap.md` decision 5. `ring` is already in the dependency
-//! tree transitively (via `rustls` in the websocket stack), so this adds no new supply-chain
-//! surface, and it is the most-audited pure-Rust option available. This is the one module in the
-//! crate that does real asymmetric cryptography - see [`super::keys`] and [`super::iso15118`] for
-//! why everything around it stays deliberately opaque instead.
+//! A RustCrypto-backed [`SoftwareCrypto`] - the crypto half [`super::keys::FileKeyStore`] was left
+//! generic over, per `docs/hardware-roadmap.md` decision 5. This is the *second* backend tried
+//! there: an earlier `ring`-backed one was reversed because `ring` cannot do the one operation this
+//! module exists for - see "Why `ring` was rejected" below. This is the one module in the crate that
+//! does real asymmetric cryptography - see [`super::keys`] and [`super::iso15118`] for why
+//! everything around it stays deliberately opaque instead.
 //!
 //! # What is real here
 //!
-//! [`RingCrypto::generate_key_pair`] generates an actual ECDSA keypair
-//! ([`ring::signature::EcdsaKeyPair::generate_pkcs8`], PKCS#8-encoded, backed by `ring`'s own CSPRNG
-//! via [`ring::rand::SystemRandom`]) - not a placeholder byte pattern like the test-only `FakeCrypto`
-//! in [`super::keys`]'s tests. [`RingCrypto::sign`] and the free function [`verify_signature`] are
-//! real ECDSA signing and verification over the P-256 and P-384 curves, using `ring`'s own
-//! field/curve arithmetic throughout. No primitive here is hand-implemented; everything bottoms out
-//! in a `ring` call.
+//! [`EcdsaCrypto::generate_key_pair`] generates an actual ECDSA keypair over NIST P-256 or P-384
+//! (`p256::ecdsa::SigningKey` / `p384::ecdsa::SigningKey`, via `elliptic_curve::Generate`'s
+//! `try_generate`, which draws from the OS CSPRNG through `getrandom`'s `SysRng`) - not a
+//! placeholder byte pattern like the test-only `FakeCrypto` in [`super::keys`]'s tests.
+//! [`EcdsaCrypto::sign`] and the free function [`verify_signature`] are real ECDSA signing
+//! (deterministic, RFC 6979) and verification, using RustCrypto's own field/curve arithmetic
+//! throughout - `p256`/`p384`'s `arithmetic` feature, not hand-rolled math. No primitive here is
+//! hand-implemented; everything bottoms out in an `ecdsa`/`p256`/`p384` call.
 //!
-//! # What `ring` cannot do, and what that means for this backend
+//! # Why `ring` was rejected, and why this backend does not repeat the mistake
 //!
-//! Two real limitations of `ring`'s public API shape this module. Both are documented here rather
-//! than worked around with another crate or hand-rolled math, per the roadmap's instruction to stop
-//! and report rather than substitute.
+//! `KeyStore::sign`'s contract is to sign a `digest` the *caller* already hashed - see
+//! `ocpp-charge-point`'s `certificates/csr.rs`, which computes `sha256(tbs)` before calling
+//! `KeyStore::sign`. `ring`'s `signature` module has no public API for that: `EcdsaKeyPair::sign`
+//! and `UnparsedPublicKey::verify` both take a `message` and hash it themselves as the first step of
+//! ECDSA, so a `ring` backend passing an already-hashed digest through that API hashes it a second
+//! time. The result was self-consistent (a `ring`-produced signature always verified through
+//! `ring`'s own second-hashing `verify`) and completely non-interoperable with any real CA or TLS
+//! peer, which hashes once. See `docs/hardware-roadmap.md` decision 5 for the full account.
 //!
-//! 1. **No RSA key generation.** `ring` can *sign with* an RSA key already loaded from DER/PKCS#8
-//!    ([`ring::signature::RsaKeyPair::from_der`]), but it has no public API to *generate* one - RSA
-//!    keygen is deliberately out of scope for the crate (primality search is slow and easy to get
-//!    subtly wrong, and `ring`'s maintainers have never added it). [`SignatureAlgorithm::Rsa2048Sha256`]
-//!    and [`SignatureAlgorithm::Rsa3072Sha256`] are therefore never advertised by
-//!    [`RingCrypto::supported_algorithms`], and [`RingCrypto::generate_key_pair`] fails closed with
-//!    [`RingCryptoError::UnsupportedAlgorithm`] if asked for either - exactly the mechanism
-//!    [`SoftwareCrypto::supported_algorithms`]'s own docs describe a backend using to declare a
-//!    subset, not a corner cut in this implementation.
-//! 2. **No public "sign/verify an already-hashed digest" entry point.** `ring`'s `signature` module
-//!    documents this directly: "this module does not support digesting the message to be signed
-//!    separately from the public key operation." [`ring::signature::EcdsaKeyPair::sign`] and
-//!    [`ring::signature::UnparsedPublicKey::verify`] both take a `message` and hash it themselves
-//!    (SHA-256 for P-256, SHA-384 for P-384) as the first step of ECDSA; the private `sign_digest`/
-//!    `verify_digest` entry points that would skip that internal hash exist inside `ring` but are
-//!    not `pub`. [`KeyStore::sign`](ocpp_charge_point::hardware::KeyStore::sign)'s contract, however,
-//!    is to sign a `digest` the *caller* already hashed (see `ocpp-charge-point`'s
-//!    `certificates/csr.rs`, which computes `sha256(tbs)` before calling `KeyStore::sign`). Passing
-//!    that already-hashed digest through `ring`'s message-signing API therefore hashes it a second
-//!    time: the signature this module produces is over `SHA-256(digest)`, not `digest` directly.
+//! This backend uses `signature::hazmat::PrehashSigner::sign_prehash` and
+//! `signature::hazmat::PrehashVerifier::verify_prehash` instead - the operation `KeyStore::sign`'s
+//! contract actually models, and precisely the entry point `ring` does not expose.
+//! `sign_prehash`/`verify_prehash` sign and verify exactly the bytes handed to them; nothing
+//! in this module's `sign`/[`verify_signature`] hashes the digest again before calling them. The
+//! module tests include `signing_signs_the_exact_digest_handed_in_not_a_second_hash_of_it`, which
+//! signs a known digest and verifies it through an independently constructed `p256` verifying key
+//! and signature (not this module's own [`verify_signature`]) - proving the property directly rather
+//! than relying on this module's own sign and verify agreeing with each other, which is exactly the
+//! symmetry that hid the `ring` bug in the first place.
 //!
-//!    This module's own [`RingCrypto::sign`] and [`verify_signature`] apply that second hash
-//!    identically on both sides, so **signing and verifying through this module are internally
-//!    consistent**: a signature this module produces always verifies through this module's own
-//!    `verify_signature`, and fails closed against a different key or tampered input exactly as a
-//!    correct ECDSA implementation must. What this module cannot promise is *external
-//!    interoperability*: a signature produced here will not verify against an independent ECDSA
-//!    implementation (a real CA checking a CSR, a
-//!    peer TLS stack checking a client certificate signature during a live mutual-TLS handshake)
-//!    that hashes the original message exactly once, because that peer never sees - and has no way
-//!    to reproduce - this module's extra hash step. This is a genuine gap in `ring`'s public surface,
-//!    not a design choice made here; wiring [`super::keys::FileKeyStore<RingCrypto>`] into anything
-//!    that needs byte-for-byte interoperability with a real external verifier (mutual TLS being the
-//!    concrete case in `ocpp-charge-point`'s own `mutual_tls.rs`) is out of scope for this task
-//!    (registration is a separate follow-up) and should not be done without resolving this first -
-//!    either an upstream `ring` change exposing digest-only signing, or a different way to supply
-//!    the digest.
+//! # What this backend cannot do
+//!
+//! **No RSA.** [`SignatureAlgorithm::Rsa2048Sha256`] and [`SignatureAlgorithm::Rsa3072Sha256`] are
+//! never advertised by [`EcdsaCrypto::supported_algorithms`], and [`EcdsaCrypto::generate_key_pair`]
+//! fails closed with [`EcdsaCryptoError::UnsupportedAlgorithm`] if asked for either. This mirrors the
+//! previous `ring` backend's own gap (`ring` cannot generate an RSA key either), but for a different
+//! reason: `docs/hardware-roadmap.md` decision 5 scopes this backend to the ECDSA algorithms the
+//! crate already needed. Accepted cost: two new direct dependencies, `p256` and `p384` - fewer than
+//! the roadmap's own estimate of three, because both crates re-export the `ecdsa`, `elliptic_curve`,
+//! and `signature` crates they are built on, so those don't need separate `Cargo.toml` entries.
+//! RustCrypto does have RSA support (the `rsa` crate) that could close this gap, but adding it is a
+//! separate decision this task does not make; [`EcdsaCrypto::supported_algorithms`] is how a backend
+//! is expected to declare an honest subset rather than invent support it doesn't have.
 //!
 //! # What is never logged
 //!
 //! Private key bytes never appear in a `tracing` call, a `Debug` impl, or a `Display` impl anywhere
-//! in this module. [`RingCrypto`] derives `Debug` safely because it holds nothing but
-//! [`ring::rand::SystemRandom`] (itself `Debug`, and stateless besides an OS handle) - no key
-//! material is ever held on `RingCrypto` itself, only passed through per-call exactly as
-//! [`SoftwareCrypto`]'s signature requires. [`RingCryptoError`] carries only algorithm identifiers,
+//! in this module. [`EcdsaCrypto`] derives `Debug` safely because it is a zero-sized unit type - it
+//! holds no state at all (unlike the previous `ring` backend, which held a `SystemRandom` handle;
+//! `getrandom`'s `SysRng` is a stateless interface over the OS RNG, constructed fresh per call, so
+//! there is nothing to carry on the struct). [`EcdsaCryptoError`] carries only algorithm identifiers,
 //! never key bytes, digests, or signatures.
 //!
-//! # Public key encoding
+//! # Public key and signature encoding
 //!
-//! [`PublicKey::bytes`] is `ring`'s uncompressed SEC1 point encoding (`0x04 || X || Y`), exactly what
-//! [`ring::signature::KeyPair::public_key`] returns for an ECDSA key pair - `ring`'s own choice, not
-//! this module's. Signatures are the fixed-length (PKCS#11-style) `r || s` encoding
-//! ([`ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING`] / `_P384_SHA384_FIXED_SIGNING`), chosen over
-//! the ASN.1 variant because it has no encoded-length edge cases to reason about when round-tripping
-//! in tests.
-
-use ring::rand::SystemRandom;
-use ring::signature::{
-    ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED,
-    ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm,
-    EcdsaVerificationAlgorithm, KeyPair as _, UnparsedPublicKey,
-};
+//! [`PublicKey::bytes`] is the uncompressed SEC1 point encoding (`0x04 || X || Y`, via
+//! `VerifyingKey::to_sec1_point`) - 65 bytes for P-256, 97 for P-384 - the same encoding the
+//! previous `ring` backend used, so nothing downstream of `PublicKey` had to change shape.
+//! Signatures are the fixed-length `r || s` encoding (via `ecdsa::Signature::to_bytes`) - 64 bytes
+//! for P-256, 96 for P-384 - chosen over the ASN.1/DER variant for the same reason as before: no
+//! encoded-length edge cases to reason about when round-tripping in tests.
 
 use ocpp_charge_point::hardware::{PublicKey, SignatureAlgorithm, SoftwareCrypto};
 
-/// A [`SoftwareCrypto`] backend over `ring`'s ECDSA (P-256 and P-384) primitives - see the module
-/// docs for exactly what is real, what `ring` cannot do, and the digest-hashing caveat that follows
-/// from it.
-#[derive(Debug)]
-pub struct RingCrypto {
-    rng: SystemRandom,
-}
+use p256::ecdsa::signature::hazmat::{PrehashSigner as _, PrehashVerifier as _};
+use p256::ecdsa::{
+    Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
+};
+use p256::elliptic_curve::Generate as _;
 
-impl RingCrypto {
-    /// A backend drawing randomness from the OS CSPRNG via [`ring::rand::SystemRandom`].
+use p384::ecdsa::{
+    Signature as P384Signature, SigningKey as P384SigningKey, VerifyingKey as P384VerifyingKey,
+};
+
+/// A [`SoftwareCrypto`] backend over RustCrypto's ECDSA (P-256 and P-384) primitives - see the
+/// module docs for exactly what is real, why it replaces the earlier `ring` backend, and the
+/// encoding choices it makes.
+///
+/// Holds no state: `getrandom`'s `SysRng` (used for key generation) is a stateless interface over
+/// the OS RNG, constructed fresh in [`Self::generate_key_pair`] rather than carried on this type.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EcdsaCrypto;
+
+impl EcdsaCrypto {
+    /// A backend drawing randomness from the OS CSPRNG for every key it generates.
     pub fn new() -> Self {
-        Self {
-            rng: SystemRandom::new(),
-        }
+        Self
     }
 }
 
-impl Default for RingCrypto {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The error type of [`RingCrypto`]'s operations, and of the free function [`verify_signature`].
+/// The error type of [`EcdsaCrypto`]'s operations, and of the free function [`verify_signature`].
 ///
 /// Carries only algorithm identifiers and a coarse outcome - never key material, digests, or
 /// signature bytes, per the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RingCryptoError {
+pub enum EcdsaCryptoError {
     /// The requested algorithm is not one this backend can generate keys for or sign/verify with -
     /// see the module docs for why RSA is never advertised.
     UnsupportedAlgorithm(SignatureAlgorithm),
-    /// `ring` failed to generate a new keypair (its CSPRNG was unavailable, or key generation could
-    /// not complete).
+    /// The OS CSPRNG failed while generating a new keypair.
     KeyGenerationFailed,
-    /// `ring` rejected key material handed back to it - a corrupt or foreign-encoded private key.
-    /// [`SoftKeyStoreError::Crypto`](ocpp_charge_point::hardware::SoftKeyStoreError::Crypto) is the
-    /// caller-visible wrapper.
+    /// The supplied private key bytes were not a valid scalar for the requested curve - a corrupt
+    /// or foreign-encoded key.
     KeyRejected,
-    /// `ring` failed to produce a signature for otherwise-valid inputs.
+    /// RustCrypto failed to produce a signature for otherwise-valid inputs.
     SigningFailed,
-    /// Signature verification failed - the signature does not match the public key and digest given.
+    /// Signature verification failed - the signature does not match the public key and digest
+    /// given, or the public key or signature bytes themselves were not validly encoded.
     /// **Fail closed**: this is also what a malformed signature, a wrong key, or tampered digest
     /// bytes produce, so a caller must never treat anything other than `Ok(())` as "verified".
     VerificationFailed,
 }
 
-impl std::fmt::Display for RingCryptoError {
+impl std::fmt::Display for EcdsaCryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedAlgorithm(algorithm) => {
                 write!(
                     f,
-                    "{algorithm:?} is not supported by the ring crypto backend"
+                    "{algorithm:?} is not supported by the RustCrypto ECDSA backend"
                 )
             }
-            Self::KeyGenerationFailed => f.write_str("ring failed to generate a keypair"),
-            Self::KeyRejected => f.write_str("ring rejected the supplied key material"),
-            Self::SigningFailed => f.write_str("ring failed to produce a signature"),
+            Self::KeyGenerationFailed => {
+                f.write_str("the OS RNG failed while generating a keypair")
+            }
+            Self::KeyRejected => f.write_str("the supplied key material was rejected"),
+            Self::SigningFailed => f.write_str("failed to produce a signature"),
             Self::VerificationFailed => f.write_str("signature verification failed"),
         }
     }
 }
 
-impl std::error::Error for RingCryptoError {}
+impl std::error::Error for EcdsaCryptoError {}
 
-/// Maps a [`SignatureAlgorithm`] to the `ring` signing algorithm that generates and signs with it -
-/// `Err` for anything `ring` cannot generate keys for (RSA - see the module docs).
-fn signing_algorithm(
-    algorithm: SignatureAlgorithm,
-) -> Result<&'static EcdsaSigningAlgorithm, RingCryptoError> {
-    match algorithm {
-        SignatureAlgorithm::EcdsaP256Sha256 => Ok(&ECDSA_P256_SHA256_FIXED_SIGNING),
-        SignatureAlgorithm::EcdsaP384Sha384 => Ok(&ECDSA_P384_SHA384_FIXED_SIGNING),
-        SignatureAlgorithm::Rsa2048Sha256 | SignatureAlgorithm::Rsa3072Sha256 => {
-            Err(RingCryptoError::UnsupportedAlgorithm(algorithm))
-        }
-    }
-}
-
-/// Maps a [`SignatureAlgorithm`] to the `ring` verification algorithm matching
-/// [`signing_algorithm`]'s choice for the same algorithm.
-fn verification_algorithm(
-    algorithm: SignatureAlgorithm,
-) -> Result<&'static EcdsaVerificationAlgorithm, RingCryptoError> {
-    match algorithm {
-        SignatureAlgorithm::EcdsaP256Sha256 => Ok(&ECDSA_P256_SHA256_FIXED),
-        SignatureAlgorithm::EcdsaP384Sha384 => Ok(&ECDSA_P384_SHA384_FIXED),
-        SignatureAlgorithm::Rsa2048Sha256 | SignatureAlgorithm::Rsa3072Sha256 => {
-            Err(RingCryptoError::UnsupportedAlgorithm(algorithm))
-        }
-    }
-}
-
-impl SoftwareCrypto for RingCrypto {
-    type Error = RingCryptoError;
+impl SoftwareCrypto for EcdsaCrypto {
+    type Error = EcdsaCryptoError;
 
     fn generate_key_pair(
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(Vec<u8>, PublicKey), Self::Error> {
-        let alg = signing_algorithm(algorithm)?;
-
-        // `generate_pkcs8` gives us only the encoded document; reload it to reach the public key
-        // through `ring::signature::KeyPair`, mirroring `ring`'s own Ed25519 example in
-        // `ring::signature`'s module docs.
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &self.rng)
-            .map_err(|_| RingCryptoError::KeyGenerationFailed)?;
-        let key_pair = EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &self.rng)
-            .map_err(|_| RingCryptoError::KeyRejected)?;
-
-        let public_key = PublicKey {
-            algorithm,
-            bytes: key_pair.public_key().as_ref().to_vec(),
-        };
-        Ok((pkcs8.as_ref().to_vec(), public_key))
+        match algorithm {
+            SignatureAlgorithm::EcdsaP256Sha256 => {
+                let signing_key = P256SigningKey::try_generate()
+                    .map_err(|_| EcdsaCryptoError::KeyGenerationFailed)?;
+                let verifying_key = P256VerifyingKey::from(&signing_key);
+                let public_key = PublicKey {
+                    algorithm,
+                    bytes: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
+                };
+                Ok((signing_key.to_bytes().to_vec(), public_key))
+            }
+            SignatureAlgorithm::EcdsaP384Sha384 => {
+                let signing_key = P384SigningKey::try_generate()
+                    .map_err(|_| EcdsaCryptoError::KeyGenerationFailed)?;
+                let verifying_key = P384VerifyingKey::from(&signing_key);
+                let public_key = PublicKey {
+                    algorithm,
+                    bytes: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
+                };
+                Ok((signing_key.to_bytes().to_vec(), public_key))
+            }
+            SignatureAlgorithm::Rsa2048Sha256 | SignatureAlgorithm::Rsa3072Sha256 => {
+                Err(EcdsaCryptoError::UnsupportedAlgorithm(algorithm))
+            }
+        }
     }
 
     fn sign(
@@ -210,17 +182,31 @@ impl SoftwareCrypto for RingCrypto {
         private_key: &[u8],
         digest: &[u8],
     ) -> Result<Vec<u8>, Self::Error> {
-        let alg = signing_algorithm(algorithm)?;
-        let key_pair = EcdsaKeyPair::from_pkcs8(alg, private_key, &self.rng)
-            .map_err(|_| RingCryptoError::KeyRejected)?;
-        let signature = key_pair
-            .sign(&self.rng, digest)
-            .map_err(|_| RingCryptoError::SigningFailed)?;
-        Ok(signature.as_ref().to_vec())
+        match algorithm {
+            SignatureAlgorithm::EcdsaP256Sha256 => {
+                let signing_key = P256SigningKey::from_slice(private_key)
+                    .map_err(|_| EcdsaCryptoError::KeyRejected)?;
+                let signature: P256Signature = signing_key
+                    .sign_prehash(digest)
+                    .map_err(|_| EcdsaCryptoError::SigningFailed)?;
+                Ok(signature.to_bytes().to_vec())
+            }
+            SignatureAlgorithm::EcdsaP384Sha384 => {
+                let signing_key = P384SigningKey::from_slice(private_key)
+                    .map_err(|_| EcdsaCryptoError::KeyRejected)?;
+                let signature: P384Signature = signing_key
+                    .sign_prehash(digest)
+                    .map_err(|_| EcdsaCryptoError::SigningFailed)?;
+                Ok(signature.to_bytes().to_vec())
+            }
+            SignatureAlgorithm::Rsa2048Sha256 | SignatureAlgorithm::Rsa3072Sha256 => {
+                Err(EcdsaCryptoError::UnsupportedAlgorithm(algorithm))
+            }
+        }
     }
 
     fn supported_algorithms(&self) -> &[SignatureAlgorithm] {
-        // RSA is deliberately absent - `ring` cannot generate an RSA keypair. See the module docs.
+        // RSA is deliberately absent - see the module docs.
         &[
             SignatureAlgorithm::EcdsaP256Sha256,
             SignatureAlgorithm::EcdsaP384Sha384,
@@ -235,8 +221,7 @@ impl SoftwareCrypto for RingCrypto {
 /// [`super::keys::FileKeyStore`]'s own contract needs one (a caller who generated the key already
 /// trusts it; verification is the *peer's* job on a real signature). This free function exists so
 /// this module's own signatures can be checked - by this crate's tests, and by any future caller
-/// that needs to verify a signature produced by this same backend, subject to the digest-hashing
-/// caveat in the module docs.
+/// that needs to verify a signature produced by this same backend.
 ///
 /// **Fails closed on every error path**: an unsupported algorithm, a malformed public key, a
 /// tampered digest, or a tampered signature all produce `Err`, never `Ok(())`.
@@ -245,11 +230,30 @@ pub fn verify_signature(
     public_key: &[u8],
     digest: &[u8],
     signature: &[u8],
-) -> Result<(), RingCryptoError> {
-    let alg = verification_algorithm(algorithm)?;
-    UnparsedPublicKey::new(alg, public_key)
-        .verify(digest, signature)
-        .map_err(|_| RingCryptoError::VerificationFailed)
+) -> Result<(), EcdsaCryptoError> {
+    match algorithm {
+        SignatureAlgorithm::EcdsaP256Sha256 => {
+            let verifying_key = P256VerifyingKey::from_sec1_bytes(public_key)
+                .map_err(|_| EcdsaCryptoError::VerificationFailed)?;
+            let signature = P256Signature::from_slice(signature)
+                .map_err(|_| EcdsaCryptoError::VerificationFailed)?;
+            verifying_key
+                .verify_prehash(digest, &signature)
+                .map_err(|_| EcdsaCryptoError::VerificationFailed)
+        }
+        SignatureAlgorithm::EcdsaP384Sha384 => {
+            let verifying_key = P384VerifyingKey::from_sec1_bytes(public_key)
+                .map_err(|_| EcdsaCryptoError::VerificationFailed)?;
+            let signature = P384Signature::from_slice(signature)
+                .map_err(|_| EcdsaCryptoError::VerificationFailed)?;
+            verifying_key
+                .verify_prehash(digest, &signature)
+                .map_err(|_| EcdsaCryptoError::VerificationFailed)
+        }
+        SignatureAlgorithm::Rsa2048Sha256 | SignatureAlgorithm::Rsa3072Sha256 => {
+            Err(EcdsaCryptoError::UnsupportedAlgorithm(algorithm))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,7 +264,7 @@ mod tests {
 
     #[test]
     fn a_generated_key_round_trips_through_sign_then_verify() {
-        let crypto = RingCrypto::new();
+        let crypto = EcdsaCrypto::new();
         let (private_key, public_key) = crypto
             .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
             .unwrap();
@@ -283,7 +287,7 @@ mod tests {
 
     #[test]
     fn p384_keys_also_round_trip() {
-        let crypto = RingCrypto::new();
+        let crypto = EcdsaCrypto::new();
         let (private_key, public_key) = crypto
             .generate_key_pair(SignatureAlgorithm::EcdsaP384Sha384)
             .unwrap();
@@ -304,9 +308,61 @@ mod tests {
         );
     }
 
+    /// The test the module docs point to: proves [`EcdsaCrypto::sign`] signs exactly the digest it
+    /// is given, not a second hash of it - the property that disqualified the previous `ring`
+    /// backend (see `docs/hardware-roadmap.md` decision 5).
+    ///
+    /// Verification here goes through a `p256::ecdsa::VerifyingKey` and `Signature` built directly
+    /// from RustCrypto's own types, decoded independently from `public_key.bytes` and the returned
+    /// signature bytes - deliberately *not* this module's own [`verify_signature`] - so this test
+    /// cannot pass merely because this module's own sign and verify code share a mistake. A `ring`
+    /// backend that hashed the digest again before signing would fail this: the independent
+    /// verifier checks the signature against `digest` exactly as given, and a signature produced
+    /// over `SHA-256(digest)` does not verify against `digest` itself.
+    #[test]
+    fn signing_signs_the_exact_digest_handed_in_not_a_second_hash_of_it() {
+        use sha2::{Digest as _, Sha256};
+
+        let crypto = EcdsaCrypto::new();
+        let (private_key, public_key) = crypto
+            .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
+            .unwrap();
+
+        // A digest shaped exactly like `certificates/csr.rs` hands to `KeyStore::sign`: already
+        // hashed once by the caller.
+        let digest = Sha256::digest(b"a CertificationRequestInfo the caller already SHA-256'd");
+        let signature = crypto
+            .sign(SignatureAlgorithm::EcdsaP256Sha256, &private_key, &digest)
+            .unwrap();
+
+        // Independent verifier: RustCrypto's own types, decoded from scratch, never touching this
+        // module's `verify_signature`.
+        let independent_verifying_key =
+            P256VerifyingKey::from_sec1_bytes(&public_key.bytes).unwrap();
+        let independent_signature = P256Signature::from_slice(&signature).unwrap();
+
+        assert!(
+            independent_verifying_key
+                .verify_prehash(&digest, &independent_signature)
+                .is_ok(),
+            "the signature must verify against the exact digest that was signed"
+        );
+
+        // The disqualifying `ring` behavior: had this module hashed `digest` again before signing
+        // (as the `ring` backend was forced to), the signature would verify against
+        // `SHA-256(digest)` instead - it must not.
+        let double_hashed_digest = Sha256::digest(digest);
+        assert!(
+            independent_verifying_key
+                .verify_prehash(&double_hashed_digest, &independent_signature)
+                .is_err(),
+            "a once-hashed digest's signature must not also verify against a second hash of it"
+        );
+    }
+
     #[test]
     fn verification_fails_closed_against_a_tampered_digest() {
-        let crypto = RingCrypto::new();
+        let crypto = EcdsaCrypto::new();
         let (private_key, public_key) = crypto
             .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
             .unwrap();
@@ -324,12 +380,12 @@ mod tests {
             b"tampered",
             &signature,
         );
-        assert_eq!(result, Err(RingCryptoError::VerificationFailed));
+        assert_eq!(result, Err(EcdsaCryptoError::VerificationFailed));
     }
 
     #[test]
     fn verification_fails_closed_against_the_wrong_public_key() {
-        let crypto = RingCrypto::new();
+        let crypto = EcdsaCrypto::new();
         let (private_key, _) = crypto
             .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
             .unwrap();
@@ -347,12 +403,12 @@ mod tests {
             digest,
             &signature,
         );
-        assert_eq!(result, Err(RingCryptoError::VerificationFailed));
+        assert_eq!(result, Err(EcdsaCryptoError::VerificationFailed));
     }
 
     #[test]
     fn verification_fails_closed_against_a_tampered_signature() {
-        let crypto = RingCrypto::new();
+        let crypto = EcdsaCrypto::new();
         let (private_key, public_key) = crypto
             .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
             .unwrap();
@@ -368,12 +424,12 @@ mod tests {
             digest,
             &signature,
         );
-        assert_eq!(result, Err(RingCryptoError::VerificationFailed));
+        assert_eq!(result, Err(EcdsaCryptoError::VerificationFailed));
     }
 
     #[test]
     fn rsa_algorithms_are_not_advertised_as_supported() {
-        let crypto = RingCrypto::new();
+        let crypto = EcdsaCrypto::new();
         let algorithms = crypto.supported_algorithms();
         assert!(!algorithms.contains(&SignatureAlgorithm::Rsa2048Sha256));
         assert!(!algorithms.contains(&SignatureAlgorithm::Rsa3072Sha256));
@@ -388,11 +444,11 @@ mod tests {
 
     #[test]
     fn requesting_an_rsa_key_pair_fails_closed_rather_than_inventing_one() {
-        let crypto = RingCrypto::new();
+        let crypto = EcdsaCrypto::new();
         let result = crypto.generate_key_pair(SignatureAlgorithm::Rsa2048Sha256);
         assert_eq!(
             result.unwrap_err(),
-            RingCryptoError::UnsupportedAlgorithm(SignatureAlgorithm::Rsa2048Sha256)
+            EcdsaCryptoError::UnsupportedAlgorithm(SignatureAlgorithm::Rsa2048Sha256)
         );
     }
 
@@ -401,16 +457,16 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let generated = {
-            let before = FileKeyStore::new(FileStorage::new(dir.path()), RingCrypto::new());
+            let before = FileKeyStore::new(FileStorage::new(dir.path()), EcdsaCrypto::new());
             before
                 .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
                 .await
                 .unwrap()
         };
 
-        // A fresh store and a fresh `RingCrypto` (nothing but a `SystemRandom` handle, so nothing
-        // to carry over) - as a restart would create - over the same directory on disk.
-        let after = FileKeyStore::new(FileStorage::new(dir.path()), RingCrypto::new());
+        // A fresh store and a fresh `EcdsaCrypto` (nothing but a unit type, so nothing to carry
+        // over) - as a restart would create - over the same directory on disk.
+        let after = FileKeyStore::new(FileStorage::new(dir.path()), EcdsaCrypto::new());
         let signature = after.sign(&generated.handle, b"digest").await.unwrap();
 
         assert_eq!(
@@ -427,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn exceeding_the_maximum_is_rejected_with_the_real_crypto_backend() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileKeyStore::with_limit(FileStorage::new(dir.path()), RingCrypto::new(), 1);
+        let store = FileKeyStore::with_limit(FileStorage::new(dir.path()), EcdsaCrypto::new(), 1);
 
         store
             .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
@@ -442,11 +498,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_contract_certificate_key_installs_and_signs_through_the_full_stack() {
-        // Proves the whole composition end to end: `FileKeyStore` over `RingCrypto`, generating,
+        // Proves the whole composition end to end: `FileKeyStore` over `EcdsaCrypto`, generating,
         // persisting, and signing with a real key - the shape a CSR (B4.3) or a contract-certificate
         // key would actually be used through.
         let dir = tempfile::tempdir().unwrap();
-        let store = FileKeyStore::new(FileStorage::new(dir.path()), RingCrypto::new());
+        let store = FileKeyStore::new(FileStorage::new(dir.path()), EcdsaCrypto::new());
 
         let generated = store
             .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
@@ -466,14 +522,14 @@ mod tests {
         );
     }
 
-    /// A compile-time check that `RingCrypto` satisfies the bounds
+    /// A compile-time check that `EcdsaCrypto` satisfies the bounds
     /// [`super::super::keys::FileKeyStore`] (and eventually a registration) needs -
     /// `SoftwareCrypto + Send + Sync + 'static` - mirroring every other fake's own bound-check test
     /// in this module directory.
     #[allow(dead_code)]
     fn assert_satisfies_the_key_store_bounds<T: SoftwareCrypto + Send + Sync + 'static>() {}
     #[allow(dead_code)]
-    fn ring_crypto_satisfies_the_key_store_bounds() {
-        assert_satisfies_the_key_store_bounds::<RingCrypto>();
+    fn ecdsa_crypto_satisfies_the_key_store_bounds() {
+        assert_satisfies_the_key_store_bounds::<EcdsaCrypto>();
     }
 }
