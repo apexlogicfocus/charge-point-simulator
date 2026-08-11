@@ -31,26 +31,30 @@
 //!   otherwise. The connector state machine's own transition table
 //!   (`ConnectorState::apply` in the vendored `ocpp-charge-point` source) takes
 //!   `(Available, ConnectorEvent::Reserved(_)) -> Reserved` unconditionally - it has no
-//!   `Capabilities` check of its own. The only place `capabilities.reservation` is ever
-//!   consulted in this crate is `connect.rs`'s `if capabilities.reservation { ... }` around the
-//!   `.reservation(csms)` registration - CSMS-registration-time, reachable only through
-//!   `connect_charger` against a live CSMS. `start_local_charger` never calls
-//!   `register_setup_blocks` at all (it registers only `authorization()`), so no capability of
-//!   any kind is ever consulted on the path this file can drive. What this file *can* and does
-//!   prove is that the low-level mechanism itself carries no such gate, which is exactly why the
-//!   CSMS-registration gate is where all of the enforcement necessarily lives.
-//! - **The local authorization list's rejection path (half of point 4) is NOT observable**,
-//!   for a related but distinct reason, and the test below proves the *un*-observability
-//!   directly rather than asserting around it. `start_local_charger` (H3b) registers a
-//!   `LocalAuthorizer` whose `authorize()` is `Infallible` and always returns
-//!   `Ok(AuthorizationStatus::Accepted)`. The only place `ChargePointState.local_authorization_list`
-//!   is ever read is `ocpp_charge_point::authorization::offline_decision`, called exclusively
-//!   from `plain_decision`'s `Err(_)` arm - i.e. only once `Authorizer::authorize` itself fails.
-//!   Since `LocalAuthorizer` can't fail, that arm is dead code on every local charger, list
-//!   contents included. A locally listed identifier is accepted - trivially, the same as any
-//!   identifier - and, as
-//!   [`local_auth_list_rejection_is_not_observable_in_local_mode`] demonstrates, so is one the
-//!   list explicitly rejects.
+//!   `Capabilities` check of its own. As of H3c, `start_local_charger` *does* route through the
+//!   same `register_setup_blocks` the connected path uses (against `NullCsms`, a CSMS that
+//!   answers nothing), which does conditionally register `.reservation(csms)` on
+//!   `capabilities.reservation` exactly as the connected path does - but registering
+//!   `ReserveNowHandler` against a CSMS that will never send a `ReserveNow` in the first place is
+//!   inert either way, since nothing ever dials in to trigger it locally. So this file still can't
+//!   observe the capability gate that matters - only `connect_charger` against a live (or faked)
+//!   CSMS could ever see `.reservation(csms)` not being called turn into a CSMS response of
+//!   `NotImplemented`. What this file *can* and does prove is that the low-level mechanism itself
+//!   carries no such gate, which is exactly why the CSMS-registration gate is where all of the
+//!   enforcement necessarily lives.
+//! - **The local authorization list's rejection path (half of point 4) is now observable - this
+//!   is the fix, not a limitation.** Before `docs/hardware-roadmap.md`'s H3c, `start_local_charger`
+//!   registered a `LocalAuthorizer` whose `authorize()` was `Infallible` and always returned
+//!   `Ok(AuthorizationStatus::Accepted)`; the only place `ChargePointState.local_authorization_list`
+//!   is ever read is `ocpp_charge_point::authorization::offline_decision`, called exclusively from
+//!   `plain_decision`'s `Err(_)` arm - i.e. only once `Authorizer::authorize` itself fails. Since
+//!   `LocalAuthorizer` couldn't fail, that arm was dead code on every local charger, list contents
+//!   included - see the git history of [`local_auth_list_rejection_is_observable_in_local_mode`]
+//!   for the test that used to document this as a known gap. H3c's fix: `start_local_charger` now
+//!   registers `NullCsms` as the Authorization block's `Authorizer`, and `NullCsms::authorize`
+//!   always returns `Err`, the honest answer for a charge point with nowhere to send the request.
+//!   That is exactly what makes upstream fall through to the local authorization list, and then
+//!   the (empty, for a local charger) authorization cache.
 
 use std::time::Duration as StdDuration;
 
@@ -311,25 +315,54 @@ async fn a_charger_declaring_local_auth_list_authorizes_a_locally_listed_identif
     );
 }
 
-/// H9 point 4, negative half - and the finding this test exists to surface rather than paper
-/// over: **a local charger's local authorization list can never actually reject anything.**
+/// Waits briefly for `evse_id`/`connector_id` to reach `Charging`, and asserts it never does -
+/// the connector must instead settle into, and stay in, `Locked`. A short bounded wait rather
+/// than an instant read: authorization is decided by `run_authorization_requests`, a background
+/// task decoupled from the `send` that presented the identifier (see
+/// `ocpp_charge_point::authorization`), so a wrongly-accepted decision needs a moment to land.
+/// Deliberately much shorter than [`wait_for`]'s own 5-second budget - long enough to catch a
+/// regression, short enough to keep a *passing* run of this file fast, since a passing run is
+/// exactly the case where this bound is never hit early and always waits it out.
+async fn assert_never_reaches_charging(
+    states: &mut WatchReceiver<ocpp_charge_point::state::ChargePointState>,
+    evse_id: usize,
+    connector_id: usize,
+) {
+    let reached_charging = tokio::time::timeout(
+        StdDuration::from_millis(300),
+        wait_for(states, evse_id, connector_id, OcppConnectorState::Charging),
+    )
+    .await
+    .is_ok();
+    assert!(
+        !reached_charging,
+        "a rejected identifier must never reach Charging"
+    );
+    assert_eq!(
+        states.borrow().evses[evse_id].connectors[connector_id],
+        OcppConnectorState::Locked,
+        "a rejected identifier must leave the connector Locked, not anywhere else"
+    );
+}
+
+/// H9 point 4, negative half - and, as of `docs/hardware-roadmap.md`'s H3c, the regression test
+/// for the fix rather than a record of the defect. This test used to be
+/// `local_auth_list_rejection_is_not_observable_in_local_mode`, proving the *opposite* of what its
+/// new name says: `start_local_charger` (H3b) registered a `LocalAuthorizer` whose `authorize()`
+/// was `Infallible` and always answered `Ok(Accepted)`, so `ocpp_charge_point::authorization::
+/// plain_decision` - which only ever consults the local authorization list (via
+/// `offline_decision`) from its `Err(_)` arm - could never reach that arm at all. A listed,
+/// explicitly-rejected identifier used to start charging anyway.
 ///
-/// `start_local_charger` (H3b) registers `LocalAuthorizer` as the Authorization block's
-/// `Authorizer`, whose `authorize()` returns `Result<AuthorizationStatus, Infallible>` and always
-/// answers `Ok(Accepted)`. `ocpp_charge_point::authorization::plain_decision` only ever consults
-/// the local authorization list (via `offline_decision`) from its `Err(_)` arm - the fallback
-/// path for when asking the CSMS itself failed. An `Authorizer` that cannot fail can never reach
-/// that arm, so `ChargePointState.local_authorization_list` is *stored* (this crate can seed and
-/// read it back, as the test above shows) but never *consulted* by a local charger, regardless of
-/// what it contains.
-///
-/// Proven directly: the list below explicitly rejects this identifier, and charging starts
-/// anyway. If the local authorization list's rejection path worked from the outside, this test
-/// would hang waiting for `Locked` (denial leaves the connector locked, never `Charging` - see
-/// `ocpp_charge_point::authorization`'s own
-/// `a_rejected_decision_leaves_the_connector_locked` test) and time out instead of passing.
+/// The fix: `start_local_charger` now registers `NullCsms` as the Authorization block's
+/// `Authorizer`, and `NullCsms::authorize` always returns `Err` - the honest answer for a charge
+/// point with nowhere to send the request. That is what makes `offline_decision` reachable, and
+/// so what makes this list's contents actually matter. Proven both ways here: a listed-and-blocked
+/// identifier must never start charging (below), and a listed-and-accepted one must
+/// (`a_charger_declaring_local_auth_list_authorizes_a_locally_listed_identifier`, above) -
+/// together they are the regression test for both directions of the fix.
 #[tokio::test]
-async fn local_auth_list_rejection_is_not_observable_in_local_mode() {
+async fn local_auth_list_rejection_is_observable_in_local_mode() {
     let config = config(CapabilitiesConfig {
         local_auth_list: true,
         ..Default::default()
@@ -362,16 +395,13 @@ async fn local_auth_list_rejection_is_not_observable_in_local_mode() {
         ))
         .await
         .unwrap();
-    // This is the finding, not an oversight: a real local authorization list would leave the
-    // connector `Locked` here. It reaches `Charging` instead, because `LocalAuthorizer` accepted
-    // before the list was ever read.
-    wait_for(&mut states, 0, 0, OcppConnectorState::Charging).await;
+    assert_never_reaches_charging(&mut states, 0, 0).await;
 
     assert_eq!(
         projected_connector(&charger, &config, 0, 0).status,
-        ConnectorStatus::Charging,
-        "an identifier the local authorization list explicitly rejects still started charging - \
-         see this test's doc comment for why that is a finding about LocalAuthorizer, not a bug \
-         in this test"
+        // `OcppConnectorState::Locked` projects to the coarse `Occupied` (`map_connector_status`)
+        // - a cable is plugged in and locked, but no session ever started.
+        ConnectorStatus::Occupied,
+        "an identifier the local authorization list explicitly rejects must not start charging"
     );
 }

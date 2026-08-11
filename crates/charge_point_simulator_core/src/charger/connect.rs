@@ -128,7 +128,38 @@ pub fn websocket_url(base_url: &str, ocpp_identity: &str) -> String {
 /// `RecordingCsms` does for CSMS-facing ones - a signal plain vs. `_persisted` registration has no
 /// other way to expose, since neither ever calls a `register_*` method distinguishable from the
 /// other (see the doc comment above).
-async fn register_setup_blocks<T, E, C, N, X, B, M, K, S, D>(
+///
+/// # `has_csms` (`docs/hardware-roadmap.md` H3c)
+///
+/// `false` for [`super::running_charger::start_local_charger`], `true` (unconditionally, matching
+/// every call site before H3c) for [`connect_ocpp_2_1`]. Gates the blocks whose entire purpose is
+/// talking to a CSMS that, in local mode, does not exist: `provisioning` (which would otherwise
+/// block forever inside `register_until_accepted` - see [`NullCsms`]'s doc comment for why it must
+/// never fabricate an accepted registration), the plain/`_persisted` `status_notifications`/
+/// `transaction_events`/`security_events` pair, `meter_values`, and - within their own capability
+/// gates - `tariff_and_cost`/`variable_monitoring`/`periodic_event_stream`. Every one of those is
+/// "at best a no-op offline" (`docs/hardware-roadmap.md`'s own phrase): each either forwards a
+/// locally-known fact outward with nothing that reads it back, or - `provisioning` - would hang the
+/// caller.
+///
+/// Left ungated (registered in both modes, exactly the same code path either way): `authorization`
+/// (the fix - see [`NullCsms::authorize`]), `clear_cache`/`network_profiles`/`remote_control`/
+/// `trigger_message`/`availability_control`/`reset`/`device_model` (each a single non-blocking
+/// handler registration with no further consequence, cheap enough to keep the functional-block
+/// shape complete even though nothing ever dials in to trigger them locally), and the capability
+/// -gated `reservation`(+`reservation_status_updates`)/`local_authorization_list`/`smart_charging`
+/// (+`charging_profile_reports`) blocks - these three are `docs/hardware-roadmap.md`'s point:
+/// `smart_charging`'s projection loops and `reservation_status_updates`'s expiry sweep react to
+/// *locally* injected events (`ChargePointEvent::ChargingProfileSet`, an aged `Reservation`), not a
+/// CSMS round trip, so local mode gets the same charging-limit and reservation-expiry behavior a
+/// connected charger would.
+// The eighth parameter (`has_csms`) is what H3c added; splitting the caller-supplied primitives
+// (`backoff`/`monotonic`/`clock`/`storage`/`display`) into a struct to appease this lint would
+// only add a type nothing else needs, for a private, single-purpose function with exactly two
+// call sites (`connect_ocpp_2_1`, `start_local_charger`) that both already spell out every
+// argument by name.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn register_setup_blocks<T, E, C, N, X, B, M, K, S, D>(
     mut builder: ChargePointBuilder<T, X>,
     csms: &N,
     backoff: B,
@@ -136,6 +167,7 @@ async fn register_setup_blocks<T, E, C, N, X, B, M, K, S, D>(
     clock: K,
     storage: Option<&S>,
     display: Option<D>,
+    has_csms: bool,
 ) -> ChargePointBuilder<T, X>
 where
     T: ChargePoint<E, C>,
@@ -227,27 +259,41 @@ where
     if let Some(storage) = storage {
         builder = builder.boot_reason_persistence(storage.clone()).await;
     }
-    builder = builder.provisioning(csms, backoff.clone(), monotonic).await;
+    // `has_csms`: `provisioning` calls `register_until_accepted`, which retries - with a
+    // backoff, but with no upper bound - until the CSMS accepts registration. Against a
+    // `NullCsms` that (correctly, per its own doc comment) never fabricates acceptance, that call
+    // would never return, hanging this function - and so `start_local_charger` - forever. There
+    // is no gate that makes `provisioning` safe to call locally; it is simply not called.
+    if has_csms {
+        builder = builder.provisioning(csms, backoff.clone(), monotonic).await;
+    }
 
     if let Some(storage) = storage {
         builder = builder
             .transaction_persistence(storage.clone(), clock.clone())
             .await;
     }
-    builder = if let Some(storage) = storage {
-        builder
-            .status_notifications_persisted(csms, QueueStore::new(storage.clone(), "status"))
-            .await
-    } else {
-        builder.status_notifications(csms).await
-    };
-    builder = if let Some(storage) = storage {
-        builder
-            .transaction_events_persisted(csms, QueueStore::new(storage.clone(), "transaction"))
-            .await
-    } else {
-        builder.transaction_events(csms).await
-    };
+    // `has_csms`: forwards connector status / transaction lifecycle events outward; local state
+    // (`ChargerState`) is populated straight from `ChargePointState`/hardware via
+    // `RunningCharger::apply_state` regardless of whether this registers, so against no CSMS this
+    // is exactly the "at best a no-op offline" case - a background loop that will only ever queue
+    // what it can never flush.
+    if has_csms {
+        builder = if let Some(storage) = storage {
+            builder
+                .status_notifications_persisted(csms, QueueStore::new(storage.clone(), "status"))
+                .await
+        } else {
+            builder.status_notifications(csms).await
+        };
+        builder = if let Some(storage) = storage {
+            builder
+                .transaction_events_persisted(csms, QueueStore::new(storage.clone(), "transaction"))
+                .await
+        } else {
+            builder.transaction_events(csms).await
+        };
+    }
 
     if let Some(storage) = storage {
         builder = builder
@@ -261,15 +307,24 @@ where
     if let Some(storage) = storage {
         builder = builder.network_profile_persistence(storage.clone()).await;
     }
+    // Unlike `has_csms`'s other gated blocks, `network_profiles`/`clear_cache`/`remote_control`/
+    // `trigger_message`/`availability_control`/`reset`/`device_model` below are left ungated -
+    // see the doc comment above for why: each is one non-blocking `register_*_handler` call with
+    // no further consequence, so registering them locally costs nothing even though nothing ever
+    // dials in to trigger them.
     builder = builder.network_profiles(csms).await;
 
-    builder = if let Some(storage) = storage {
-        builder
-            .security_events_persisted(csms, QueueStore::new(storage.clone(), "security"))
-            .await
-    } else {
-        builder.security_events(csms).await
-    };
+    // `has_csms`: same "at best a no-op offline" reasoning as `status_notifications`/
+    // `transaction_events` above.
+    if has_csms {
+        builder = if let Some(storage) = storage {
+            builder
+                .security_events_persisted(csms, QueueStore::new(storage.clone(), "security"))
+                .await
+        } else {
+            builder.security_events(csms).await
+        };
+    }
     if let Some(storage) = storage {
         builder = builder
             .security_log_persisted(
@@ -293,11 +348,21 @@ where
     if let Some(storage) = storage {
         builder = builder.device_model_persistence(storage.clone()).await;
     }
-    builder = builder
-        .device_model(csms)
-        .await
-        .meter_values(csms, backoff.clone(), clock.clone())
-        .await;
+    builder = builder.device_model(csms).await;
+    // `has_csms`: reports periodic/aligned meter readings outward. Every meter reading a local
+    // charger has is already on `ChargePointState::latest_meter_samples`, populated directly by
+    // the hardware layer (H3b) and read back through `RunningCharger::apply_state` regardless of
+    // this registration - so registering it locally would only spawn a loop that polls forever
+    // (paced, not busy - `run_aligned_meter_values` backs off on a fixed interval when disabled)
+    // to report to nobody. Skipped for the same "at best a no-op offline" reason as
+    // `status_notifications` above, even though `docs/hardware-roadmap.md`'s H3c names "meter
+    // values" among the locally-relevant blocks - the relevant local behavior (the meter itself
+    // advancing) does not go through this registration at all.
+    if has_csms {
+        builder = builder
+            .meter_values(csms, backoff.clone(), clock.clone())
+            .await;
+    }
 
     if capabilities.reservation {
         if let Some(storage) = storage {
@@ -320,7 +385,9 @@ where
         }
         builder = builder.local_authorization_list(csms).await;
     }
-    if capabilities.tariff_and_cost {
+    // `has_csms`: Tariff and Cost is purely CSMS-facing (a CSMS installing/reading tariffs, or
+    // being told about accrued cost) with no locally-observable effect either way.
+    if has_csms && capabilities.tariff_and_cost {
         builder = builder.cost(csms).await.tariffs(csms).await;
     }
     if capabilities.smart_charging {
@@ -340,7 +407,10 @@ where
             .charging_profile_reports(csms)
             .await;
     }
-    if capabilities.variable_monitoring {
+    // `has_csms`: Variable Monitoring's install/clear surface is CSMS-inbound only and its
+    // reporting loops (`variable_monitor_events`) exist purely to notify a CSMS - nothing locally
+    // observable depends on either.
+    if has_csms && capabilities.variable_monitoring {
         builder = builder
             .variable_monitoring(csms)
             .await
@@ -348,7 +418,9 @@ where
             .await
             .variable_monitor_events(csms, backoff.clone(), clock.clone(), 60);
     }
-    if capabilities.periodic_event_stream {
+    // `has_csms`: Periodic Event Stream exists only to push data to a CSMS on a schedule the CSMS
+    // requested; with none, there is nothing to open a stream for.
+    if has_csms && capabilities.periodic_event_stream {
         builder = builder
             .periodic_event_streams(csms, clock, backoff.clone(), 5)
             .await;
@@ -359,6 +431,517 @@ where
     }
 
     builder
+}
+
+/// What every `Result`-returning method on [`NullCsms`] returns: there is no CSMS to answer, so
+/// there is no answer - never "accepted", never "rejected", just unreachable. This is what a real
+/// charger with no CSMS actually experiences (`docs/hardware-roadmap.md`'s "Known gaps"), and it
+/// is the mechanism the local-authorization-list fix relies on: upstream's
+/// `authorization::plain_decision` only ever consults the local authorization list and the
+/// authorization cache from its `Err(_)` arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NoCsms;
+
+impl core::fmt::Display for NoCsms {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "no CSMS is connected - this is a local simulation")
+    }
+}
+
+impl std::error::Error for NoCsms {}
+
+/// The CSMS [`start_local_charger`](super::running_charger::start_local_charger) registers
+/// [`register_setup_blocks`] against - `docs/hardware-roadmap.md`'s H3c, done together with the
+/// local-authorizer fix in "Known gaps" because both are "local mode is under-wired".
+///
+/// Implements the same ~47-trait bound `register_setup_blocks`'s `N` requires - the whole reason
+/// local mode can route through that function at all rather than a second hand-built chain like
+/// `tests/smart_charging.rs` used to need (H8's gap). Modeled on this module's own test-only
+/// `RecordingCsms` (same trait list, same shape) but answering every question differently, on
+/// purpose:
+///
+/// - **Every `register_*_handler` method is a harmless no-op.** These only ever wire a callback
+///   for a CSMS-initiated wire message (`UnlockConnector`, `Reset`, `SendLocalList`, ...) to this
+///   charge point's actor; a local charger dials no CSMS, so no such message can ever arrive to
+///   trigger one. Registering them costs nothing (a single non-blocking call) and completes the
+///   functional-block shape, but nothing about local behavior depends on it.
+/// - **Every method that would otherwise return a CSMS's decision, acknowledgement, or acceptance
+///   returns `Err(NoCsms)`.** `authorize` is the fix this task exists for: an `Err` is exactly what
+///   makes upstream fall back to the local authorization list and the authorization cache, instead
+///   of the always-`Ok(Accepted)` `LocalAuthorizer` H3b registered, whose `Infallible` error type
+///   made that fallback unreachable. The same honesty extends to `notify_boot` (never fabricates
+///   registration acceptance - see [`register_setup_blocks`]'s `has_csms` doc comment for why
+///   `provisioning`, the one block that would actually call this, is never registered at all),
+///   `send_heartbeat`, and every `notify_*`/`send_*` method besides: none of them are wired up by
+///   `register_setup_blocks` when `has_csms` is `false`, except `notify_reservation_status` (called
+///   by `reservation_status_updates`'s expiry sweep, which stays registered locally because the
+///   sweep itself - releasing an expired reservation - is real local behavior; the CSMS
+///   notification about it failing is logged and otherwise harmless).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NullCsms;
+
+#[async_trait::async_trait]
+impl BootNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_boot(
+        &self,
+        _vendor_name: &str,
+        _model_name: &str,
+        _reason: Option<ocpp_charge_point::state::BootReasonCause>,
+    ) -> Result<ocpp_charge_point::provisioning::BootNotificationOutcome, Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl HeartbeatSender for NullCsms {
+    type Error = NoCsms;
+    async fn send_heartbeat(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl StatusNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_status(
+        &self,
+        _evse_id: usize,
+        _connector_id: usize,
+        _status: ocpp_charge_point::state::ConnectorStatus,
+        _connector_state: ocpp_charge_point::state::ConnectorState,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_transaction_event(
+        &self,
+        _evse_id: usize,
+        _connector_id: usize,
+        _kind: ocpp_charge_point::state::TransactionEventKind,
+        _transaction: ocpp_charge_point::state::Transaction,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl Authorizer for NullCsms {
+    type Error = NoCsms;
+    async fn authorize(
+        &self,
+        _id_token: &ocpp_charge_point::state::IdToken,
+    ) -> Result<ocpp_charge_point::state::AuthorizationStatus, Self::Error> {
+        // The fix: an unreachable CSMS means no decision was ever made, which is what falls
+        // upstream through to the local authorization list and the authorization cache. See this
+        // type's doc comment.
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl UnlockConnectorHandler for NullCsms {
+    async fn register_unlock_connector_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ChangeAvailabilityHandler for NullCsms {
+    async fn register_change_availability_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl RequestStartTransactionHandler for NullCsms {
+    async fn register_request_start_transaction_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl RequestStopTransactionHandler for NullCsms {
+    async fn register_request_stop_transaction_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl TriggerMessageHandler for NullCsms {
+    async fn register_trigger_message_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ReserveNowHandler for NullCsms {
+    async fn register_reserve_now_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl CancelReservationHandler for NullCsms {
+    async fn register_cancel_reservation_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ReservationStatusNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_reservation_status(
+        &self,
+        _update: ocpp_charge_point::state::ReservationUpdate,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl ResetHandler for NullCsms {
+    async fn register_reset_handler(&self, _actor: ocpp_charge_point::actor::ChargePointActor) {}
+}
+
+#[async_trait::async_trait]
+impl SendLocalListHandler for NullCsms {
+    async fn register_send_local_list_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetLocalListVersionHandler for NullCsms {
+    async fn register_get_local_list_version_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetVariablesHandler for NullCsms {
+    async fn register_get_variables_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SetVariablesHandler for NullCsms {
+    async fn register_set_variables_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetBaseReportHandler for NullCsms {
+    async fn register_get_base_report_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetReportHandler for NullCsms {
+    async fn register_get_report_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SecurityEventNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_security_event(
+        &self,
+        _event_type: &ocpp_charge_point::state::SecurityEventType,
+        _tech_info: Option<&str>,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl CostUpdatedHandler for NullCsms {
+    async fn register_cost_updated_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SetDefaultTariffHandler for NullCsms {
+    async fn register_set_default_tariff_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ChangeTransactionTariffHandler for NullCsms {
+    async fn register_change_transaction_tariff_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClearTariffsHandler for NullCsms {
+    async fn register_clear_tariffs_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetTariffsHandler for NullCsms {
+    async fn register_get_tariffs_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl MeterValuesNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn send_meter_values(
+        &self,
+        _evse_id: usize,
+        _connector_id: usize,
+        _sample: ocpp_charge_point::state::MeterSample,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl SetChargingProfileHandler for NullCsms {
+    async fn register_set_charging_profile_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClearChargingProfileHandler for NullCsms {
+    async fn register_clear_charging_profile_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetCompositeScheduleHandler for NullCsms {
+    async fn register_get_composite_schedule_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+        _projection: Arc<ChargingLimitProjection>,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetChargingProfilesHandler for NullCsms {
+    async fn register_get_charging_profiles_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SetVariableMonitoringHandler for NullCsms {
+    async fn register_set_variable_monitoring_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClearVariableMonitoringHandler for NullCsms {
+    async fn register_clear_variable_monitoring_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl VariableMonitorEventNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_variable_monitor_event(
+        &self,
+        _event: &ocpp_charge_point::state::TriggeredMonitor,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl SetMonitoringBaseHandler for NullCsms {
+    async fn register_set_monitoring_base_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SetMonitoringLevelHandler for NullCsms {
+    async fn register_set_monitoring_level_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetMonitoringReportHandler for NullCsms {
+    async fn register_get_monitoring_report_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl OpenPeriodicEventStreamHandler for NullCsms {
+    async fn register_open_periodic_event_stream_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClosePeriodicEventStreamHandler for NullCsms {
+    async fn register_close_periodic_event_stream_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl AdjustPeriodicEventStreamHandler for NullCsms {
+    async fn register_adjust_periodic_event_stream_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetPeriodicEventStreamHandler for NullCsms {
+    async fn register_get_periodic_event_stream_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl PeriodicEventStreamNotifier for NullCsms {
+    type Error = NoCsms;
+    async fn notify_periodic_event_stream(
+        &self,
+        _sample: ocpp_charge_point::periodic_event_stream::PeriodicStreamSample,
+    ) -> Result<(), Self::Error> {
+        Err(NoCsms)
+    }
+}
+
+#[async_trait::async_trait]
+impl SetNetworkProfileHandler for NullCsms {
+    async fn register_set_network_profile_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClearCacheHandler for NullCsms {
+    async fn register_clear_cache_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SetDisplayMessageHandler for NullCsms {
+    async fn register_set_display_message_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+        _supported_formats: Vec<ocpp_charge_point::state::MessageFormat>,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetDisplayMessagesHandler for NullCsms {
+    async fn register_get_display_messages_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClearDisplayMessageHandler for NullCsms {
+    async fn register_clear_display_message_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ReconnectHandler for NullCsms {
+    async fn register_reconnect_handler<F, FF>(&self, _callback: F)
+    where
+        F: FnMut() -> FF + Send + Sync + 'static,
+        FF: core::future::Future<Output = ()> + Send + 'static,
+    {
+        // Never invoked - a local charger never reconnects, since it never connected in the
+        // first place - but harmless to drop either way.
+    }
 }
 
 /// Dials `profile`'s CSMS as an OCPP 2.1 CSMS and runs the fake hardware built from `config`
@@ -472,6 +1055,7 @@ async fn connect_ocpp_2_1(
         SystemClock,
         storage.as_ref(),
         display,
+        true, // has_csms: a real CSMS is dialed on this path - unchanged from before H3c.
     )
     .await;
 
@@ -1122,6 +1706,7 @@ mod tests {
             SystemClock,
             Some(&RecordingStorage::new()),
             Some(FakeDisplay::new()),
+            true, // has_csms: this test compares against a real (connected-path) setup() session.
         )
         .await;
         let our_runtime = our_builder.offline_queue_retries(TokioBackoff, 60).build();
@@ -1165,6 +1750,7 @@ mod tests {
             SystemClock,
             Some(&storage),
             Some(FakeDisplay::new()),
+            true, // has_csms: this test is specifically about the connected path's registrations.
         )
         .await;
         let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
@@ -1287,6 +1873,7 @@ mod tests {
             SystemClock,
             Some(&storage),
             None::<FakeDisplay>,
+            true, // has_csms: proving the connected path's persistence registrations.
         )
         .await;
         let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
@@ -1347,6 +1934,7 @@ mod tests {
             SystemClock,
             None::<&RecordingStorage>,
             Some(FakeDisplay::new()),
+            true, // has_csms: proving the connected path's display-message registration.
         )
         .await;
         let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();
@@ -1396,6 +1984,7 @@ mod tests {
             SystemClock,
             Some(&storage),
             None::<FakeDisplay>,
+            true, // has_csms: proving the connected path's plain-vs-persisted dual-form choice.
         )
         .await;
         let _runtime = builder.offline_queue_retries(TokioBackoff, 60).build();

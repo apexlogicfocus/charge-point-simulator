@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use ocpp_charge_point::ChargePointBuilder;
 use ocpp_charge_point::ChargePointRuntime;
-use ocpp_charge_point::authorization::Authorizer;
-use ocpp_charge_point::clock::SystemClock;
+use ocpp_charge_point::clock::{SystemClock, SystemMonotonicClock};
 use ocpp_charge_point::executor::TokioExecutor;
-use ocpp_charge_point::state::{AuthorizationStatus, IdToken};
+use ocpp_charge_point::provisioning::TokioBackoff;
 
 use super::config::ChargerConfig;
-use super::hardware::FakeChargePoint;
+use super::connect::{NullCsms, register_setup_blocks};
+use super::hardware::{FakeChargePoint, FakeDisplay, FileStorage};
 use super::ocpp_bridge::{apply_hardware_state, apply_ocpp_state};
 use super::state::ChargerState;
 
@@ -92,26 +92,6 @@ impl Deref for RunningCharger {
     }
 }
 
-/// A trivial `Authorizer` that accepts every presented identifier without asking anyone - the
-/// only sensible answer for a charger with no CSMS at all. Real hardware falls back to a local
-/// authorization list or authorization cache when a CSMS is briefly unreachable (see
-/// `ocpp_charge_point::authorization`'s module docs); a *local simulation* has neither and no
-/// CSMS to have ever populated them, so unconditional acceptance is the offline behavior this
-/// simulator can actually back - matching `ocpp-charge-point`'s own
-/// `examples/simulated_charge_point.rs`, which notes that "a charge point whose backend is
-/// unreachable still charges cars."
-#[derive(Clone, Copy, Debug, Default)]
-struct LocalAuthorizer;
-
-#[async_trait::async_trait]
-impl Authorizer for LocalAuthorizer {
-    type Error = core::convert::Infallible;
-
-    async fn authorize(&self, _id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
-        Ok(AuthorizationStatus::Accepted)
-    }
-}
-
 /// Starts a charger's fake hardware with no CSMS at all: no dial, no `register`/
 /// `register_until_accepted` call - `ChargePointState::registration` stays `None` forever, and
 /// [`super::ocpp_bridge::apply_ocpp_state`] reads that (via `SimulationMode::Local`) as
@@ -119,17 +99,29 @@ impl Authorizer for LocalAuthorizer {
 /// CSMS's rejected/pending registration would mean.
 ///
 /// Otherwise this runs the same machinery the connected path does: the same [`FakeChargePoint`],
-/// the same `ChargePointBuilder`/`ChargePointRuntime`, the same connector state machine - a local
-/// charger genuinely runs OCPP's connector lifecycle (cable connected, locked, authorizing,
-/// charging, ...), it just has nowhere to report it. The one functional block registered is
-/// Authorization, via [`LocalAuthorizer`] - without it, presenting an identifier would leave a
-/// connector stuck in `Authorizing` forever, since nothing would ever answer the resulting
-/// `AuthorizationRequested`. Every other functional block (persistence, display, smart charging,
-/// ...) stays unregistered: they all either need a CSMS round trip this charger has nowhere to
-/// send, or are separate opt-in tasks on `docs/hardware-roadmap.md` this one doesn't claim.
+/// the same `ChargePointBuilder`/`ChargePointRuntime`, the same connector state machine, and - as
+/// of `docs/hardware-roadmap.md`'s H3c - the same [`register_setup_blocks`] the connected path
+/// uses, against [`NullCsms`], a CSMS stand-in that answers nothing a real CSMS would answer (see
+/// its own doc comment) so this exercises the *offline* paths rather than a fake-online one.
+///
+/// `has_csms: false` skips every block whose entire purpose is talking to a CSMS that does not
+/// exist here - `provisioning` above all, since against a `NullCsms` that never fabricates
+/// acceptance its retry-until-accepted call would otherwise hang this function forever. What's
+/// left registered: `authorization` (via `NullCsms`, which now *declines* - see its doc comment -
+/// so an identifier falls through to the local authorization list and the authorization cache
+/// instead of what used to be an always-accepting, `Infallible` `LocalAuthorizer`, the fix
+/// `docs/hardware-roadmap.md`'s "Known gaps" names), the handful of single-call CSMS-inbound
+/// handler registrations cheap enough to keep regardless (`clear_cache`, `network_profiles`,
+/// `remote_control`, `trigger_message`, `availability_control`, `reset`, `device_model`), and -
+/// gated on the same `Capabilities` flags the connected path reads - `reservation`
+/// (+`reservation_status_updates`, so a reservation actually expires locally),
+/// `local_authorization_list`, and `smart_charging` (+`charging_profile_reports`, so a locally
+/// installed `ChargingProfileSet` actually computes and applies a current limit - H8's gap).
+/// [`register_setup_blocks`]'s own `has_csms` doc comment has the full registered/skipped list and
+/// the reasoning behind each entry.
 ///
 /// See `docs/hardware-roadmap.md`'s H3b for why this is the shape a local (unconnected)
-/// simulation takes from here on, instead of the coarse, hardware-free state machine
+/// simulation takes at all, instead of the coarse, hardware-free state machine
 /// `charger/state.rs`/`charger/command.rs` used to run entirely on their own.
 pub async fn start_local_charger(config: &ChargerConfig) -> RunningCharger {
     let hardware = FakeChargePoint::from_config(config);
@@ -138,7 +130,17 @@ pub async fn start_local_charger(config: &ChargerConfig) -> RunningCharger {
     let builder = ChargePointBuilder::start(hardware, TokioExecutor)
         .await
         .unwrap_or_else(|error: core::convert::Infallible| match error {});
-    let builder = builder.authorization(&LocalAuthorizer, SystemClock).await;
+    let builder = register_setup_blocks(
+        builder,
+        &NullCsms,
+        TokioBackoff,
+        SystemMonotonicClock,
+        SystemClock,
+        None::<&FileStorage>,
+        None::<FakeDisplay>,
+        false, // has_csms: no CSMS is ever dialed in local mode.
+    )
+    .await;
 
     RunningCharger::new(builder.build(), handle)
 }
@@ -149,8 +151,8 @@ mod tests {
     use crate::charger::config::EvseConfig;
     use crate::charger::config::OcppVersion;
     use ocpp_charge_point::state::{
-        ChargePointEvent, ConnectorEvent, ConnectorState as OcppConnectorState, EvseEvent,
-        IdTokenKind,
+        AuthorizationStatus, ChargePointEvent, ConnectorEvent,
+        ConnectorState as OcppConnectorState, EvseEvent, IdToken, IdTokenKind, LocalListEntry,
     };
     use std::time::Duration as StdDuration;
 
@@ -180,12 +182,36 @@ mod tests {
 
     /// Drives `charger` through a full local session up to (but not including) ticking the
     /// meter: cable connected, locked (automatic, via the real hardware round trip), an
-    /// identifier presented, and authorized (automatic, via [`LocalAuthorizer`]) - the same
-    /// sequence a real offline charger runs, with no CSMS anywhere in the loop. Times out rather
-    /// than hanging forever if a transition never lands, so a regression fails the test instead
-    /// of wedging the suite.
+    /// identifier presented, and authorized - the same sequence a real offline charger runs, with
+    /// no CSMS anywhere in the loop.
+    ///
+    /// Authorization now genuinely happens offline (H3c's fix - see [`NullCsms`]'s doc comment):
+    /// `NullCsms::authorize` always declines, so upstream falls back to the local authorization
+    /// list, which starts empty and would reject an unlisted identifier - the connector would sit
+    /// in `Locked` forever instead of reaching `Charging`. Seeding `"TAG-1"` into the list first
+    /// (exactly the `ChargePointEvent::LocalListUpdated` a CSMS's `SendLocalList` would produce -
+    /// see `tests/reservation_and_auth_list.rs`) is what makes this test's tag a genuinely
+    /// authorized one rather than an arbitrary string that used to be accepted only because
+    /// nothing ever checked.
+    ///
+    /// Times out rather than hanging forever if a transition never lands, so a regression fails
+    /// the test instead of wedging the suite.
     async fn charge_locally(charger: &RunningCharger, evse_id: usize, connector_id: usize) {
         let mut states = charger.subscribe();
+
+        charger
+            .send(ChargePointEvent::LocalListUpdated {
+                version: 1,
+                entries: vec![LocalListEntry {
+                    id_token: IdToken {
+                        value: "TAG-1".into(),
+                        kind: IdTokenKind::ISO14443,
+                    },
+                    status: AuthorizationStatus::Accepted,
+                }],
+            })
+            .await
+            .unwrap();
 
         charger
             .send(connector_event(
