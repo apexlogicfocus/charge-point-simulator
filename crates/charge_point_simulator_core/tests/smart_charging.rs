@@ -3,39 +3,46 @@
 //! **public** API - see `CLAUDE.md`'s note that this crate is published to crates.io, so a test
 //! that only reaches what a downstream consumer could reach is itself part of the proof.
 //!
-//! # Why this isn't just `start_local_charger` + `send`
+//! # `start_local_charger`, mostly (H3c)
 //!
-//! The obvious shape - take the `RunningCharger` from `start_local_charger`, `send` a
-//! `ChargePointEvent::ChargingProfileSet` at it, tick it, done - does not exercise the whole
-//! chain. `start_local_charger` (`charger/running_charger.rs`) registers exactly one functional
-//! block, Authorization; it never calls `ocpp_charge_point::ChargePointBuilder::smart_charging`,
-//! which is what spawns the two background loops
+//! Before `docs/hardware-roadmap.md`'s H3c, `start_local_charger` registered exactly one
+//! functional block (Authorization), so this file had to hand-build its own minimal charger
+//! (`bespoke_start_charger`, below) through the same public `ChargePointBuilder` `RunningCharger`'s
+//! two constructors use, just to get Smart Charging's two background projection loops
 //! (`ocpp_charge_point::smart_charging::run_charging_limit_projection`/
-//! `run_charging_limit_schedule`) that turn an installed profile into a composite schedule and
-//! push `ConnectorEvent::CurrentLimitComputed` at the state machine. Without that registration, a
-//! `ChargingProfileSet` event lands in `ChargePointState::charging_profiles` and then goes
-//! nowhere - nothing ever computes a limit from it, so `HardwareCommand::SetCurrentLimit` never
-//! fires and the meter never clamps. `connect_charger`'s `register_setup_blocks` does call
-//! `smart_charging` (gated on `Capabilities::smart_charging`, per H2/H8), but only for a charger
-//! dialed against a real CSMS.
+//! `run_charging_limit_schedule`) actually running against a local, no-CSMS session. H3c wired
+//! `start_local_charger` itself through `register_setup_blocks` - the same function
+//! `connect_charger` uses - against a null CSMS, registering Smart Charging whenever
+//! `capabilities.smart_charging` is declared, exactly as the connected path does. Four of this
+//! file's five tests now use `start_local_charger` directly, with no bespoke chain at all - and,
+//! since H3c also fixed local authorization to genuinely consult the local authorization list (see
+//! `docs/hardware-roadmap.md`'s "Known gaps"), [`charge_locally`] below seeds a list entry before
+//! presenting a tag, the same fallout `tests/reservation_and_auth_list.rs` and
+//! `charger/running_charger.rs`'s own tests needed.
 //!
-//! So this file builds its own minimal local charger (`start_charger` below), through the same
-//! public `ChargePointBuilder` used by `RunningCharger`'s two constructors, registering
-//! Authorization exactly as `start_local_charger` does *and* - only when the config declares
-//! `capabilities.smart_charging`, mirroring `register_setup_blocks`'s own gate - Smart Charging
-//! too, against a trivial no-op fake CSMS (`NoopCsms`) satisfying the three handler-registration
-//! traits `smart_charging` requires. Every type involved (`ChargePointBuilder`,
-//! `ChargePointRuntime`, `ocpp_charge_point::authorization::Authorizer`,
-//! `ocpp_charge_point::smart_charging::{SetChargingProfileHandler, ClearChargingProfileHandler,
-//! GetCompositeScheduleHandler}`, `ocpp_charge_point::provisioning::Backoff`,
-//! `ocpp_charge_point::clock::Clock`) is public on `ocpp_charge_point`, which is itself a regular
-//! (non-dev) dependency of `charge_point_simulator_core`, so naming it here needs no additions to
-//! this crate's `Cargo.toml`.
+//! # The one exception: `a_stepped_schedule_changes_the_applied_limit_at_the_period_boundary`
 //!
-//! Simulated time only, per decision 2 in the hardware roadmap: `TestClock` below is a
-//! caller-advanced `Clock`, never the wall clock, kept in lockstep with every
-//! `FakeChargePoint::tick` call so a schedule's period boundaries land exactly where the test
-//! expects them to.
+//! `start_local_charger` hardcodes `ocpp_charge_point::clock::SystemClock` (the real wall clock)
+//! for every registration that takes a `Clock`, including Smart Charging - there is no public way
+//! to hand it a test-controlled one. The composite-schedule projection reads that clock to decide
+//! which period of an *absolute* schedule (`ChargingSchedule::start_schedule`, anchored per
+//! `amp_profile`'s doc comment to a fixed instant) is currently active. Three of the other four
+//! tests get away with `start_local_charger`'s real clock because their schedules are unbounded
+//! (`duration_secs: None`) and their anchor ([`epoch`]) is safely in the past relative to the real
+//! wall clock, so "which period is active" only ever depends on "past or not", never on exactly
+//! *how far* past. The boundary test can't: it needs `now` to land within specific, narrow windows
+//! relative to `start_schedule` (`[0, 1800)` then `[1800, 3600)` seconds) to prove the limit
+//! changes exactly at the crossing - not before, and not only once the test asks for the final
+//! value - and the real wall clock cannot give it that without an actual 1800-second wait, which
+//! decision 2 (`docs/hardware-roadmap.md`: never the wall clock in simulated behavior) rules out.
+//!
+//! So that one test keeps a bespoke chain (everything below prefixed `bespoke_`), built against
+//! [`TestClock`], a `Clock` the test advances by hand in lockstep with [`FakeChargePoint::tick`].
+//! **This is the finding H3c's brief asked to be reported rather than papered over**: `core` has
+//! no public way to run a local charger against an injectable `Clock`/`Backoff`, so any test that
+//! needs exact control over *when* something happens in real terms (rather than *how much
+//! simulated time has elapsed*, which `RunningCharger::tick` already controls precisely) cannot be
+//! expressed through `start_local_charger` alone yet.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
@@ -44,7 +51,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use charge_point_simulator_core::charger::{
     CapabilitiesConfig, ChargerConfig, ChargerState, EvseConfig, FakeChargePoint, OcppVersion,
-    apply_hardware_state, apply_ocpp_state,
+    RunningCharger, apply_hardware_state, apply_ocpp_state, start_local_charger,
 };
 use ocpp_charge_point::ChargePointBuilder;
 use ocpp_charge_point::ChargePointRuntime;
@@ -62,6 +69,7 @@ use ocpp_charge_point::state::{
     ChargingProfileCriteria, ChargingProfileId, ChargingProfileKind, ChargingProfilePurpose,
     ChargingProfileScope, ChargingRateUnit, ChargingSchedule, ChargingSchedulePeriod,
     ConnectorEvent, ConnectorState as OcppConnectorState, EvseEvent, IdToken, IdTokenKind,
+    LocalListEntry,
 };
 use ocpp_charge_point::sync::WatchReceiver;
 
@@ -70,112 +78,6 @@ use ocpp_charge_point::sync::WatchReceiver;
 /// unrestricted connector should accrue in one simulated hour. Used only as a sanity bound, with
 /// generous tolerance, never as an exact equality.
 const NOMINAL_HOURLY_KWH: f64 = 7.4;
-
-// ---------------------------------------------------------------------------------------------
-// Simulated clock
-// ---------------------------------------------------------------------------------------------
-
-/// A [`Clock`] the test advances by hand, never the wall clock (decision 2,
-/// `docs/hardware-roadmap.md`). Shared (via `Arc`) between every registration on one charger that
-/// needs a `Clock`, and advanced by the test in lockstep with [`FakeChargePoint::tick`] so a
-/// charging schedule's period boundaries are crossed exactly when the test ticks past them.
-#[derive(Clone)]
-struct TestClock(Arc<Mutex<DateTime<Utc>>>);
-
-impl TestClock {
-    fn new(start: DateTime<Utc>) -> Self {
-        Self(Arc::new(Mutex::new(start)))
-    }
-
-    fn now_value(&self) -> DateTime<Utc> {
-        *self.0.lock().expect("lock poisoned")
-    }
-
-    fn advance(&self, elapsed: StdDuration) {
-        let mut now = self.0.lock().expect("lock poisoned");
-        *now += ChronoDuration::from_std(elapsed).expect("elapsed fits in a chrono::Duration");
-    }
-}
-
-impl Clock for TestClock {
-    fn now(&self) -> DateTime<Utc> {
-        self.now_value()
-    }
-}
-
-/// An arbitrary, fixed reference instant - never the real wall clock - every test anchors its
-/// [`TestClock`] and its charging schedules' `start_schedule` to.
-fn epoch() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000, 0).expect("a valid fixed Unix timestamp")
-}
-
-// ---------------------------------------------------------------------------------------------
-// A local charger with an optional Smart Charging registration
-// ---------------------------------------------------------------------------------------------
-
-/// The only sensible `Authorizer` for a charger with no CSMS - see
-/// `charger/running_charger.rs`'s private `LocalAuthorizer`, reproduced here because this file
-/// builds its own charger rather than going through `start_local_charger` (see this module's
-/// doc comment for why) and that type isn't public.
-#[derive(Clone, Copy, Debug, Default)]
-struct LocalAuthorizer;
-
-#[async_trait::async_trait]
-impl Authorizer for LocalAuthorizer {
-    type Error = core::convert::Infallible;
-
-    async fn authorize(&self, _id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
-        Ok(AuthorizationStatus::Accepted)
-    }
-}
-
-/// A CSMS stand-in that registers nothing anywhere - the three methods `ChargePointBuilder::
-/// smart_charging` calls exist only to hand this charge point's inbound `SetChargingProfile`/
-/// `ClearChargingProfile`/`GetCompositeSchedule` handling to a real network client, and this
-/// charger has no CSMS at all. Every profile in these tests is installed directly as a
-/// `ChargePointEvent::ChargingProfileSet`, bypassing the handler this would otherwise register -
-/// so nothing here ever needs to be reached, only registered (harmlessly, as a no-op) so that
-/// `smart_charging`'s other job - spawning the two projection loops that turn a stored profile
-/// into `HardwareCommand::SetCurrentLimit` - actually happens.
-#[derive(Clone, Copy, Debug, Default)]
-struct NoopCsms;
-
-#[async_trait::async_trait]
-impl SetChargingProfileHandler for NoopCsms {
-    async fn register_set_charging_profile_handler(&self, _actor: ChargePointActor) {}
-}
-
-#[async_trait::async_trait]
-impl ClearChargingProfileHandler for NoopCsms {
-    async fn register_clear_charging_profile_handler(&self, _actor: ChargePointActor) {}
-}
-
-#[async_trait::async_trait]
-impl GetCompositeScheduleHandler for NoopCsms {
-    async fn register_get_composite_schedule_handler(
-        &self,
-        _actor: ChargePointActor,
-        _projection: Arc<ChargingLimitProjection>,
-    ) {
-    }
-}
-
-/// The period-boundary loop (`run_charging_limit_schedule`) sleeps on this between evaluations.
-/// A real `Backoff` would sleep for however long is left until the next schedule boundary
-/// (`ocpp_charge_point::smart_charging::projection`'s own doc comment), which is meaningless
-/// against a [`TestClock`] the test itself steps by hand - so this ignores `seconds` entirely and
-/// re-evaluates on a short, fixed real-time cadence instead. That keeps the loop from busy
-/// spinning while still converging quickly whenever the test advances the clock or ticks the
-/// meter, without ever depending on the wall clock for correctness (only for polling cadence).
-#[derive(Clone, Copy, Debug, Default)]
-struct FastBackoff;
-
-#[async_trait::async_trait]
-impl Backoff for FastBackoff {
-    async fn wait(&self, _seconds: u32) {
-        tokio::time::sleep(StdDuration::from_millis(5)).await;
-    }
-}
 
 /// Builds a `ChargerConfig` for one EVSE with a single connector, declaring
 /// `capabilities.smart_charging` per `smart_charging`.
@@ -195,47 +97,6 @@ fn config(smart_charging: bool) -> ChargerConfig {
     }
 }
 
-/// Starts a local (no-CSMS) charger, the same way `start_local_charger` does (Authorization
-/// against [`LocalAuthorizer`], no dial, no registration), and - **only** when `config` declares
-/// `capabilities.smart_charging`, exactly the gate `connect_charger`'s `register_setup_blocks`
-/// applies for a live CSMS - additionally registers the Smart Charging functional block against
-/// [`NoopCsms`], which is what actually starts the composite-schedule projection loops. Returns
-/// the runtime plus a live [`FakeChargePoint`] handle to tick (see `charger/running_charger.rs`'s
-/// doc comment on why a handle has to be cloned out before the other clone's ownership moves into
-/// the builder).
-async fn start_charger(
-    config: &ChargerConfig,
-    clock: TestClock,
-) -> (ChargePointRuntime<FakeChargePoint>, FakeChargePoint) {
-    let hardware = FakeChargePoint::from_config(config);
-    let handle = hardware.clone();
-
-    let builder = ChargePointBuilder::start(hardware, TokioExecutor)
-        .await
-        .unwrap_or_else(|error: core::convert::Infallible| match error {});
-    let builder = builder.authorization(&LocalAuthorizer, clock.clone()).await;
-    let builder = if config.capabilities().smart_charging {
-        builder
-            .smart_charging(
-                &NoopCsms,
-                Arc::new(ChargingLimitProjection::new()),
-                clock,
-                FastBackoff,
-            )
-            .await
-    } else {
-        builder
-    };
-
-    (builder.build(), handle)
-}
-
-// ---------------------------------------------------------------------------------------------
-// Driving a session and reading state back - the `RunningCharger` test pattern from
-// `charger/running_charger.rs`, reproduced against a bare `ChargePointRuntime` since this file
-// doesn't have a `RunningCharger` to hand (see this module's doc comment).
-// ---------------------------------------------------------------------------------------------
-
 fn connector_event(evse_id: usize, connector_id: usize, event: ConnectorEvent) -> ChargePointEvent {
     ChargePointEvent::Evse {
         evse_id,
@@ -244,53 +105,6 @@ fn connector_event(evse_id: usize, connector_id: usize, event: ConnectorEvent) -
             event,
         },
     }
-}
-
-/// Drives `runtime` through a full local session up to `Charging`: cable connected, locked
-/// (automatic, via the real hardware round trip), an identifier presented, and authorized
-/// (automatic, via [`LocalAuthorizer`]) - see `charger/running_charger.rs`'s `charge_locally` for
-/// the original. Times out rather than hanging forever if a transition never lands.
-async fn charge_locally(
-    runtime: &ChargePointRuntime<FakeChargePoint>,
-    evse_id: usize,
-    connector_id: usize,
-) {
-    let mut states = runtime.subscribe();
-
-    runtime
-        .send(connector_event(
-            evse_id,
-            connector_id,
-            ConnectorEvent::CableConnected,
-        ))
-        .await
-        .unwrap();
-    wait_for_connector_state(
-        &mut states,
-        evse_id,
-        connector_id,
-        OcppConnectorState::Locked,
-    )
-    .await;
-
-    runtime
-        .send(connector_event(
-            evse_id,
-            connector_id,
-            ConnectorEvent::IdTokenPresented(IdToken {
-                value: "TAG-1".into(),
-                kind: IdTokenKind::ISO14443,
-            }),
-        ))
-        .await
-        .unwrap();
-    wait_for_connector_state(
-        &mut states,
-        evse_id,
-        connector_id,
-        OcppConnectorState::Charging,
-    )
-    .await;
 }
 
 async fn wait_for_connector_state(
@@ -311,47 +125,23 @@ async fn wait_for_connector_state(
     .unwrap_or_else(|_| panic!("connector never reached {target:?} within the timeout"));
 }
 
-/// Projects both `runtime`'s OCPP state and `hardware`'s hardware-only state (lock, contactor,
-/// current limit - H7) onto a fresh [`ChargerState`], the same two-call sequence
-/// `RunningCharger::apply_state` uses, reproduced here since this file has no `RunningCharger`.
-fn read_state(
-    runtime: &ChargePointRuntime<FakeChargePoint>,
-    hardware: &FakeChargePoint,
-    config: &ChargerConfig,
-) -> ChargerState {
-    let mut state = ChargerState::from_config(config.clone());
-    apply_ocpp_state(&mut state, &runtime.state());
-    apply_hardware_state(&mut state, hardware);
-    state
+async fn install_profile(runtime: &ChargePointRuntime<FakeChargePoint>, profile: ChargingProfile) {
+    runtime
+        .send(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::ChargePoint,
+            profile: Box::new(profile),
+        })
+        .await
+        .unwrap();
 }
 
-/// Polls (via the state watch, never a `sleep`) until `ConnectorState::current_limit_ma` for
-/// `evse_id`/`connector_id` reads `expected`, or panics after a timeout. The limit's path to
-/// hardware crosses two async hops after any single event this test sends - the projection loop
-/// noticing a state change and computing a limit, then the spawned hardware-command loop in
-/// `FakeChargePoint::start` actually calling `Connector::set_current_limit` - so nothing about it
-/// is synchronous with `runtime.send(..).await` returning, and polling is the correct tool per
-/// `charger/running_charger.rs`'s own `wait_for`.
-async fn wait_for_current_limit(
-    runtime: &ChargePointRuntime<FakeChargePoint>,
-    hardware: &FakeChargePoint,
-    config: &ChargerConfig,
-    evse_id: usize,
-    connector_id: usize,
-    expected: Option<u32>,
-) -> ChargerState {
-    let mut states = runtime.subscribe();
-    tokio::time::timeout(StdDuration::from_secs(5), async {
-        loop {
-            let state = read_state(runtime, hardware, config);
-            if state.evses[evse_id].connectors[connector_id].current_limit_ma == expected {
-                return state;
-            }
-            let _ = states.changed().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("current limit never reached {expected:?} within the timeout"))
+async fn clear_all_profiles(runtime: &ChargePointRuntime<FakeChargePoint>) {
+    runtime
+        .send(ChargePointEvent::ChargingProfilesCleared {
+            criteria: ChargingProfileCriteria::default(),
+        })
+        .await
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -400,23 +190,330 @@ fn flat_period(limit_amps: f64) -> ChargingSchedulePeriod {
     }
 }
 
-async fn install_profile(runtime: &ChargePointRuntime<FakeChargePoint>, profile: ChargingProfile) {
-    runtime
-        .send(ChargePointEvent::ChargingProfileSet {
-            scope: ChargingProfileScope::ChargePoint,
-            profile: Box::new(profile),
-        })
-        .await
-        .unwrap();
+/// An arbitrary, fixed reference instant - never the real wall clock - every schedule anchors its
+/// `start_schedule` to (and, for the bespoke-chain test, [`TestClock`] as well). Safely in the
+/// past relative to the real `SystemClock` `start_local_charger` uses, which is what lets the
+/// unbounded-duration tests below use it without needing a controllable clock at all.
+fn epoch() -> DateTime<Utc> {
+    DateTime::from_timestamp(1_700_000_000, 0).expect("a valid fixed Unix timestamp")
 }
 
-async fn clear_all_profiles(runtime: &ChargePointRuntime<FakeChargePoint>) {
-    runtime
-        .send(ChargePointEvent::ChargingProfilesCleared {
-            criteria: ChargingProfileCriteria::default(),
+// ---------------------------------------------------------------------------------------------
+// The `start_local_charger` path - used by every test but the period-boundary one (see module doc)
+// ---------------------------------------------------------------------------------------------
+
+/// Drives `charger` through a full local session up to `Charging`: seeds `"TAG-1"` into the local
+/// authorization list (H3c made authorization genuinely offline - see the module doc comment -
+/// so an unlisted identifier would now be rejected, leaving the connector `Locked` forever), then
+/// cable connected, locked, identifier presented, authorized from the list. Times out rather than
+/// hanging forever if a transition never lands.
+async fn charge_locally(charger: &RunningCharger, evse_id: usize, connector_id: usize) {
+    let mut states = charger.subscribe();
+
+    charger
+        .send(ChargePointEvent::LocalListUpdated {
+            version: 1,
+            entries: vec![LocalListEntry {
+                id_token: IdToken {
+                    value: "TAG-1".into(),
+                    kind: IdTokenKind::ISO14443,
+                },
+                status: AuthorizationStatus::Accepted,
+            }],
         })
         .await
         .unwrap();
+
+    charger
+        .send(connector_event(
+            evse_id,
+            connector_id,
+            ConnectorEvent::CableConnected,
+        ))
+        .await
+        .unwrap();
+    wait_for_connector_state(
+        &mut states,
+        evse_id,
+        connector_id,
+        OcppConnectorState::Locked,
+    )
+    .await;
+
+    charger
+        .send(connector_event(
+            evse_id,
+            connector_id,
+            ConnectorEvent::IdTokenPresented(IdToken {
+                value: "TAG-1".into(),
+                kind: IdTokenKind::ISO14443,
+            }),
+        ))
+        .await
+        .unwrap();
+    wait_for_connector_state(
+        &mut states,
+        evse_id,
+        connector_id,
+        OcppConnectorState::Charging,
+    )
+    .await;
+}
+
+/// Projects `charger`'s full observable state onto a fresh [`ChargerState`] via
+/// [`RunningCharger::apply_state`] - the same public entry point a downstream frontend uses.
+fn read_state(charger: &RunningCharger, config: &ChargerConfig) -> ChargerState {
+    let mut state = ChargerState::from_config(config.clone());
+    charger.apply_state(&mut state);
+    state
+}
+
+/// Polls (via the state watch, never a `sleep`) until `ConnectorState::current_limit_ma` for
+/// `evse_id`/`connector_id` reads `expected`, or panics after a timeout. The limit's path to
+/// hardware crosses two async hops after any single event this test sends - the projection loop
+/// noticing a state change and computing a limit, then the spawned hardware-command loop in
+/// `FakeChargePoint::start` actually calling `Connector::set_current_limit` - so nothing about it
+/// is synchronous with `charger.send(..).await` returning, and polling is the correct tool per
+/// `charger/running_charger.rs`'s own `wait_for`.
+async fn wait_for_current_limit(
+    charger: &RunningCharger,
+    config: &ChargerConfig,
+    evse_id: usize,
+    connector_id: usize,
+    expected: Option<u32>,
+) -> ChargerState {
+    let mut states = charger.subscribe();
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let state = read_state(charger, config);
+            if state.evses[evse_id].connectors[connector_id].current_limit_ma == expected {
+                return state;
+            }
+            let _ = states.changed().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("current limit never reached {expected:?} within the timeout"))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The bespoke chain - only for `a_stepped_schedule_changes_the_applied_limit_at_the_period_boundary`
+// (see the module doc comment's "The one exception" section for why)
+// ---------------------------------------------------------------------------------------------
+
+/// A [`Clock`] the test advances by hand, never the wall clock (decision 2,
+/// `docs/hardware-roadmap.md`). Advanced by the test in lockstep with [`FakeChargePoint::tick`] so
+/// a charging schedule's period boundaries are crossed exactly when the test ticks past them -
+/// control `start_local_charger`'s hardcoded `SystemClock` cannot offer (see the module doc
+/// comment).
+#[derive(Clone)]
+struct TestClock(Arc<Mutex<DateTime<Utc>>>);
+
+impl TestClock {
+    fn new(start: DateTime<Utc>) -> Self {
+        Self(Arc::new(Mutex::new(start)))
+    }
+
+    fn now_value(&self) -> DateTime<Utc> {
+        *self.0.lock().expect("lock poisoned")
+    }
+
+    fn advance(&self, elapsed: StdDuration) {
+        let mut now = self.0.lock().expect("lock poisoned");
+        *now += ChronoDuration::from_std(elapsed).expect("elapsed fits in a chrono::Duration");
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.now_value()
+    }
+}
+
+/// The only sensible `Authorizer` for a charger with no CSMS - see
+/// `charger/running_charger.rs`'s private `NullCsms::authorize` for the production equivalent
+/// (which declines, so real local mode falls back to the local authorization list). Reproduced
+/// here as an always-accepting stand-in because the bespoke chain has no local authorization list
+/// story to exercise and isn't the point of this test - only exact period-boundary timing is.
+#[derive(Clone, Copy, Debug, Default)]
+struct BespokeAuthorizer;
+
+#[async_trait::async_trait]
+impl Authorizer for BespokeAuthorizer {
+    type Error = core::convert::Infallible;
+
+    async fn authorize(&self, _id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
+        Ok(AuthorizationStatus::Accepted)
+    }
+}
+
+/// A CSMS stand-in that registers nothing anywhere - the three methods `ChargePointBuilder::
+/// smart_charging` calls exist only to hand this charge point's inbound `SetChargingProfile`/
+/// `ClearChargingProfile`/`GetCompositeSchedule` handling to a real network client, and this
+/// charger has no CSMS at all. Every profile in this test is installed directly as a
+/// `ChargePointEvent::ChargingProfileSet`, bypassing the handler this would otherwise register -
+/// so nothing here ever needs to be reached, only registered (harmlessly, as a no-op) so that
+/// `smart_charging`'s other job - spawning the two projection loops that turn a stored profile
+/// into `HardwareCommand::SetCurrentLimit` - actually happens.
+#[derive(Clone, Copy, Debug, Default)]
+struct BespokeNoopCsms;
+
+#[async_trait::async_trait]
+impl SetChargingProfileHandler for BespokeNoopCsms {
+    async fn register_set_charging_profile_handler(&self, _actor: ChargePointActor) {}
+}
+
+#[async_trait::async_trait]
+impl ClearChargingProfileHandler for BespokeNoopCsms {
+    async fn register_clear_charging_profile_handler(&self, _actor: ChargePointActor) {}
+}
+
+#[async_trait::async_trait]
+impl GetCompositeScheduleHandler for BespokeNoopCsms {
+    async fn register_get_composite_schedule_handler(
+        &self,
+        _actor: ChargePointActor,
+        _projection: Arc<ChargingLimitProjection>,
+    ) {
+    }
+}
+
+/// The period-boundary loop (`run_charging_limit_schedule`) sleeps on this between evaluations.
+/// A real `Backoff` would sleep for however long is left until the next schedule boundary
+/// (`ocpp_charge_point::smart_charging::projection`'s own doc comment), which is meaningless
+/// against a [`TestClock`] the test itself steps by hand - so this ignores `seconds` entirely and
+/// re-evaluates on a short, fixed real-time cadence instead. That keeps the loop from busy
+/// spinning while still converging quickly whenever the test advances the clock or ticks the
+/// meter, without ever depending on the wall clock for correctness (only for polling cadence).
+#[derive(Clone, Copy, Debug, Default)]
+struct BespokeFastBackoff;
+
+#[async_trait::async_trait]
+impl Backoff for BespokeFastBackoff {
+    async fn wait(&self, _seconds: u32) {
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+}
+
+/// Starts a local (no-CSMS) charger the same shape `start_local_charger` builds (see its own doc
+/// comment), but against a caller-supplied [`TestClock`] instead of the real `SystemClock` -
+/// exactly the one thing `start_local_charger` cannot be asked for yet (see the module doc
+/// comment). Registers Authorization against [`BespokeAuthorizer`] and - only when `config`
+/// declares `capabilities.smart_charging`, mirroring `register_setup_blocks`'s own gate - Smart
+/// Charging against [`BespokeNoopCsms`]. Returns the runtime plus a live [`FakeChargePoint`]
+/// handle to tick (see `charger/running_charger.rs`'s doc comment on why a handle has to be cloned
+/// out before the other clone's ownership moves into the builder).
+async fn bespoke_start_charger(
+    config: &ChargerConfig,
+    clock: TestClock,
+) -> (ChargePointRuntime<FakeChargePoint>, FakeChargePoint) {
+    let hardware = FakeChargePoint::from_config(config);
+    let handle = hardware.clone();
+
+    let builder = ChargePointBuilder::start(hardware, TokioExecutor)
+        .await
+        .unwrap_or_else(|error: core::convert::Infallible| match error {});
+    let builder = builder
+        .authorization(&BespokeAuthorizer, clock.clone())
+        .await;
+    let builder = if config.capabilities().smart_charging {
+        builder
+            .smart_charging(
+                &BespokeNoopCsms,
+                Arc::new(ChargingLimitProjection::new()),
+                clock,
+                BespokeFastBackoff,
+            )
+            .await
+    } else {
+        builder
+    };
+
+    (builder.build(), handle)
+}
+
+/// Drives `runtime` through a full local session up to `Charging` against [`BespokeAuthorizer`],
+/// which accepts unconditionally - no local-authorization-list seeding needed here, unlike
+/// [`charge_locally`].
+async fn bespoke_charge_locally(
+    runtime: &ChargePointRuntime<FakeChargePoint>,
+    evse_id: usize,
+    connector_id: usize,
+) {
+    let mut states = runtime.subscribe();
+
+    runtime
+        .send(connector_event(
+            evse_id,
+            connector_id,
+            ConnectorEvent::CableConnected,
+        ))
+        .await
+        .unwrap();
+    wait_for_connector_state(
+        &mut states,
+        evse_id,
+        connector_id,
+        OcppConnectorState::Locked,
+    )
+    .await;
+
+    runtime
+        .send(connector_event(
+            evse_id,
+            connector_id,
+            ConnectorEvent::IdTokenPresented(IdToken {
+                value: "TAG-1".into(),
+                kind: IdTokenKind::ISO14443,
+            }),
+        ))
+        .await
+        .unwrap();
+    wait_for_connector_state(
+        &mut states,
+        evse_id,
+        connector_id,
+        OcppConnectorState::Charging,
+    )
+    .await;
+}
+
+/// Projects both `runtime`'s OCPP state and `hardware`'s hardware-only state (lock, contactor,
+/// current limit - H7) onto a fresh [`ChargerState`], the same two-call sequence
+/// `RunningCharger::apply_state` uses internally - reproduced here because the bespoke chain has
+/// no `RunningCharger` to hand (it has no public constructor outside `charger/`).
+fn bespoke_read_state(
+    runtime: &ChargePointRuntime<FakeChargePoint>,
+    hardware: &FakeChargePoint,
+    config: &ChargerConfig,
+) -> ChargerState {
+    let mut state = ChargerState::from_config(config.clone());
+    apply_ocpp_state(&mut state, &runtime.state());
+    apply_hardware_state(&mut state, hardware);
+    state
+}
+
+/// [`wait_for_current_limit`], against the bespoke chain's separate runtime/hardware handles.
+async fn bespoke_wait_for_current_limit(
+    runtime: &ChargePointRuntime<FakeChargePoint>,
+    hardware: &FakeChargePoint,
+    config: &ChargerConfig,
+    evse_id: usize,
+    connector_id: usize,
+    expected: Option<u32>,
+) -> ChargerState {
+    let mut states = runtime.subscribe();
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let state = bespoke_read_state(runtime, hardware, config);
+            if state.evses[evse_id].connectors[connector_id].current_limit_ma == expected {
+                return state;
+            }
+            let _ = states.changed().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("current limit never reached {expected:?} within the timeout"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -432,32 +529,23 @@ async fn clear_all_profiles(runtime: &ChargePointRuntime<FakeChargePoint>) {
 async fn a_restrictive_profile_accrues_less_energy_than_no_profile_over_the_same_elapsed_time() {
     let cfg = config(true);
 
-    let unrestricted_clock = TestClock::new(epoch());
-    let (unrestricted, unrestricted_hw) = start_charger(&cfg, unrestricted_clock.clone()).await;
+    let unrestricted = start_local_charger(&cfg).await;
     charge_locally(&unrestricted, 0, 0).await;
 
-    let restricted_clock = TestClock::new(epoch());
-    let (restricted, restricted_hw) = start_charger(&cfg, restricted_clock.clone()).await;
+    let restricted = start_local_charger(&cfg).await;
     charge_locally(&restricted, 0, 0).await;
     install_profile(
         &restricted,
         amp_profile(1, epoch(), None, vec![flat_period(8.0)]),
     )
     .await;
-    wait_for_current_limit(&restricted, &restricted_hw, &cfg, 0, 0, Some(8_000)).await;
+    wait_for_current_limit(&restricted, &cfg, 0, 0, Some(8_000)).await;
 
-    unrestricted_clock.advance(StdDuration::from_secs(3_600));
-    unrestricted_hw.tick(StdDuration::from_secs(3_600)).await;
+    unrestricted.tick(StdDuration::from_secs(3_600)).await;
+    restricted.tick(StdDuration::from_secs(3_600)).await;
 
-    restricted_clock.advance(StdDuration::from_secs(3_600));
-    restricted_hw.tick(StdDuration::from_secs(3_600)).await;
-
-    let unrestricted_energy = read_state(&unrestricted, &unrestricted_hw, &cfg).evses[0]
-        .metrics
-        .energy_kwh;
-    let restricted_energy = read_state(&restricted, &restricted_hw, &cfg).evses[0]
-        .metrics
-        .energy_kwh;
+    let unrestricted_energy = read_state(&unrestricted, &cfg).evses[0].metrics.energy_kwh;
+    let restricted_energy = read_state(&restricted, &cfg).evses[0].metrics.energy_kwh;
 
     assert!(
         restricted_energy > 0.0,
@@ -476,27 +564,25 @@ async fn a_restrictive_profile_accrues_less_energy_than_no_profile_over_the_same
 #[tokio::test]
 async fn a_zero_limit_suspends_accrual_without_ending_the_transaction_or_faulting() {
     let cfg = config(true);
-    let clock = TestClock::new(epoch());
-    let (runtime, hardware) = start_charger(&cfg, clock.clone()).await;
-    charge_locally(&runtime, 0, 0).await;
+    let charger = start_local_charger(&cfg).await;
+    charge_locally(&charger, 0, 0).await;
 
     install_profile(
-        &runtime,
+        &charger,
         amp_profile(1, epoch(), None, vec![flat_period(0.0)]),
     )
     .await;
-    wait_for_current_limit(&runtime, &hardware, &cfg, 0, 0, Some(0)).await;
+    wait_for_current_limit(&charger, &cfg, 0, 0, Some(0)).await;
 
-    clock.advance(StdDuration::from_secs(3_600));
-    hardware.tick(StdDuration::from_secs(3_600)).await;
+    charger.tick(StdDuration::from_secs(3_600)).await;
 
-    let state = read_state(&runtime, &hardware, &cfg);
+    let state = read_state(&charger, &cfg);
     assert_eq!(
         state.evses[0].metrics.energy_kwh, 0.0,
         "a Some(0) limit should halt accrual entirely"
     );
     assert_eq!(
-        runtime.state().evses[0].connectors[0],
+        charger.state().evses[0].connectors[0],
         OcppConnectorState::Charging,
         "suspended by a zero limit, not ended - the connector must stay Charging"
     );
@@ -512,35 +598,28 @@ async fn a_zero_limit_suspends_accrual_without_ending_the_transaction_or_faultin
 #[tokio::test]
 async fn clearing_the_profile_restores_the_unrestricted_rate() {
     let cfg = config(true);
-    let clock = TestClock::new(epoch());
-    let (runtime, hardware) = start_charger(&cfg, clock.clone()).await;
-    charge_locally(&runtime, 0, 0).await;
+    let charger = start_local_charger(&cfg).await;
+    charge_locally(&charger, 0, 0).await;
 
     install_profile(
-        &runtime,
+        &charger,
         amp_profile(1, epoch(), None, vec![flat_period(8.0)]),
     )
     .await;
-    wait_for_current_limit(&runtime, &hardware, &cfg, 0, 0, Some(8_000)).await;
+    wait_for_current_limit(&charger, &cfg, 0, 0, Some(8_000)).await;
 
-    clock.advance(StdDuration::from_secs(3_600));
-    hardware.tick(StdDuration::from_secs(3_600)).await;
-    let limited_energy = read_state(&runtime, &hardware, &cfg).evses[0]
-        .metrics
-        .energy_kwh;
+    charger.tick(StdDuration::from_secs(3_600)).await;
+    let limited_energy = read_state(&charger, &cfg).evses[0].metrics.energy_kwh;
     assert!(
         limited_energy > 0.0 && limited_energy < NOMINAL_HOURLY_KWH,
         "the limited hour should accrue less than the nominal rate, got {limited_energy}"
     );
 
-    clear_all_profiles(&runtime).await;
-    wait_for_current_limit(&runtime, &hardware, &cfg, 0, 0, None).await;
+    clear_all_profiles(&charger).await;
+    wait_for_current_limit(&charger, &cfg, 0, 0, None).await;
 
-    clock.advance(StdDuration::from_secs(3_600));
-    hardware.tick(StdDuration::from_secs(3_600)).await;
-    let restored_energy = read_state(&runtime, &hardware, &cfg).evses[0]
-        .metrics
-        .energy_kwh;
+    charger.tick(StdDuration::from_secs(3_600)).await;
+    let restored_energy = read_state(&charger, &cfg).evses[0].metrics.energy_kwh;
 
     let second_hour = restored_energy - limited_energy;
     assert!(
@@ -552,12 +631,15 @@ async fn clearing_the_profile_restores_the_unrestricted_rate() {
 
 /// A stepped schedule must change the *applied* limit exactly when simulated time crosses a
 /// period boundary - not before, and not only once the test asks for the final value.
+///
+/// The one test in this file still on the bespoke chain - see the module doc comment's "The one
+/// exception" section for why `start_local_charger`'s hardcoded `SystemClock` cannot express this.
 #[tokio::test]
 async fn a_stepped_schedule_changes_the_applied_limit_at_the_period_boundary() {
     let cfg = config(true);
     let clock = TestClock::new(epoch());
-    let (runtime, hardware) = start_charger(&cfg, clock.clone()).await;
-    charge_locally(&runtime, 0, 0).await;
+    let (runtime, hardware) = bespoke_start_charger(&cfg, clock.clone()).await;
+    bespoke_charge_locally(&runtime, 0, 0).await;
 
     install_profile(
         &runtime,
@@ -580,12 +662,12 @@ async fn a_stepped_schedule_changes_the_applied_limit_at_the_period_boundary() {
         ),
     )
     .await;
-    wait_for_current_limit(&runtime, &hardware, &cfg, 0, 0, Some(8_000)).await;
+    bespoke_wait_for_current_limit(&runtime, &hardware, &cfg, 0, 0, Some(8_000)).await;
 
     // Not yet at the boundary: still the first period's limit.
     clock.advance(StdDuration::from_secs(900));
     hardware.tick(StdDuration::from_secs(900)).await;
-    let state = read_state(&runtime, &hardware, &cfg);
+    let state = bespoke_read_state(&runtime, &hardware, &cfg);
     assert_eq!(
         state.evses[0].connectors[0].current_limit_ma,
         Some(8_000),
@@ -595,7 +677,7 @@ async fn a_stepped_schedule_changes_the_applied_limit_at_the_period_boundary() {
     // Cross the boundary.
     clock.advance(StdDuration::from_secs(900));
     hardware.tick(StdDuration::from_secs(900)).await;
-    wait_for_current_limit(&runtime, &hardware, &cfg, 0, 0, Some(16_000)).await;
+    bespoke_wait_for_current_limit(&runtime, &hardware, &cfg, 0, 0, Some(16_000)).await;
 }
 
 /// Capabilities gate *behavior*, not just advertisement (per `charger/config.rs`'s
@@ -608,20 +690,18 @@ async fn a_stepped_schedule_changes_the_applied_limit_at_the_period_boundary() {
 #[tokio::test]
 async fn a_charger_without_the_smart_charging_capability_is_unaffected_by_an_installed_profile() {
     let cfg = config(false);
-    let clock = TestClock::new(epoch());
-    let (runtime, hardware) = start_charger(&cfg, clock.clone()).await;
-    charge_locally(&runtime, 0, 0).await;
+    let charger = start_local_charger(&cfg).await;
+    charge_locally(&charger, 0, 0).await;
 
     install_profile(
-        &runtime,
+        &charger,
         amp_profile(1, epoch(), None, vec![flat_period(8.0)]),
     )
     .await;
 
-    clock.advance(StdDuration::from_secs(3_600));
-    hardware.tick(StdDuration::from_secs(3_600)).await;
+    charger.tick(StdDuration::from_secs(3_600)).await;
 
-    let state = read_state(&runtime, &hardware, &cfg);
+    let state = read_state(&charger, &cfg);
     assert_eq!(
         state.evses[0].connectors[0].current_limit_ma, None,
         "with no smart_charging capability, nothing ever computes or applies a limit"
