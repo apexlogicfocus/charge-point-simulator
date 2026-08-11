@@ -187,6 +187,30 @@ The guiding principles, which every task should be checked against:
   `trigger_upload_failure()` so failing a log upload leaves a firmware download in flight alone.
   The registration follow-up needs these names.
 
+- **H3c + the local-authorizer fix** — local mode now routes through `register_setup_blocks` with a
+  `has_csms` flag, against a `NullCsms` whose `authorize` returns `Err(NoCsms)`. That error is the
+  honest answer for a charger that cannot reach anyone, and it makes upstream's `offline_decision`
+  reachable, so the local authorization list and auth cache finally do something. H9's test that
+  documented the defect is inverted into the regression test for the fix.
+
+  What local mode registers, and what it deliberately doesn't:
+
+  - **Always:** `authorization`, plus the cheap single-call handlers — `clear_cache`,
+    `network_profiles`, `remote_control`, `trigger_message`, `availability_control`, `reset`,
+    `device_model`.
+  - **When declared:** `reservation` + `reservation_status_updates` (reservations now genuinely
+    expire locally), `local_authorization_list`, `smart_charging` + `charging_profile_reports` —
+    which closes the gap H8 found.
+  - **Skipped:** `provisioning`, the one block genuinely unregisterable offline — `NullCsms` must
+    never fabricate boot acceptance, so `register_until_accepted` would retry forever and hang
+    `start_local_charger` rather than merely spin. `status_notifications`, `transaction_events`,
+    `security_events`, `meter_values` are pure CSMS-forwarding with no local effect (that state
+    already reaches `ChargerState` via `apply_ocpp_state` and the hardware directly).
+    `tariff_and_cost`, `variable_monitoring`, `periodic_event_stream` are CSMS-facing reporting.
+
+  Idleness was measured, not assumed: process CPU time before and after a 2s idle wait was
+  identical (0.02s → 0.02s).
+
 ## Where we are
 
 Every charger — local or connected — runs a real `ocpp_charge_point::ChargePointRuntime` (see
@@ -553,6 +577,12 @@ more satisfying task.
   (all-false capabilities registers no gated block). Nothing asserts that declaring `reservation` or
   `local_auth_list` actually *does* register `reserve_now`/`send_local_list`. H9 was scoped out of
   `connect.rs` and could not add it from an integration test.
+- **A local charger can't be run against an injectable clock.** `start_local_charger` hardcodes
+  `SystemClock` for every `Clock`-taking registration, so a test needing exact control over "now"
+  relative to an anchored schedule can't use it. `tests/smart_charging.rs`'s stepped-schedule test is
+  the one case still hand-building its own builder chain for this reason (kept, and renamed with a
+  `bespoke_` prefix, rather than silently left unexplained). A `start_local_charger_with` taking
+  `Clock`/`Backoff` would close it — worth doing before more time-sensitive behavior lands.
 - **No `SoftwareCrypto` backend ships.** `FileKeyStore` stays generic until someone picks one; H13
   cannot do plug and charge without that decision. `ring` is already present transitively via the
   websocket TLS stack, which makes it the obvious candidate — but it is a security choice, not a
