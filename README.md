@@ -8,7 +8,7 @@
 
 ## 🚀 Overview
 
-**Flowion Charge Point Simulator** is an open-source simulator that emulates real-world EV charge points using the Open Charge Point Protocol (OCPP).
+**This Charge Point Simulator** is an open-source simulator that emulates real-world EV charge points using the Open Charge Point Protocol (OCPP).
 
 It enables developers to test and validate **Charge Station Management Systems (CSMS)**, develop smart charging algorithms, verify load balancing strategies, and automate integration testing — without requiring physical charging hardware.
 
