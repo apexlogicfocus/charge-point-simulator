@@ -1,11 +1,3 @@
-<a href="https://flowion.io">
-  <img src="https://flowion.io/brand/github-banner.png"
-       alt="Flowion — charging infrastructure, made easy. Open source from the team behind flowion.io."
-       width="100%">
-</a>
-
-# ⚡ Flowion Charge Point Simulator
-
 > **A high-fidelity OCPP Charge Point Simulator for testing, validating, and developing EV charging infrastructure.**
 
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
