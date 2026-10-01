@@ -12,23 +12,21 @@
 
 It enables developers to test and validate **Charge Station Management Systems (CSMS)**, develop smart charging algorithms, verify load balancing strategies, and automate integration testing — without requiring physical charging hardware.
 
-Built with protocol correctness, realism, and developer experience in mind, Flowion Charge Point Simulator aims to behave like an actual charging station rather than simply replaying OCPP messages.
+Built with protocol correctness, realism, and developer experience in mind, Charge Point Simulator aims to behave like an actual charging station rather than simply replaying OCPP messages.
 
 The simulator currently supports **OCPP 1.6J**, with **OCPP 2.0.1 and OCPP 2.1 actively being implemented**.
 
-Whether you are developing a new CSMS, validating an existing backend, or testing complex charging scenarios, Flowion Charge Point Simulator provides a fast, deterministic, and scriptable environment for EV charging development.
+Whether you are developing a new CSMS, validating an existing backend, or testing complex charging scenarios, Charge Point Simulator provides a fast, deterministic, and scriptable environment for EV charging development.
 
 ---
 
-## 🤔 Why Flowion Charge Point Simulator?
+## 🤔 Why This Charge Point Simulator?
 
 Developing and testing against physical charge points can be expensive, slow, and difficult to automate.
 
-Flowion Charge Point Simulator provides a reliable virtual alternative that integrates seamlessly into your development workflow.
+Charge Point Simulator provides a reliable virtual alternative that integrates seamlessly into your development workflow.
 
-Designed by **Flowion AB**, the simulator focuses on **protocol accuracy** and realistic charge point behavior. Instead of simply sending predefined messages, it aims to replicate how a real charging station communicates, reacts, and operates.
-
-| Physical Charge Point                    | Flowion Charge Point Simulator             |
+| Physical Charge Point                    | This Charge Point Simulator             |
 | ---------------------------------------- | ------------------------------------------ |
 | 💰 Requires purchasing hardware          | ✅ No hardware required                     |
 | 📍 Must be physically accessible         | ✅ Runs anywhere                            |
@@ -62,7 +60,7 @@ Designed by **Flowion AB**, the simulator focuses on **protocol accuracy** and r
 
 ## 🎯 Use Cases
 
-Flowion Charge Point Simulator is designed for:
+This Charge Point Simulator is designed for:
 
 * 🚀 Developing OCPP backends
 * 🧪 CSMS integration testing
@@ -95,7 +93,7 @@ Flowion Charge Point Simulator is designed for:
 
 ## 🔋 Simulation Capabilities
 
-Flowion Charge Point Simulator is designed to simulate the complete behavior of a real charging station.
+Charge Point Simulator is designed to simulate the complete behavior of a real charging station.
 
 Supported scenarios include:
 
@@ -123,7 +121,7 @@ Supported scenarios include:
 ### Homebrew
 
 ```bash
-brew install flowion-charge-point-simulator
+brew install charge-point-simulator
 ```
 
 ### Build from Source
@@ -132,11 +130,6 @@ Requirements:
 
 * Rust toolchain
 * Cargo
-
-```bash
-git clone https://github.com/flowion/flowion-charge-point-simulator.git
-
-cd flowion-charge-point-simulator
 
 cargo build --release
 ```
@@ -153,9 +146,6 @@ cargo run --release
 
 Start the simulator:
 
-```bash
-flowion-charge-point-simulator
-```
 
 The simulator launches an interactive terminal dashboard where you can monitor and control simulated charge points.
 
@@ -191,13 +181,9 @@ CSMS-connected charger does.
 
 State lives under one directory per charger:
 
-```
-<config dir>/flowion-charge-point-simulator/storage/<charger-id>/
-```
-
 `<config dir>` follows your OS's usual convention (e.g. `~/.config` on Linux, `~/Library/Application
-Support` on macOS) unless the `FLOWION_STATE_DIR` environment variable is set, in which case state is
-written under `<FLOWION_STATE_DIR>/storage/<charger-id>/` instead - handy for tests, CI, or running
+Support` on macOS) unless the environment variable is set, in which case state is
+written under `<STATE_DIR>/storage/<charger-id>/` instead - handy for tests, CI, or running
 multiple isolated instances side by side.
 
 Whether anything actually gets written still depends on the charger's own declared
@@ -260,7 +246,7 @@ exercised without writing a config first.
 
 ## 🧪 Testing & CI
 
-Flowion Charge Point Simulator is designed to integrate into automated development workflows.
+This Charge Point Simulator is designed to integrate into automated development workflows.
 
 Common use cases:
 
@@ -303,7 +289,7 @@ Contribution guidelines will be added soon.
 
 ## 📄 License
 
-Flowion Charge Point Simulator is dual licensed:
+Charge Point Simulator is dual licensed:
 
 * MIT License
 * Apache License 2.0
@@ -312,11 +298,9 @@ You may choose either license.
 
 ---
 
-## 🏢 About Flowion
+## 🏢 About 
 
-**Flowion Charge Point Simulator** is developed by **Flowion AB** as part of our mission to make EV charging infrastructure more accessible, reliable, and developer-friendly.
-
-Flowion builds modern software solutions for electric vehicle charging, focusing on open standards such as **OCPP** and helping companies develop and operate scalable charging solutions.
+This builds modern software solutions for electric vehicle charging, focusing on open standards such as **OCPP** and helping companies develop and operate scalable charging solutions.
 
 The Charge Point Simulator represents our commitment to providing high-quality developer tools that make it easier to build, test, and validate EV charging systems.
 
